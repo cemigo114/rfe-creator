@@ -16,6 +16,7 @@ leaks in; subprocess tests scrub the same variables.
 """
 
 import ast
+import inspect
 import json
 import os
 import re
@@ -43,6 +44,7 @@ from type_registry import (  # noqa: E402
     load_workspace_bindings,
     parse_extra_roots,
     parse_type_arg,
+    read_batch,
     resolve,
 )
 
@@ -353,6 +355,29 @@ class TestDescriptorProjections:
         assert desc.local_id_pattern == r"^INIT-\d+$"
         assert desc.id_field == "initiative_id"
         assert desc.score_fields == ["what", "why", "scope", "open_to_how", "right_sized"]
+
+    def test_parent_key_pattern_is_the_anchored_alternation(self):
+        # PR-3b: the ONE join behind the task schema (artifact_utils) and the batch validator
+        # (validate_batch_input) — PR-1 checklist Q14 reconciled by construction.
+        reg = _shipped()
+        assert reg.get("rfe").parent_key_pattern == r"^(RFE-\d+|RHAIRFE-\d+)$"
+        assert reg.get("initiative").parent_key_pattern == (
+            r"^(RHAISTRAT-\d+|RHOAIENG-\d+|INIT-\d+)$"
+        )
+        for name in SHIPPED:
+            desc = reg.get(name)
+            patterns = desc.get("conventions.parent_key_patterns")
+            assert desc.parent_key_pattern == "^(" + "|".join(patterns) + ")$"
+            assert re.fullmatch(desc.parent_key_pattern, f"{desc.write_prefix}12")
+            assert re.fullmatch(desc.parent_key_pattern, f"x{desc.write_prefix}12") is None
+
+    def test_parent_key_pattern_is_none_without_patterns(self):
+        assert Descriptor("bare", {"type": "bare"}).parent_key_pattern is None
+        assert Descriptor("gh", _minimal("gh", "GH")).parent_key_pattern is None
+        empty = {"type": "e", "conventions": {"parent_key_patterns": []}}
+        assert Descriptor("e", empty).parent_key_pattern is None
+        one = {"type": "o", "conventions": {"parent_key_patterns": [r"OUT-\d+"]}}
+        assert Descriptor("o", one).parent_key_pattern == r"^(OUT-\d+)$"
 
     def test_list_properties_are_copies(self):
         desc = _shipped().get("rfe")
@@ -2612,3 +2637,184 @@ class TestReadParityStrictIdsAndWorkspaceNames:
             RegistryError, match="bindings.rfes: unknown type; registered types: rfe, initiative"
         ):
             reg.workspace_bindings()
+
+
+# ── read_batch (PR-3b: the one parser of the batch root) ─────────────────────────
+
+
+class TestReadBatch:
+    """``read_batch`` is shared by ``resolve`` (rung 2), ``validate_batch_input.py`` and
+    ``next_rfe_id.py --from-batch``: one parser of the two root forms, shape errors only (the
+    per-item ``type`` rule stays the ladder's)."""
+
+    def test_constants(self):
+        assert type_registry.LEGACY_DEFAULT_RUNG == "legacy default"
+        assert type_registry.RESOLVE_RUNGS[-1] == type_registry.LEGACY_DEFAULT_RUNG
+        assert type_registry.BATCH_MAPPING_KEYS == ("type", "items")
+
+    def test_legacy_list_is_returned_as_is_with_no_type(self, tmp_path):
+        items = [{"prompt": "x"}, "RHOAIENG-1", {"prompt": "y", "type": "rfe"}]
+        batch = _write_yaml(tmp_path / "b.yaml", items)
+        # The per-item type key is NOT read_batch's business (resolve rejects it, D2).
+        assert read_batch(batch) == (None, items)
+        assert read_batch(str(batch)) == (None, items)
+
+    def test_mapping_form_returns_the_stripped_type_and_its_items(self, tmp_path):
+        data = {"type": " initiative ", "items": [{"prompt": "x"}, "RFE-1"]}
+        batch = _write_yaml(tmp_path / "b.yaml", data)
+        assert read_batch(batch) == ("initiative", [{"prompt": "x"}, "RFE-1"])
+
+    def test_mapping_form_may_be_empty_and_its_type_is_not_validated_here(self, tmp_path):
+        batch = _write_yaml(tmp_path / "b.yaml", {"type": "epic", "items": []})
+        assert read_batch(batch) == ("epic", [])
+        with pytest.raises(ResolveError, match="unknown type 'epic'"):
+            resolve(_shipped(), batch=batch, env={})
+
+    @pytest.mark.parametrize(
+        "content, match",
+        [
+            ("type: rfe\n", "expected a list of items .* got a mapping with keys type"),
+            ("items: []\n", "expected a list of items .* got a mapping with keys items"),
+            ("42\n", "got int"),
+            ("", "got nothing"),
+            ("type: rfe\nitems: nope\n", "'items' must be a list, got str"),
+            ("type: 5\nitems: []\n", "'type' must be a non-empty string, got 5"),
+            ("type: ''\nitems: []\n", "'type' must be a non-empty string"),
+            (
+                "type: rfe\nitems: []\nextra: 1\n",
+                "the mapping form takes exactly the keys 'type' and 'items'; unexpected "
+                "key\\(s\\): extra",
+            ),
+            ("- [unclosed\n", "invalid YAML in batch file"),
+        ],
+    )
+    def test_other_root_shapes_are_errors(self, tmp_path, content, match):
+        batch = tmp_path / "b.yaml"
+        batch.write_text(content, encoding="utf-8")
+        with pytest.raises(ResolveError, match=match) as excinfo:
+            read_batch(batch)
+        assert excinfo.value.exit_code == 1
+
+    def test_missing_file_is_an_error(self, tmp_path):
+        with pytest.raises(ResolveError, match="cannot read batch file"):
+            read_batch(tmp_path / "missing.yaml")
+
+    def test_extra_root_keys_are_rejected_by_resolve_too(self, tmp_path):
+        batch = _write_yaml(
+            tmp_path / "b.yaml", {"type": "rfe", "items": [{"prompt": "x"}], "labels": ["a"]}
+        )
+        match = "exactly the keys 'type' and 'items'; unexpected key\\(s\\): labels"
+        with pytest.raises(ResolveError, match=match):
+            resolve(_shipped(), batch=batch, env={})
+        result = _cli("resolve", "--batch", str(batch))
+        assert result.returncode == 1
+        assert result.stdout == ""
+        assert result.stderr.startswith("ERROR: ") and "unexpected key(s): labels" in result.stderr
+
+    def test_resolve_reads_the_batch_through_read_batch(self):
+        # Source-form pin: one parser, so the two entry scripts and the ladder cannot drift.
+        source = inspect.getsource(type_registry._batch_signal)
+        assert "read_batch(path)" in source
+        assert "_load_yaml" not in source
+
+
+# ── resolve over pre-parsed batch items (PR-3b: the batch-root consumers' call) ────
+
+
+class TestResolveBatchItems:
+    """The two batch-root consumers hand ``resolve`` the pair ``read_batch`` returned
+    (``batch_items`` — a pipe is read once), tell it that a bare string item is an entry, not an
+    id (``items_are_ids=False``), and take the type verdict only (``binding=False``)."""
+
+    def test_batch_items_are_not_re_read(self, tmp_path):
+        # ``batch`` only names the file: a path that no longer exists (a consumed pipe) is fine.
+        gone = tmp_path / "gone.yaml"
+        res = resolve(_shipped(), batch=gone, batch_items=(None, [{"prompt": "x"}]), env={})
+        assert (res.type_name, res.rung) == ("rfe", "legacy default")
+        res = resolve(_shipped(), batch=gone, batch_items=("initiative", [{"prompt": "x"}]), env={})
+        assert (res.type_name, res.rung) == ("initiative", "batch type")
+        assert res.line() == "TYPE RESOLVED: initiative (batch type)"
+
+    def test_batch_items_keep_the_unknown_type_d1_and_d2_errors(self, tmp_path):
+        label = tmp_path / "b.yaml"
+        reg = _shipped()
+        with pytest.raises(ResolveError, match=r"unknown type 'epic' \(.*b\.yaml type:\)"):
+            resolve(reg, batch=label, batch_items=("epic", []), env={})
+        with pytest.raises(ResolveError, match="--type rfe disagrees with .*b.yaml type: initi"):
+            resolve(reg, explicit_type="rfe", batch=label, batch_items=("initiative", []), env={})
+        items = [{"prompt": "x"}, {"prompt": "y", "type": "rfe"}]
+        with pytest.raises(ResolveError, match=r"b\.yaml: item 1 carries a per-item 'type' key"):
+            resolve(reg, batch=label, batch_items=(None, items), env={})
+
+    def test_batch_items_need_the_label(self):
+        with pytest.raises(ValueError, match="needs batch"):
+            resolve(_shipped(), batch_items=(None, []), env={})
+
+    def test_string_items_are_ids_by_default(self, tmp_path):
+        # PR-3a semantics, kept for a batch of ids (the ``resolve`` CLI's ``--batch``).
+        label = tmp_path / "ids.yaml"
+        res = resolve(_shipped(), batch=label, batch_items=(None, ["RHOAIENG-1"]), env={})
+        assert (res.type_name, res.rung) == ("initiative", "id grammar")
+        with pytest.raises(ResolveError, match="no registered type owns id 'alpha'"):
+            resolve(_shipped(), batch=label, batch_items=(None, ["alpha"]), env={"CI": "true"})
+
+    def test_entry_grammar_string_items_are_not_signals(self, tmp_path):
+        # items_are_ids=False — the speedrun validator's "entry N: must be a mapping" case: no
+        # rung-3 signal, no D5 error headless, no conflict with --type; D2 still applies.
+        reg = _shipped()
+        kw = {"batch": tmp_path / "batch.yaml", "items_are_ids": False}
+        items = ["just a string", {"prompt": "ok"}]
+        res = resolve(reg, batch_items=(None, items), env={"CI": "true"}, **kw)
+        assert (res.type_name, res.rung) == ("rfe", "legacy default")
+        res = resolve(reg, batch_items=(None, ["RHAIRFE-123"]), env={}, **kw)
+        assert (res.type_name, res.rung) == ("rfe", "legacy default")
+        res = resolve(
+            reg, explicit_type="rfe", batch_items=(None, ["RHOAIENG-123"]), env={"CI": "1"}, **kw
+        )
+        assert (res.type_name, res.rung) == ("rfe", "--type")
+        res = resolve(reg, batch_items=("initiative", ["RHAIRFE-1"]), env={"CI": "1"}, **kw)
+        assert (res.type_name, res.rung) == ("initiative", "batch type")
+        with pytest.raises(ResolveError, match="per-item 'type' key"):
+            resolve(reg, batch_items=(None, ["x", {"type": "rfe"}]), env={}, **kw)
+
+    def test_binding_false_returns_the_verdict_only(self):
+        env = {"JIRA_PROJECT": "KONFLUX", "RFE_CREATOR_BINDING_RFE_ISSUE_TYPE": "Story"}
+        res = resolve(_shipped(), explicit_type="rfe", env=env, binding=False)
+        assert res.binding is None and res.desc.name == "rfe"
+        assert res.line() == "TYPE RESOLVED: rfe (--type)"
+        assert res.as_dict()["binding"] is None
+        # the default still computes and renders it
+        assert resolve(_shipped(), explicit_type="rfe", env=env).line() == (
+            "TYPE RESOLVED: rfe (--type; binding override project=KONFLUX issue_type=Story)"
+        )
+
+    @pytest.mark.parametrize(
+        "env",
+        [
+            {"JIRA_PROJECT": "rhairfe"},
+            {"JIRA_PROJECT": "bad project"},
+            {"JIRA_ISSUE_TYPE": ""},
+            {"RFE_CREATOR_BINDING_RFE_PROJECT": "foo bar"},
+            {"RFE_CREATOR_BINDING_RFE_LOCAL_PREFIX": "X"},
+            {"RFE_CREATOR_BINDING_INITIATIVE_PROJECT": "bad!"},
+        ],
+    )
+    def test_binding_false_never_reads_a_malformed_override(self, env):
+        # A caller that never applies the binding cannot be failed by an override it would not
+        # have read (the batch-root consumers: main read none of these variables).
+        for kwargs in ({}, {"explicit_type": "rfe"}, {"explicit_type": "initiative"}):
+            res = resolve(_shipped(), env=env, binding=False, **kwargs)
+            assert res.binding is None and res.type_name is not None
+            assert "binding override" not in res.line()
+        # the default is fail-fast for the callers that do apply it
+        with pytest.raises(RegistryError, match="JIRA_PROJECT='rhairfe'"):
+            resolve(_shipped(), explicit_type="rfe", env={"JIRA_PROJECT": "rhairfe"})
+
+    def test_binding_false_skips_the_workspace_refusal_with_the_binding(self):
+        workspace = {"rfe": {"jira": {"project": "KONFLUX"}}}
+        res = resolve(
+            _shipped(), explicit_type="rfe", env={"CI": "1"}, workspace=workspace, binding=False
+        )
+        assert res.binding is None and res.type_name == "rfe"
+        with pytest.raises(ResolveError, match="workspace file"):
+            resolve(_shipped(), explicit_type="rfe", env={"CI": "1"}, workspace=workspace)
