@@ -26,6 +26,19 @@ def tmp_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def _isolate_headless_marker():
+    """cmd_init --headless and _load_state() export RFE_CREATOR_HEADLESS into os.environ
+    (make_state() is headless by default): keep it from leaking across tests or into the
+    developer's shell-inherited environment."""
+    before = os.environ.pop(ps.HEADLESS_MARKER_ENV, None)
+    yield
+    if before is None:
+        os.environ.pop(ps.HEADLESS_MARKER_ENV, None)
+    else:
+        os.environ[ps.HEADLESS_MARKER_ENV] = before
+
+
 def write_ids(path, ids):
     os.makedirs(os.path.dirname(path) or "tmp", exist_ok=True)
     with open(path, "w") as f:
@@ -2568,3 +2581,126 @@ class TestStateValidatedBeforeDecisionScripts:
         with pytest.raises(SystemExit):
             ps._get_config(make_state(type="initiative; id"))
         assert "REPORT" in ps._get_config(make_state(type="initiative"))
+
+
+# ---------- init --type (registry choices) ----------
+
+
+class TestInitTypeChoices:
+    def test_help_renders_the_registered_types(self, tmp_dir, capsys):
+        """The choices come from the registry; the rendered help is byte-identical to the
+        literal list it replaced ({rfe,initiative} — rfe first, names() order)."""
+        with pytest.raises(SystemExit) as exc_info:
+            ps.cmd_init(["--help"])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert "--type {rfe,initiative}" in out
+        assert "--type {" + ",".join(ps._TYPES.choices()) + "}" in out
+
+    def test_unknown_type_exits_2_with_the_registered_list(self, tmp_dir, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            ps.cmd_init(["--type", "bogus"])
+        assert exc_info.value.code == 2
+        err = capsys.readouterr().err
+        assert "argument --type: invalid choice: 'bogus'" in err
+        assert "choose from 'rfe', 'initiative'" in err
+        assert not os.path.exists(ps.STATE_FILE)
+
+    @pytest.mark.parametrize("ptype", ["rfe", "initiative"])
+    def test_registered_type_is_persisted(self, tmp_dir, ptype):
+        import io
+        from contextlib import redirect_stdout
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            ps.cmd_init(["--type", ptype])
+        assert ps._load_state()["type"] == ptype
+        assert buf.getvalue() == f"Initialized pipeline state: type={ptype} batch_size=50\n"
+
+    def test_pipeline_types_cover_the_choices(self):
+        """PIPELINE_TYPES stays a literal table; every registered choice must have a row."""
+        assert list(ps.PIPELINE_TYPES) == ps._TYPES.choices()
+
+
+# ---------- headless marker export (PR-3 D4) ----------
+
+
+class TestHeadlessMarker:
+    def test_marker_is_the_registry_marker(self):
+        """One predicate: the variable the pipeline exports is one the registry reads."""
+        import type_registry
+
+        assert ps.HEADLESS_MARKER_ENV in type_registry.HEADLESS_MARKER_VARS
+        assert type_registry.is_headless({ps.HEADLESS_MARKER_ENV: "1"})
+
+    def test_init_headless_exports_the_marker(self, tmp_dir, monkeypatch):
+        import io
+        from contextlib import redirect_stdout
+
+        monkeypatch.delenv(ps.HEADLESS_MARKER_ENV, raising=False)
+        with redirect_stdout(io.StringIO()):
+            ps.cmd_init(["--headless"])
+        assert os.environ.get(ps.HEADLESS_MARKER_ENV) == "1"
+
+    def test_init_without_headless_exports_nothing(self, tmp_dir, monkeypatch):
+        import io
+        from contextlib import redirect_stdout
+
+        monkeypatch.delenv(ps.HEADLESS_MARKER_ENV, raising=False)
+        with redirect_stdout(io.StringIO()):
+            ps.cmd_init(["--type", "initiative", "--announce-complete"])
+        assert ps.HEADLESS_MARKER_ENV not in os.environ
+
+    def test_loading_a_headless_state_exports_the_marker(self, tmp_dir, monkeypatch):
+        """Every command that spawns subprocesses loads state first, so a later process
+        (wait-for-wave, run-phase, advance) re-exports the marker for its children."""
+        monkeypatch.delenv(ps.HEADLESS_MARKER_ENV, raising=False)
+        ps._save_state(make_state(headless=True))
+        assert ps.HEADLESS_MARKER_ENV not in os.environ
+        state = ps._load_state()
+        assert state["headless"] is True
+        assert os.environ.get(ps.HEADLESS_MARKER_ENV) == "1"
+
+    def test_loading_an_interactive_state_exports_nothing(self, tmp_dir, monkeypatch):
+        monkeypatch.delenv(ps.HEADLESS_MARKER_ENV, raising=False)
+        ps._save_state(make_state(headless=False))
+        ps._load_state()
+        assert ps.HEADLESS_MARKER_ENV not in os.environ
+
+    def test_existing_value_is_left_alone(self, tmp_dir, monkeypatch):
+        """setdefault semantics: the launcher's explicit value wins, even a false one."""
+        import io
+        from contextlib import redirect_stdout
+
+        monkeypatch.setenv(ps.HEADLESS_MARKER_ENV, "0")
+        with redirect_stdout(io.StringIO()):
+            ps.cmd_init(["--headless"])
+        assert os.environ[ps.HEADLESS_MARKER_ENV] == "0"
+        ps._load_state()
+        assert os.environ[ps.HEADLESS_MARKER_ENV] == "0"
+
+    def test_helper_never_unsets_or_touches_non_headless_state(self, monkeypatch):
+        monkeypatch.delenv(ps.HEADLESS_MARKER_ENV, raising=False)
+        ps._export_headless_marker(None)
+        ps._export_headless_marker({})
+        ps._export_headless_marker({"headless": False})
+        assert ps.HEADLESS_MARKER_ENV not in os.environ
+        monkeypatch.setenv(ps.HEADLESS_MARKER_ENV, "yes")
+        ps._export_headless_marker({"headless": False})
+        ps._export_headless_marker({"headless": True})
+        assert os.environ[ps.HEADLESS_MARKER_ENV] == "yes"
+
+    def test_children_inherit_the_marker(self, tmp_dir, monkeypatch):
+        """The point of the export: a subprocess launched after init --headless sees it."""
+        import io
+        from contextlib import redirect_stdout
+
+        monkeypatch.delenv(ps.HEADLESS_MARKER_ENV, raising=False)
+        with redirect_stdout(io.StringIO()):
+            ps.cmd_init(["--headless"])
+        probe = subprocess.run(
+            [sys.executable, "-c", f"import os; print(os.environ.get({ps.HEADLESS_MARKER_ENV!r}))"],
+            capture_output=True,
+            text=True,
+        )
+        assert probe.stdout.strip() == "1"

@@ -34,7 +34,13 @@ design-proposals/work-item-types-unified.md §3.3:
       local_id_pattern, id_field; unique non-empty poll/state/report prefixes
       (empty grandfathered for type rfe only); snapshot.prefix non-empty and
       pairwise prefix-collision-free (snapshot_fetch.py:142-149 globs
-      f"{prefix}*.yaml"); no local_prefix stem equal to any effective project key
+      f"{prefix}*.yaml"); no local_prefix stem equal to any effective project key;
+      no type's effective local_prefix mints an id (f"{prefix}1") that another
+      type's effective local_id_pattern full-matches (PR-3 D13 — detect() tries
+      every type's pattern first, so such an id would be routed to the other type)
+    * a binding the registry refuses to compute (a malformed identity block, an
+      invalid or D13-inconsistent RFE_CREATOR_BINDING_* override) is a finding
+      for that type, never a traceback
   Gate 2 — --with-deps, post-bootstrap, opt-in (Q8):
     * pipeline.rubric.path exists under --assess-dir (under the repo root when
       pipeline.rubric.repo is self — the rubric is embedded, not vendored)
@@ -524,17 +530,25 @@ def cross_type_findings(registry, env):
         label = ", ".join(str(k) for k in key)
         cross(f"duplicate effective binding ({label}) shared by types: {_fmt_types(names)}", names)
 
-    # (2) unique local_prefix (effective — LOCAL_PREFIX is overridable, §3.2.1),
-    #     local_id_pattern and id_field
+    # (2) unique local_prefix and local_id_pattern (effective — LOCAL_PREFIX is overridable,
+    #     §3.2.1, and D13 re-renders the pattern from an overridden prefix) and id_field
     def eff_local_prefix(name):
         b = bindings.get(name)
         if isinstance(b, dict) and isinstance(b.get("local_prefix"), str):
             return b["local_prefix"]
         return _opt(descs[name], "identity.local_prefix")
 
+    def eff_local_id_pattern(name):
+        # binding()["local_id_pattern"] is the D13 re-rendered grammar when the registry
+        # provides one; older registries expose no such key and the descriptor pattern is it.
+        b = bindings.get(name)
+        if isinstance(b, dict) and isinstance(b.get("local_id_pattern"), str):
+            return b["local_id_pattern"]
+        return _opt(descs[name], "identity.local_id_pattern")
+
     for label, getter in (
         ("identity.local_prefix", eff_local_prefix),
-        ("identity.local_id_pattern", lambda n: _opt(descs[n], "identity.local_id_pattern")),
+        ("identity.local_id_pattern", eff_local_id_pattern),
         ("identity.id_field", lambda n: _opt(descs[n], "identity.id_field")),
     ):
         pairs = [(getter(n), n) for n in descs if getter(n) is not None]
@@ -604,6 +618,35 @@ def cross_type_findings(registry, env):
                 "indistinguishable from tracker keys (design §3.2.1(b))",
                 [name, owner],
             )
+
+    # (6) D13 collision lint on effective identities: the ids type a mints under its
+    #     effective local_prefix (sample f"{prefix}1") must not full-match any other type's
+    #     effective local_id_pattern — detect() tries every type's pattern before any prefix
+    #     rung, so such an id would resolve to type b. Every ordered pair is checked; an
+    #     uncompilable pattern is the per-type gate's finding and is skipped here.
+    for name_a in descs:
+        prefix = eff_local_prefix(name_a)
+        if not isinstance(prefix, str) or not prefix:
+            continue
+        sample = f"{prefix}1"
+        for name_b in descs:
+            if name_b == name_a:
+                continue
+            pattern = eff_local_id_pattern(name_b)
+            if not isinstance(pattern, str) or not pattern:
+                continue
+            try:
+                collides = re.fullmatch(pattern, sample) is not None
+            except re.error:
+                continue
+            if collides:
+                cross(
+                    f"local id collision: the effective identity.local_prefix {prefix!r} of type "
+                    f"{name_a!r} mints ids such as {sample!r} that full-match the effective "
+                    f"identity.local_id_pattern {pattern!r} of type {name_b!r} — detect() would "
+                    f"route type {name_a}'s local ids to type {name_b} (PR-3 D13)",
+                    [name_a, name_b],
+                )
     return findings
 
 

@@ -12,6 +12,9 @@ Usage:
     python3 scripts/check_revised.py artifacts/rfe-originals/ID.md artifacts/rfe-tasks/ID.md
     python3 scripts/check_revised.py --batch
     python3 scripts/check_revised.py --batch RHAIRFE-1504 RHAIRFE-1510
+    python3 scripts/check_revised.py --type initiative --batch --ids-file tmp/ids.txt
+
+An unregistered --type exits 2 with the registered type list.
 """
 
 import os
@@ -22,6 +25,8 @@ import type_registry
 from artifact_utils import find_review_file, read_frontmatter, read_ids_file, update_frontmatter
 
 _TYPES = type_registry.load()
+# Usage text: "rfe|initiative" today, following the registry when a type is added.
+_TYPE_CHOICES = "|".join(_TYPES.choices())
 
 
 def strip_frontmatter(text):
@@ -60,8 +65,8 @@ _TYPE_CONFIG = {
 
 def batch_mode(ids, artifacts_dir="artifacts", pipeline_type="rfe"):
     """Compare originals to tasks and set auto_revised in review frontmatter."""
-    # --type is hand-parsed in main() without choices; an unregistered type fails here with
-    # the same KeyError it always did (the dict's keys ARE the registry names).
+    # --type is validated against the registry in main() (type_registry.parse_type_arg), so
+    # the lookup cannot miss for a CLI caller; the dict's keys ARE the registry names.
     tc = _TYPE_CONFIG[pipeline_type]
     originals_dir = os.path.join(artifacts_dir, tc["originals_dir"])
     tasks_dir = os.path.join(artifacts_dir, tc["tasks_dir"])
@@ -122,13 +127,13 @@ def _extract_ids_file(argv):
 
 
 def main():
-    pipeline_type = "rfe"
-    argv = sys.argv[1:]
-    if "--type" in argv:
-        idx = argv.index("--type")
-        if idx + 1 < len(argv):
-            pipeline_type = argv[idx + 1]
-            argv = argv[:idx] + argv[idx + 2 :]
+    # --type is hand-parsed by the registry's shared helper (design §5 rung 1): an unregistered
+    # name, or a trailing flag, exits 2 with the registered list; rfe when the flag is absent.
+    try:
+        pipeline_type, argv = type_registry.parse_type_arg(_TYPES, sys.argv[1:])
+    except type_registry.ResolveError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(exc.exit_code)
 
     if "--batch" in argv:
         rest, file_ids = _extract_ids_file(argv)
@@ -137,8 +142,10 @@ def main():
         return
 
     if len(argv) != 2:
-        print("Usage: check_revised.py [--type rfe|initiative] <original> <task>", file=sys.stderr)
-        print("       check_revised.py [--type rfe|initiative] --batch [ID ...]", file=sys.stderr)
+        print(
+            f"Usage: check_revised.py [--type {_TYPE_CHOICES}] <original> <task>", file=sys.stderr
+        )
+        print(f"       check_revised.py [--type {_TYPE_CHOICES}] --batch [ID ...]", file=sys.stderr)
         sys.exit(2)
 
     revised = check_pair(argv[0], argv[1])

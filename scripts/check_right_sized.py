@@ -5,8 +5,10 @@ Reads review frontmatter for each ID and returns undersized IDs
 (scores.right_sized < 2).
 
 Usage:
-    python3 scripts/check_right_sized.py ID1 ID2 ID3
+    python3 scripts/check_right_sized.py [--type rfe|initiative] ID1 ID2 ID3
     # stdout: RESPLIT=ID1 ID3
+
+An unregistered --type exits 2 with the registered type list.
 """
 
 import os
@@ -20,23 +22,27 @@ _TYPES = type_registry.load()
 _TYPE_CONFIG = {
     name: {"reviews_dir": _TYPES.get(name).dirs()["reviews"]} for name in _TYPES.names()
 }
+# Usage text: "rfe|initiative" today, following the registry when a type is added.
+_TYPE_CHOICES = "|".join(_TYPES.choices())
 
 
 def main():
-    pipeline_type = "rfe"
-    args = sys.argv[1:]
-    if "--type" in args:
-        idx = args.index("--type")
-        if idx + 1 < len(args):
-            pipeline_type = args[idx + 1]
-            args = args[:idx] + args[idx + 2 :]
+    # --type is hand-parsed by the registry's shared helper (design §5 rung 1): an unregistered
+    # name, or a trailing flag, exits 2 with the registered list; rfe when the flag is absent.
+    try:
+        pipeline_type, args = type_registry.parse_type_arg(_TYPES, sys.argv[1:])
+    except type_registry.ResolveError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(exc.exit_code)
 
     if not args:
-        print("Usage: check_right_sized.py [--type rfe|initiative] ID1 [ID2 ...]", file=sys.stderr)
+        print(
+            f"Usage: check_right_sized.py [--type {_TYPE_CHOICES}] ID1 [ID2 ...]", file=sys.stderr
+        )
         sys.exit(1)
 
-    # --type is hand-parsed without choices; an unregistered type fails here with the same
-    # KeyError it always did (the dict's keys ARE the registry names).
+    # --type is validated against the registry by type_registry.parse_type_arg, so the lookup
+    # cannot miss for a CLI caller (the dict's keys ARE the registry names).
     reviews_dir = _TYPE_CONFIG[pipeline_type]["reviews_dir"]
     # pipeline.resplit: {score_field, below} — "right_sized < 2" for both shipped types.
     resplit = _TYPES.get(pipeline_type).get("pipeline.resplit")
