@@ -5,8 +5,8 @@
 # is source of truth BY IMPORT for adopted scripts and BY TEST for the rest (design §10). Every value is
 # the live literal on main (c1df503) with the consuming file:line AT THAT COMMIT in a trailing comment
 # (adopted scripts now derive it — the comment records where the literal lived); nothing here is
-# authored. Where §8.2 and main disagree, main wins and the comment says so (Q1, Q3, Q9, Q10, Q11, Q14
-# of the PR-1 checklist).
+# authored. Where §8.2 and main disagree, main wins and the comment says so (Q1, Q3, Q9, Q10, Q11 of
+# the PR-1 checklist; Q14 was reconciled in PR-3b).
 schema_version: 1
 type: initiative
 display: { entity: Initiative, entity_plural: Initiatives }   # split_submit.py:133-134 entity_name/_plural; generate_review_pdf.py:66-67
@@ -59,7 +59,7 @@ conventions:
   comment_prefix: "[Initiative Creator]"                # submit.py:125; split_submit.py:131 comment_marker — PUBLISHED CONTRACT (R7)
   removed_context_preamble: "*[Initiative Creator]* The following technical implementation details were removed from the Initiative description during review. This content may be useful as strategy context and is preserved here for reference:"   # submit.py:119-124 — PUBLISHED CONTRACT (R7); the design's "…" truncation is not the value; frozen
   query_default: 'project = RHOAIENG AND issuetype = Initiative'   # Q10: no consumer at PR-1 (queries arrive via --jql: snapshot_fetch.py:489, bootstrap_snapshot.py:407, jql_query.py:64); not pinned; JQL because identity.tracker is jira
-  parent_key_patterns: ['RHAISTRAT-\d+', 'RHOAIENG-\d+', 'INIT-\d+']   # artifact_utils.py:219 r"^(RHAISTRAT-\d+|RHOAIENG-\d+|INIT-\d+)$" (initiative-task.parent_key). Q14: validate_batch_input.py:36 PARENT_KEY_PATTERN omits INIT- — known divergence, reconciled in PR-3
+  parent_key_patterns: ['RHAISTRAT-\d+', 'RHOAIENG-\d+', 'INIT-\d+']   # artifact_utils.py:219 r"^(RHAISTRAT-\d+|RHOAIENG-\d+|INIT-\d+)$" (initiative-task.parent_key). Q14 reconciled in PR-3b: validate_batch_input derives PARENT_KEY_PATTERN[type] from this list through Descriptor.parent_key_pattern, the task schema's join
 
 schema:
   task:

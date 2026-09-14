@@ -65,10 +65,12 @@ When the user doesn't specify, use these defaults:
   priority: Major
 ```
 
+The file may also be a mapping with the keys `type` and `items` — `type: rfe` for this skill, the same list of entries under `items`. The `--type rfe` on the validator below is what enforces that: a mapping whose `type:` is anything else is rejected there (`ERROR: batch: --type rfe disagrees with ...`, exit 1) before any ID is allocated or any agent runs. A per-item `type` key is rejected in either form because a run is single-typed — split such a batch by type and run each part separately. The validator prints one line, `TYPE RESOLVED: rfe (--type)`, on stderr; stdout stays the `ERROR:`/`WARNING:` protocol.
+
 Validate the batch file before spending any agent budget on it. Use `--strict` so unknown fields and duplicate prompts (typically typos or copy-paste mistakes) block the run too, not just hard errors:
 
 ```bash
-python3 scripts/validate_batch_input.py <input_file> --strict
+python3 scripts/validate_batch_input.py <input_file> --type rfe --strict
 ```
 
 If this exits nonzero, stop and report the printed `ERROR:`/`WARNING:` lines to the user instead of proceeding — do not fan out agents against a batch that's already known to be malformed.

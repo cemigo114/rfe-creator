@@ -339,7 +339,7 @@
           "minItems": 1,
           "uniqueItems": true,
           "items": { "type": "string", "minLength": 1 },
-          "description": "Unanchored alternatives accepted for the task parent_key field; the task schema pattern is '^(' + '|'.join(patterns) + ')$'. Authoritative for the batch validator too once PR-3 reconciles them (today validate_batch_input is narrower: known divergence)."
+          "description": "Unanchored alternatives accepted for parent_key; Descriptor.parent_key_pattern joins them as '^(' + '|'.join(patterns) + ')$' and that one string is both the <type>-task schema pattern (artifact_utils) and the batch validator rule (validate_batch_input, applied only when batch.extra_fields lists parent_key) — reconciled in PR-3b."
         }
       }
     },

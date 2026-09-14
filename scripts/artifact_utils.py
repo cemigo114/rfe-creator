@@ -131,11 +131,14 @@ def _id_pattern(desc):
 
 
 def _parent_key_pattern(desc):
-    """``^(a|b|c)$`` over ``conventions.parent_key_patterns`` — joining reproduces today's
-    literal for both shipped types (rfe: RFE-/RHAIRFE-; initiative: RHAISTRAT-/RHOAIENG-/
-    INIT-, the task schema's wider list of PR-1 decision Q14; validate_batch_input.py's
-    narrower batch pattern is reconciled in PR-3)."""
-    return "^(" + "|".join(desc.get("conventions.parent_key_patterns")) + ")$"
+    """``^(a|b|c)$`` over ``conventions.parent_key_patterns`` — ``Descriptor.parent_key_pattern``,
+    the one join the batch validator (validate_batch_input.py) applies too, so the task schema
+    and the batch rule cannot diverge (PR-1 decision Q14, reconciled in PR-3b). Reproduces the
+    pre-registry literal for both shipped types (rfe: RFE-/RHAIRFE-; initiative:
+    RHAISTRAT-/RHOAIENG-/INIT-). A shipped type must declare the fact: the bare ``get`` fails
+    the import with the loader's KeyError naming the field (see _SCHEMA_FACTS)."""
+    desc.get("conventions.parent_key_patterns")
+    return desc.parent_key_pattern
 
 
 def _id_fields(desc):

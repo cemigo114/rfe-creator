@@ -30,8 +30,16 @@ Adoption status (PR-3a): 28 scripts load the registry at import (module-level
 DESCRIPTOR values only; ``detect()``/``owns()`` are the design §5 rung-3 routers. The values a
 pending script still carries are pinned equal to the descriptors by test, and the remaining
 scripts adopt the registry one PR at a time (design §10 items 2-5). The resolution ladder
-(``candidates``, ``resolve``, ``assert_registered_binding``) ships here; the entry scripts
-wire it in PR-3b/PR-3c, so no production invocation prints a ``TYPE RESOLVED`` line yet.
+(``candidates``, ``resolve``, ``assert_registered_binding``) ships here. PR-3b wires the two
+batch-root consumers — ``validate_batch_input.py`` and ``next_rfe_id.py --from-batch`` — through
+``read_batch`` (the one parser of a batch file, read ONCE — the parsed pair is handed to
+``resolve`` as ``batch_items``, so a pipe or ``/dev/stdin`` works) and ``resolve`` with
+``items_are_ids=False`` (a bare string item is the caller's malformed entry, never an id signal)
+and ``binding=False`` (the type verdict only: the environment's binding overrides are neither
+read nor validated). They print the resolve line on STDERR only when a non-default rung decided
+(D3): the legacy default — a bare list with no ``--type`` — is byte-identical to main on stdout
+and stderr; an explicit ``--type`` or a mapping ``type:`` adds exactly one stderr line. The
+remaining entry scripts follow in PR-3c.
 ``parse_type_arg`` is the one hand-parser behind the pipeline gates that take ``--type``
 without argparse (``check_revised``, ``check_right_sized``, ``check_autofix_complete``), so
 their error text cannot drift.
@@ -86,8 +94,10 @@ per-id routers.
 
 ``resolve(registry, ...)`` runs the ladder: ``--type`` (rung 1) > batch mapping ``type:``
 (rung 2; a per-item ``type`` key and a ``--type`` that disagrees with the mapping are hard
-errors, D1/D2) > deterministic signals (rung 3: artifact frontmatter ``type:``, else the
-artifact's parent directory against every type's ``dirs``, else ids through ``candidates``)
+errors, D1/D2; ``read_batch(path)`` is the shared parser of the two batch root forms — the
+legacy bare list and ``{type: <t>, items: [...]}`` with exactly those two keys) >
+deterministic signals (rung 3: artifact frontmatter ``type:``, else the artifact's parent
+directory against every type's ``dirs``, else ids through ``candidates``)
 > the grandfathered ``rfe`` default (rung 5). Conflicting deterministic signals are a hard
 error, never a question. Provisional-only signals resolve when they single out one type and
 are otherwise ambiguous: headless -> ``ResolveError`` (exit 3), interactive -> a
@@ -178,16 +188,20 @@ TRACKER_KEY_GRAMMARS = {"jira": re.compile(r"^[A-Z][A-Z0-9]+-[0-9]+$")}
 CANDIDATE_RUNGS = ("local_id_pattern", "key_prefix", "local_prefix", "tracker_grammar")
 PROVISIONAL_RUNG = "tracker_grammar"
 # ``resolve()`` rungs, strongest first (design §5; rung 4, the interactive picker, is not here).
+# The last rung is the grandfathered default: entry scripts print no resolve line for it (D3).
+LEGACY_DEFAULT_RUNG = "legacy default"
 RESOLVE_RUNGS = (
     "--type",
     "batch type",
     "frontmatter type",
     "artifact dir",
     "id grammar",
-    "legacy default",
+    LEGACY_DEFAULT_RUNG,
 )
 # Design §5 rung 5: the grandfathered default when nothing else decides.
 LEGACY_DEFAULT_TYPE = "rfe"
+# The batch mapping form (design §5 rung 2) has exactly these two root keys.
+BATCH_MAPPING_KEYS = ("type", "items")
 EXIT_AMBIGUOUS = 3
 
 # Sentinel for Descriptor.get(): "no default supplied" must be distinguishable from None,
@@ -514,6 +528,22 @@ class Descriptor:
     @property
     def score_fields(self):
         return list(self.get("schema.review.score_fields"))
+
+    @property
+    def parent_key_pattern(self):
+        """``^(a|b|c)$`` over ``conventions.parent_key_patterns``, or ``None`` when the
+        descriptor declares no patterns.
+
+        The ONE join behind every ``parent_key`` check: ``artifact_utils`` puts it on the
+        ``<type>-task`` schema and ``validate_batch_input`` applies it to batch entries, so the
+        task schema and the batch validator agree by construction (PR-1 checklist Q14,
+        reconciled in PR-3b). Alternatives are used verbatim (unanchored regex fragments such
+        as ``RHAISTRAT-\\d+``), exactly as the hand-written literals were.
+        """
+        patterns = self.get("conventions.parent_key_patterns", None)
+        if not patterns:
+            return None
+        return "^(" + "|".join(patterns) + ")$"
 
 
 def _bare_dir(value):
@@ -1031,11 +1061,14 @@ def resolve(
     *,
     explicit_type=None,
     batch=None,
+    batch_items=None,
+    items_are_ids=True,
     artifact=None,
     ids=(),
     env=None,
     headless=None,
     workspace=None,
+    binding=True,
 ):
     """Run the design §5 resolution ladder and return a ``Resolution``.
 
@@ -1043,11 +1076,18 @@ def resolve(
 
     1. ``--type`` — ``explicit_type``; an unregistered name is a ``ResolveError`` listing the
        registered types.
-    2. ``batch type`` — ``batch`` is a YAML path. A mapping root with ``type`` and ``items``
-       is the mapping form and its ``type`` is the signal (a disagreeing ``explicit_type`` is
-       an error, D1). A bare list root is the legacy form: no rung-2 signal, its string items
-       join ``ids``. Any item — in either form — that is a mapping carrying a ``type`` key is
-       an error (D2: per-item types are rejected). Any other root shape is an error.
+    2. ``batch type`` — ``batch`` is a YAML path, read through ``read_batch`` unless the
+       caller already did: ``batch_items`` is that ``(type, items)`` pair (a batch-root
+       consumer reads a pipe or ``/dev/stdin`` exactly once) and ``batch`` then only names
+       the file in messages. A mapping root with ``type`` and ``items`` is the mapping form
+       and its ``type`` is the signal (a disagreeing ``explicit_type`` is an error, D1). A
+       bare list root is the legacy form: no rung-2 signal. Any item — in either form — that
+       is a mapping carrying a ``type`` key is an error (D2: per-item types are rejected).
+       Bare string items join ``ids`` when ``items_are_ids`` (the default — a batch of ids,
+       as the ``resolve`` CLI takes); an entry-grammar caller (the speedrun batch, where
+       every item is a mapping) passes ``items_are_ids=False`` so a bare string is its own
+       malformed-entry error — never an id signal, never a D5 error. Any other root shape is
+       an error.
     3. deterministic signals — ``artifact`` (a markdown path): a string frontmatter ``type``
        is ``frontmatter type``; else its parent directory name against every type's ``dirs``
        is ``artifact dir`` AND its stem joins ``ids`` (so a stem owned by another type is a
@@ -1071,7 +1111,17 @@ def resolve(
     The binding on the result is ``desc.binding(env, workspace, shorthand=True)`` — the bare
     ``JIRA_PROJECT`` / ``JIRA_ISSUE_TYPE`` shorthand applies to the resolved type only.
     ``workspace`` is the mapping ``TypeRegistry.workspace_bindings`` returned; a headless run
-    whose resolved binding was overridden from the workspace is refused (§3.2.1 g).
+    whose resolved binding was overridden from the workspace is refused (§3.2.1 g). With
+    ``binding=False`` the caller wants the type verdict only (``type_name``, ``rung``,
+    ``desc``): the RESOLVED type's binding is not computed — its overrides are neither read
+    nor validated, so a caller that would never apply them cannot fail on them —
+    ``Resolution.binding`` is ``None``, the line carries no override clause and the §3.2.1 g
+    refusal, which belongs to the binding, is skipped with it. The id rungs are deliberately
+    NOT affected: ``candidates()`` always matches over effective bindings (an overridden
+    write prefix decides ownership), so when ids are resolved a malformed override in the
+    environment still raises ``RegistryError`` whatever ``binding`` says. The batch-root
+    consumers pass ``binding=False`` together with ``items_are_ids=False`` and so never reach
+    that path (PR-3b); the writers take the binding (PR-3c).
     """
     if env is None:
         env = registry.env
@@ -1087,14 +1137,16 @@ def resolve(
 
     def resolved(name, rung, provisional):
         desc = registry.get(name)
-        binding = desc.binding(env, workspace=workspace, shorthand=True)
-        if headless_run and "workspace" in binding["source"].split("+"):
+        if not binding:
+            return Resolution(name, desc, rung, provisional, None, [])
+        effective = desc.binding(env, workspace=workspace, shorthand=True)
+        if headless_run and "workspace" in effective["source"].split("+"):
             raise ResolveError(
-                f"{name}: binding override(s) {', '.join(binding['overrides'])} come from the "
+                f"{name}: binding override(s) {', '.join(effective['overrides'])} come from the "
                 f"workspace file ({WORKSPACE_FILENAME}), which is not trusted in a headless/CI "
                 f"run; set {BINDING_ENV_PREFIX}* variables instead (design §3.2.1 g)"
             )
-        return Resolution(name, desc, rung, provisional, binding, [])
+        return Resolution(name, desc, rung, provisional, effective, [])
 
     # rung 1
     if explicit_type is not None:
@@ -1103,16 +1155,22 @@ def resolve(
     # rung 2 — (item_id, strict): strict ids are the caller's and the batch's; a derived
     # artifact stem is not (D5 applies to strict ids only).
     id_list = [(i, True) for i in ids if isinstance(i, str) and i]
-    batch_type = None
-    if batch is not None:
+    batch_type, batch_ids = None, []
+    if batch_items is not None:
+        if batch is None:
+            raise ValueError("resolve(batch_items=...) needs batch: the file name for messages")
+        batch_type, items = batch_items
+        batch_ids = _batch_item_ids(batch, items)
+    elif batch is not None:
         batch_type, batch_ids = _batch_signal(batch)
-        if batch_type is not None:
-            known(batch_type, f"{batch} type:")
-            if explicit_type is not None and explicit_type != batch_type:
-                raise ResolveError(
-                    f"--type {explicit_type} disagrees with {batch} type: {batch_type}; both are "
-                    f"explicit, so neither is guessed — pass one or make them agree (PR-3 D1)"
-                )
+    if batch_type is not None:
+        known(batch_type, f"{batch} type:")
+        if explicit_type is not None and explicit_type != batch_type:
+            raise ResolveError(
+                f"--type {explicit_type} disagrees with {batch} type: {batch_type}; both are "
+                f"explicit, so neither is guessed — pass one or make them agree (PR-3 D1)"
+            )
+    if items_are_ids:
         id_list.extend((i, True) for i in batch_ids)
     chosen = explicit_type if explicit_type is not None else batch_type
 
@@ -1183,7 +1241,7 @@ def resolve(
         only_provisional = True
     else:
         if LEGACY_DEFAULT_TYPE in registry:
-            return resolved(LEGACY_DEFAULT_TYPE, "legacy default", False)
+            return resolved(LEGACY_DEFAULT_TYPE, LEGACY_DEFAULT_RUNG, False)
         raise ResolveError(
             f"no type signal and the legacy default type {LEGACY_DEFAULT_TYPE!r} is not "
             f"registered; pass --type (registered types: {registered_text})"
@@ -1212,23 +1270,46 @@ def _load_yaml(path, what):
         raise ResolveError(f"{path}: cannot read {what}: {exc}") from exc
 
 
-def _batch_signal(path):
-    """``(type or None, string item ids)`` for a batch file (design §5 rung 2, D1/D2)."""
+def read_batch(path):
+    """``(type or None, items)`` for a batch file — the ONE parser of the batch root, shared by
+    ``resolve`` (rung 2), ``validate_batch_input.py`` and ``next_rfe_id.py --from-batch``.
+
+    Two root forms (design §5 rung 2): the legacy bare list (``type`` is ``None``; the list is
+    returned as is) and the mapping form ``{type: <t>, items: [...]}`` whose keys are EXACTLY
+    ``type`` (a non-empty string, returned stripped) and ``items`` (a list). Every other root —
+    a missing or extra key, a non-list ``items``, another ``type`` shape, an unreadable file or
+    invalid YAML — raises ``ResolveError`` (``exit_code`` 1). The items are not inspected here:
+    the per-item ``type`` rule (D2) belongs to the ladder (``resolve``), so a caller can map the
+    shape errors of the file to its own usage-error code and leave the content errors to
+    ``resolve``.
+    """
     data = _load_yaml(path, "batch file")
-    if isinstance(data, dict) and "type" in data and "items" in data:
+    if isinstance(data, dict) and all(key in data for key in BATCH_MAPPING_KEYS):
         batch_type = data["type"]
         if not isinstance(batch_type, str) or not batch_type.strip():
             raise ResolveError(f"{path}: 'type' must be a non-empty string, got {batch_type!r}")
         items = data["items"]
         if not isinstance(items, list):
             raise ResolveError(f"{path}: 'items' must be a list, got {_shape(items)}")
-        return batch_type.strip(), _batch_item_ids(path, items)
+        extra = [str(key) for key in data if key not in BATCH_MAPPING_KEYS]
+        if extra:
+            raise ResolveError(
+                f"{path}: the mapping form takes exactly the keys 'type' and 'items'; unexpected "
+                f"key(s): {', '.join(extra)}"
+            )
+        return batch_type.strip(), items
     if isinstance(data, list):
-        return None, _batch_item_ids(path, data)
+        return None, data
     raise ResolveError(
         f"{path}: expected a list of items (legacy form) or a mapping with 'type' and 'items' "
         f"(mapping form), got {_shape(data)}"
     )
+
+
+def _batch_signal(path):
+    """``(type or None, string item ids)`` for a batch file (design §5 rung 2, D1/D2)."""
+    batch_type, items = read_batch(path)
+    return batch_type, _batch_item_ids(path, items)
 
 
 def _batch_item_ids(path, items):

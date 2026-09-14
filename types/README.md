@@ -89,7 +89,7 @@ itself is fine — `resolve()` follows the link).
 | `generate_review_pdf.py` | `REPORT_CONFIG`, `--type` choices | PR-2a |
 | `generate_run_report.py` | `TYPE_CONFIG` (`scan_tasks` bound to `artifact_utils.scan_tasks(desc)`), `--type` choices | PR-2a, PR-2b; the `tracker_ref`/role predicates pending (PR-3) |
 | `jql_query.py` | default exclusion wrapper, `--project` choices | PR-2a |
-| `next_rfe_id.py` | `DEFAULT_PREFIX` / `DEFAULT_DIR` | PR-2a |
+| `next_rfe_id.py` | `DEFAULT_PREFIX` / `DEFAULT_DIR` (`type_defaults(desc)`); `--from-batch` reads the file through `type_registry.read_batch` and decides the type through `resolve` — the `{type, items}` mapping form takes prefix and directory from its type's descriptor, the legacy list keeps the rfe defaults | PR-2a; PR-3b (batch forms) |
 | `prep_assess.py` | prefix sniff → `detect()` | PR-2a |
 | `preserve_review_state.py` | prefix sniff → `detect()` | PR-2a |
 | `reassess_save.py` | `_TYPE_CONFIG`, `--type` choices | PR-2a |
@@ -97,7 +97,7 @@ itself is fine — `resolve()` follows the link).
 | `split_collect.py` | `_TYPE_CONFIG`, `_set_revise` defaults, `--type` choices | PR-2a |
 | `split_submit.py` | `SPLIT_CONFIG` (descriptor projection over `names()`: `identity.jira.{project,issue_type}`, `conventions.{comment_prefix,label_prefix}`, `display.{entity,entity_plural}`, `id_field`, `dirs`, `index.enabled`, alignment labels; `scan_fn` / `rename_fn` / `parse_child_fn` bound to the `artifact_utils` generics, `find_review_fn` = `find_review_file`), the split link type and the close-superseded transition / resolution from `identity.jira.{split_link_type,state_map.close_superseded}`, `--type` choices | PR-2d; the feasibility set, the split-child marker and every phase label are still composed from `conventions.label_prefix`; the durable-store comment grammar and the `<PROJECT>-DRY` sentinel are composition, pinned by source form |
 | `submit.py` | `TYPE_CONFIGS` (descriptor projection over `names()`), `--type` choices, task scan / rename via `artifact_utils.scan_tasks` / `rename_to_tracker_key(desc)`, approve target from `identity.jira.state_map.approved` | PR-2d; grandfathered: the rfe `snapshot_prefix` `''` sentinel and the `split_type_arg` / report `--type` argv convention (no `--type` for rfe); the `auto-created` / `auto-revised` / `needs-attention` / `split-quarantine` labels are still composed from `conventions.label_prefix` |
-| `validate_batch_input.py` | `ALLOWED_PRIORITIES`, known fields, `--type` choices | PR-2a; `PARENT_KEY_PATTERN` literal until PR-3 (Q14) |
+| `validate_batch_input.py` | `ALLOWED_PRIORITIES` / `KNOWN_FIELDS` / `PARENT_KEY_PATTERN` per type (`schema.task.priority.enum`, base ∪ `batch.extra_fields`, `Descriptor.parent_key_pattern` — the task schema's join, Q14 reconciled), `--type` choices; the batch root through `type_registry.read_batch`, the type through `resolve` | PR-2a; PR-3b (batch forms, per-type rules) |
 | `verify_phase.py` | phase tables, `_TYPE_CONFIG`, error-stub score tail, `--type` choices | PR-2a |
 | `check_autofix_complete.py` | `--type` validated through `type_registry.parse_type_arg` (unknown → exit 2 with the registered list); `_TYPE_CONFIG` literal, pinned | PR-3a (validation); table pending |
 | `check_content_preservation.py` | inline dir branch | pending |
@@ -158,8 +158,8 @@ and `produces[]` (§3.7 cross-type chain; rfe-creator ships no gate evaluator),
 `identity.github` branch (§8.6 shape; adapter/emulator are first-requester work), `classification`,
 `dirs.{dupes,merges}`, `companions.extra_suffixes`, `conventions.labels.{processing,human_sign_off,
 templates}`, `conventions.query_default`, `schema.task.priority.map_to_tracker` (the `enum`
-beside it feeds `artifact_utils.SCHEMAS` and `validate_batch_input.ALLOWED_PRIORITIES` since
-PR-2b / PR-2a; the map has no consumer), `schema.review.{extra_scores,extra_rules}`,
+beside it feeds `artifact_utils.SCHEMAS` since PR-2b and `validate_batch_input.ALLOWED_PRIORITIES`
+per type since PR-3b; the map has no consumer), `schema.review.{extra_scores,extra_rules}`,
 `pipeline.context_sources` (descriptive; SETUP is still hardcoded),
 `pipeline.dimensions[].{blocking, condition.context_exists, setup}`,
 `snapshot.{mode,processed_gate}`.
@@ -220,14 +220,16 @@ registered), is a hard failure. `DRAFT-` is not adopted at v1.
 [--workspace-root DIR] [--json] [ID ...]` runs the deterministic ladder and prints one line,
 `TYPE RESOLVED: <type> (<rung>)` — with `; binding override project=KONFLUX ...` inside the
 parentheses when the effective binding carries overrides (`project`, `issue_type`, `local_prefix`
-order). The `resolve` CLI always prints it; the entry scripts (wired in PR-3b/PR-3c) stay silent for
-the legacy default so existing invocations remain byte-identical (D3). `--json` prints
+order). The `resolve` CLI always prints it; the entry scripts print it only when a non-default rung
+decided and stay silent for the legacy default, so existing invocations remain byte-identical (D3) —
+`validate_batch_input.py` and `next_rfe_id.py --from-batch` since PR-3b (on stderr, see "Batch input
+forms" below), the remaining entry scripts in PR-3c. `--json` prints
 `{type, rung, provisional, binding, candidates, line}` instead. Rungs, strongest first:
 
 | Rung | Signal | Notes |
 |---|---|---|
 | `--type` | explicit type | unknown → exit 1 with the registered list |
-| `batch type` | `{type: <t>, items: [...]}` batch root | a legacy bare list gives no signal (its string items join the ids); `--type` disagreeing with `type:` is an error (D1); an item carrying its own `type` key is an error (D2); any other root shape is an error |
+| `batch type` | `{type: <t>, items: [...]}` batch root | a legacy bare list gives no signal (its string items join the ids for the `resolve` CLI's batch of ids; an entry-grammar caller passes `items_are_ids=False`); `--type` disagreeing with `type:` is an error (D1); an item carrying its own `type` key is an error (D2); any other root shape is an error |
 | `frontmatter type` | artifact frontmatter `type:` | `--artifact PATH`; the block between the first two `---` lines |
 | `artifact dir` | the artifact's parent directory is one of a type's `dirs` | when there is no frontmatter `type:`; the file stem always joins the ids too, so a stem owned by another type is a conflict, not a silent directory win |
 | `id grammar` | ids through `candidates()` | rungs `local_id_pattern` → `key_prefix` → `local_prefix` → the Jira grammar `^[A-Z][A-Z0-9]+-[0-9]+$` (provisional: every Jira-bound type), each over **effective** bindings; under a `LOCAL_PREFIX` override the descriptor's own pattern and prefix stay read forms, so ids minted before the override still resolve |
@@ -247,6 +249,59 @@ Headless means `is_headless(env, flag)`: `RFE_CREATOR_HEADLESS` (exported by the
 predicate for the extra-roots seam, the workspace file and resolve (D4). `python3 scripts/type_registry.py candidates <ID>` prints the rung
 and the candidate types of one id (`tracker_grammar (provisional): rfe initiative`). `detect()` is
 unchanged (one Descriptor or `None`, descriptor values only) for the per-id routers.
+
+### Batch input forms (PR-3b)
+
+A batch file has one of two root forms, parsed by `type_registry.read_batch(path)` — the one parser
+behind `resolve` (rung 2), `validate_batch_input.py` and `next_rfe_id.py --from-batch`:
+
+| Form | Root | Type |
+|---|---|---|
+| legacy list | a bare list of entries | `--type`, else the legacy default `rfe` (no signal — silent) |
+| mapping | `{type: <t>, items: [...]}`, exactly those two keys | `type:` (rung 2); `--type`, when given, must agree |
+
+The rules are `resolve`'s, so the two scripts cannot drift from the ladder:
+
+- **D1** — `--type` disagreeing with the mapping's `type:` is a hard error: both are explicit,
+  nothing is guessed.
+- **D2** — an item carrying its own `type` key is a hard error in either form: a run is
+  single-typed (`tmp/pipeline-state.yaml` holds one type), so the message tells the author to split
+  the batch by type, one typed run per workspace.
+- An unknown mapping type is an error naming the registered types; a root that is neither form (a
+  missing or extra key, a non-list `items`) is a shape error.
+- **Stderr rule (D3) for the two protocol scripts.** Their stdout is machine-read
+  (`ERROR_COUNT=`/`WARNING_COUNT=`/`VALID=` lines; one id per line), so the resolve line
+  `TYPE RESOLVED: <type> (--type)` / `(batch type)` goes to **stderr**, and only when a non-default
+  rung decided; the legacy default prints nothing anywhere. `validate_batch_input.py` reports D1, D2
+  and an unknown type through its protocol (`ERROR_COUNT=1`, one `ERROR: batch: ...` line,
+  `VALID=false`, exit 1) and keeps exit 2 for file and shape errors; `next_rfe_id.py` has no content
+  protocol and exits 2 with the message on stderr for all of them — and for an explicit
+  `--prefix`/`--dir` that disagrees with the mapping type's descriptor values (the initiative
+  speedrun's `--prefix INIT --dir artifacts/initiatives` with a legacy list is no conflict: the
+  legacy default is not a signal).
+- **Read once, verdict only.** Both scripts hand `resolve` the pair `read_batch` returned
+  (`batch_items`: a pipe or `/dev/stdin` is read exactly once), tell it that a bare string item is
+  an entry, not an id (`items_are_ids=False`: the validator's `entry N: must be a mapping` error,
+  never a rung-3 signal nor a headless D5 error), and take the type verdict only (`binding=False`:
+  `JIRA_PROJECT` / `JIRA_ISSUE_TYPE` / `RFE_CREATOR_BINDING_*` are neither read nor validated —
+  main read none of them — and the line carries no binding clause). The legacy default is therefore
+  byte-identical to main on stdout and stderr whatever the environment. An explicit `--type` keeps
+  main's stdout and adds exactly one stderr line: both speedrun bodies pass theirs (`--type rfe` /
+  `--type initiative`), which is what rejects a mapping `type:` of the other type (D1) before any
+  id is allocated or any agent runs.
+- **Parent keys per type.** The batch rule for `parent_key` is `Descriptor.parent_key_pattern`
+  (`'^(' + '|'.join(conventions.parent_key_patterns) + ')$'`), the same string `artifact_utils`
+  puts on the `<type>-task` schema (PR-1 checklist Q14 reconciled by construction), applied only
+  when the type lists `parent_key` in `batch.extra_fields`: an initiative batch accepts
+  `RHAISTRAT-`, `RHOAIENG-` and — new in PR-3b — `INIT-` parents, and the error text is rendered
+  from the patterns (`'parent_key' must match one of RHAISTRAT-\d+, RHOAIENG-\d+, INIT-\d+`); an
+  rfe entry carrying `parent_key` gets the unknown-field warning, never a pattern error (before
+  PR-3b a malformed value was a pattern error on any type — that check left with the literal;
+  `--strict`, which both speedruns pass, still blocks the warning). The priority vocabulary is the
+  resolved type's `schema.task.priority.enum`.
+
+The speedrun bodies keep the list-form example (the eval harness feeds that form) and describe the
+mapping form in prose right after it.
 
 ## Lint gates (§3.3)
 
