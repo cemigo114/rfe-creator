@@ -84,6 +84,9 @@ exclusion, and split parent detection. The `rfe_id` pattern constraint causes
 | `"feasibility_failed"` | Review Step 2 | `rfe.review/SKILL.md` Step 2 |
 | `"review_failed"` | Review Step 3 | `rfe.review/SKILL.md` Step 3 |
 | `"split_failed: agent did not write split-status file"` | Split Step 1 | `rfe.split/SKILL.md` Step 1 |
+| `"<phase base>_stalled"` (`fetch_stalled`, `assess_stalled`, `feasibility_stalled`, `alignment_stalled`, `review_stalled`: the stuck poll phase with the type's `pipeline.poll_prefix` stripped, so `assess_stalled` for `assess` and `initiative-assess` alike) | Wave stall guard escalation of a fetch / assess / review-class wave (`docs/wave-stall-guard.md`), on the registry error stub | `pipeline_state.py` `_escalate_stuck` via `verify_phase.write_error_stubs(outcome="stalled")` |
+| `"revise_stalled"` | Wave stall guard escalation of a REVISE-class wave: set on the real review (score, recommendation and `auto_revised` kept), or on the registry stub when that review cannot be updated | `pipeline_state.py` `_mark_revise_stalled` via `_mark_review_or_stub` (`artifact_utils.update_frontmatter`, falling back to `verify_phase.write_error_stubs(error="revise_stalled")`) |
+| `"split_not_attempted: wave stalled ..."` | Wave stall guard escalation of a SPLIT wave (non-retryable, like the submit.py form below) | `pipeline_state.py` `_mark_split_not_attempted` via `_mark_review_or_stub` |
 | `"split_refused: too many leaf children"` | Submit Phase 1 | `submit.py:199` |
 | `"split_refused: jira conflict"` | Submit Phase 1 | `submit.py:233` |
 | `"submit_failed: {msg}"` | Submit Phase 2 (also sets needs_attention=true) | `submit.py:597-605` |
@@ -930,8 +933,11 @@ returns "completed" only when `auto_revised=true`. If the revise agent runs but
 makes no changes (e.g., split-recommended IDs where scope can't change), the
 review file will have `auto_revised=false` and polling will hang. The
 orchestrator's post-revise `check_revised.py` step partially mitigates this by
-fixing the flag after agent completion, but the polling loop itself has no
-timeout guard.
+fixing the flag after agent completion. The polling loop itself is bounded by
+the wave stall guard in `pipeline_state.py wait-for-wave`
+(`docs/wave-stall-guard.md`): after a no-progress window it re-dispatches or
+escalates the stuck ids and releases the slot by dropping the id from the wave
+and ids files, without changing these per-phase checks.
 
 ### 5.8 `revise + infeasible` Is a Terminal State
 

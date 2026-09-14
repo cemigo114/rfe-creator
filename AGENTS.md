@@ -161,7 +161,9 @@ When `tmp/pipeline-state.yaml` exists and the phase is not DONE:
 2. After launching each wave of agents, your next Bash call MUST be
    `python3 scripts/pipeline_state.py wait-for-wave`. This is a blocking
    synchronization barrier that reads artifact files on disk. On exit 3,
-   re-run the same command.
+   re-run the same command. An exit 0 preceded by a `wait-for-wave: STALL`
+   line on stderr is normal: the barrier has re-dispatched or escalated the
+   stuck ids itself (docs/wave-stall-guard.md); continue with next-action.
 3. Do not wait for agent-completion notifications — the wait-for-wave command
    is unrelated to the Agent tool's notification system.
 
