@@ -6,12 +6,19 @@ Exits 0 if all complete, exits 1 with the list of missing IDs if not.
 
 Usage:
     python3 scripts/check_autofix_complete.py [--type rfe|initiative]
+
+An unregistered --type exits 2 with the registered type list.
 """
 
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import type_registry
+
+# The registry validates --type; _TYPE_CONFIG stays literal because its ids_file values are
+# pipeline facts (the speedrun state prefix) pinned to the descriptors by test, not derived.
+_TYPES = type_registry.load()
 
 _TYPE_CONFIG = {
     "rfe": {
@@ -26,13 +33,23 @@ _TYPE_CONFIG = {
 
 
 def main():
-    pipeline_type = "rfe"
-    args = sys.argv[1:]
-    if "--type" in args:
-        idx = args.index("--type")
-        if idx + 1 < len(args):
-            pipeline_type = args[idx + 1]
+    # --type is hand-parsed by the registry's shared helper (design §5 rung 1): an unregistered
+    # name, or a trailing flag, exits 2 with the registered list; rfe when the flag is absent.
+    try:
+        pipeline_type, _ = type_registry.parse_type_arg(_TYPES, sys.argv[1:])
+    except type_registry.ResolveError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(exc.exit_code)
 
+    if pipeline_type not in _TYPE_CONFIG:
+        # Registered (a drop-in via RFE_CREATOR_EXTRA_TYPES) but this table is still literal:
+        # refuse through the same usage-error path rather than an uncaught KeyError.
+        print(
+            f"ERROR: --type {pipeline_type!r} is registered but has no entry in this script's "
+            f"table yet; supported: {', '.join(_TYPE_CONFIG)}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     tc = _TYPE_CONFIG[pipeline_type]
 
     ids_file = tc["ids_file"]

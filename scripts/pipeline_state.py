@@ -31,11 +31,21 @@ from datetime import datetime, timezone
 
 import yaml
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import type_registry
+
+_TYPES = type_registry.load()
+
 STATE_FILE = "tmp/pipeline-state.yaml"
 WAVE_IDS_FILE = "tmp/pipeline-wave-ids.txt"
 DISPATCH_MARKER = "tmp/.dispatch-marker"
 
 MAX_NEXT_ACTION_ITERATIONS = 50
+
+# The explicit headless marker the type registry reads (type_registry.HEADLESS_MARKER_VARS;
+# design §3.5, PR-3 D4). A headless pipeline exports it once, at init and on every state load,
+# so each subprocess it launches sees the same predicate the pipeline runs under.
+HEADLESS_MARKER_ENV = "RFE_CREATOR_HEADLESS"
 
 
 # ---------- YAML block-scalar dumper (scoped) ----------
@@ -446,13 +456,30 @@ def _wave_size(state, config):
 # ---------- State helpers ----------
 
 
+def _export_headless_marker(state):
+    """Export ``RFE_CREATOR_HEADLESS=1`` into this process when ``state`` says ``headless``.
+
+    Every subprocess the pipeline launches inherits ``os.environ``, so a headless run marks
+    itself here — at ``init --headless`` and on every state load — and the registry's
+    ``is_headless`` predicate agrees with the pipeline's own flag in every child (design §3.5,
+    PR-3 D4: one headless predicate). The state file is authoritative: ``init --headless``
+    wrote it, so the marker is set to ``1`` even over a stale or false value the environment
+    already carried — a child that saw ``0`` would treat the run as interactive and could
+    stall a headless pipeline. A non-headless state exports nothing and never unsets a value.
+    """
+    if isinstance(state, dict) and state.get("headless"):
+        os.environ[HEADLESS_MARKER_ENV] = "1"
+
+
 def _load_state():
-    """Load pipeline state from disk."""
+    """Load pipeline state from disk (and export the headless marker for a headless run)."""
     if not os.path.exists(STATE_FILE):
         print(f"State file not found: {STATE_FILE}", file=sys.stderr)
         sys.exit(1)
     with open(STATE_FILE) as f:
-        return yaml.safe_load(f)
+        state = yaml.safe_load(f)
+    _export_headless_marker(state)
+    return state
 
 
 def _save_state(state):
@@ -845,7 +872,14 @@ def advance(state, dry_run=False):
 
 def cmd_init(args):
     parser = argparse.ArgumentParser(prog="pipeline_state.py init")
-    parser.add_argument("--type", choices=["rfe", "initiative"], default="rfe")
+    # Registered type names (rfe first) that this script has a phase table for: an unknown
+    # --type fails with that list (design §5 rung 1), and a drop-in type without a
+    # PIPELINE_TYPES entry is refused HERE, before any state is written, rather than by
+    # _validate_state_values later. PIPELINE_TYPES keeps its literal table, pinned equal to
+    # the registry names.
+    parser.add_argument(
+        "--type", choices=[n for n in _TYPES.choices() if n in PIPELINE_TYPES], default="rfe"
+    )
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--announce-complete", action="store_true")
@@ -874,6 +908,7 @@ def cmd_init(args):
         "retry_batch": None,
     }
     _save_state(state)
+    _export_headless_marker(state)
     print(f"Initialized pipeline state: type={opts.type} batch_size={opts.batch_size}")
 
 

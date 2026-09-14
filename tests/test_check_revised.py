@@ -3,8 +3,12 @@
 
 import os
 import subprocess
+import sys
 
 import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+import check_revised  # noqa: E402
 
 SCRIPT = os.path.join(os.path.dirname(__file__), "..", "scripts", "check_revised.py")
 FM_SCRIPT = os.path.join(os.path.dirname(__file__), "..", "scripts", "frontmatter.py")
@@ -338,3 +342,64 @@ class TestReassessCyclePreservation:
         assert "auto_revised" not in set_cmd, (
             "review-agent.md frontmatter.py set must not include auto_revised"
         )
+
+
+class TestTypeArg:
+    """--type is validated against the registry through the shared
+    type_registry.parse_type_arg (PR-3a; pinned in tests/test_type_registry.py): an
+    unregistered name exits 2 with the registered list instead of a KeyError traceback."""
+
+    UNKNOWN = "ERROR: unknown --type 'bogus'; registered types: rfe, initiative\n"
+    TRAILING = "ERROR: --type requires a value; registered types: rfe, initiative\n"
+
+    def test_usage_choices_follow_the_registry(self):
+        assert check_revised._TYPE_CHOICES == "|".join(check_revised._TYPES.choices())
+        assert check_revised._TYPE_CHOICES == "rfe|initiative"
+
+    def test_cli_unknown_type_in_batch_mode(self, tmp_path):
+        result = subprocess.run(
+            ["python3", SCRIPT, "--type", "bogus", "--batch"],
+            capture_output=True,
+            text=True,
+            cwd=tmp_path,
+        )
+        assert result.returncode == 2
+        assert result.stderr == self.UNKNOWN
+        assert result.stdout == ""
+
+    def test_cli_unknown_type_in_pair_mode(self, tmp_dir):
+        _write("original.md", "Same.\n")
+        _write("task.md", "Same.\n")
+        result = subprocess.run(
+            ["python3", SCRIPT, "--type", "bogus", "original.md", "task.md"],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 2
+        assert result.stderr == self.UNKNOWN
+
+    def test_cli_trailing_type(self):
+        result = subprocess.run(
+            ["python3", SCRIPT, "--batch", "--type"], capture_output=True, text=True
+        )
+        assert result.returncode == 2
+        assert result.stderr == self.TRAILING
+
+    def test_cli_usage_lists_the_registered_types(self):
+        result = subprocess.run(["python3", SCRIPT, "only-one"], capture_output=True, text=True)
+        assert result.returncode == 2
+        assert result.stderr == (
+            "Usage: check_revised.py [--type rfe|initiative] <original> <task>\n"
+            "       check_revised.py [--type rfe|initiative] --batch [ID ...]\n"
+        )
+
+    def test_cli_registered_type_still_works_in_pair_mode(self, tmp_dir):
+        _write("original.md", "Original.\n")
+        _write("task.md", "Revised.\n")
+        result = subprocess.run(
+            ["python3", SCRIPT, "--type", "initiative", "original.md", "task.md"],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip() == "REVISED=true"

@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""Tests for scripts/type_registry.py — the import-clean work-item type registry (PR-1).
+"""Tests for scripts/type_registry.py — the import-clean work-item type registry.
 
-design-proposals/work-item-types-unified.md §3.2 / §3.2.1 / §10 item 1. These tests are
-the registry's own contract (the adopting scripts, PR-2a onwards, test only their
-projections): discovery over one or more roots, the ``names()`` order today's
+design-proposals/work-item-types-unified.md §3.2 / §3.2.1 / §5 / §10 item 1 and the PR-3
+plan (PR-3a). These tests are the registry's own contract (the adopting scripts test only
+their projections): discovery over one or more roots, the ``names()`` order today's
 argparse ``choices`` lists use, dotted access, the two ``dirs`` spellings (Q13), label
-flattening, the effective binding overlay (§3.2.1) and the CLI exit codes.
+flattening, the effective binding overlay and its sources (§3.2.1: env, shorthand,
+workspace file, D13 re-rendering, the headless trust boundary), multi-candidate detection
+(``candidates``), the ownership check (``assert_registered_binding``), the resolution
+ladder (``resolve`` and its CLI) and the CLI exit codes.
 
 Every registry here is built with ``load(root=..., extra_roots=[], env={})`` so a
-developer's ``RFE_CREATOR_EXTRA_TYPES`` / ``RFE_CREATOR_BINDING_*`` never leaks in;
-subprocess tests scrub the same variables.
+developer's ``RFE_CREATOR_EXTRA_TYPES`` / ``RFE_CREATOR_BINDING_*`` / ``JIRA_PROJECT`` never
+leaks in; subprocess tests scrub the same variables.
 """
 
 import ast
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -28,11 +32,18 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 import type_registry  # noqa: E402
 from type_registry import (  # noqa: E402
     MISSING,
+    Candidates,
     Descriptor,
     RegistryError,
+    Resolution,
+    ResolveError,
+    assert_registered_binding,
     binding_env_var,
     load,
+    load_workspace_bindings,
     parse_extra_roots,
+    parse_type_arg,
+    resolve,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -92,13 +103,21 @@ def _shipped():
     return load(root=TYPES_ROOT, extra_roots=[], env={})
 
 
+_SHORTHAND_VARS = frozenset(
+    var for per_tracker in type_registry.SHORTHAND_ENV_VARS.values() for var in per_tracker
+)
+
+
 def _clean_env(**extra):
     """The developer's seams AND the headless/CI markers stay out of subprocess tests: under
-    GitHub Actions ``CI``/``GITHUB_ACTIONS`` would otherwise gate RFE_CREATOR_EXTRA_TYPES."""
+    GitHub Actions ``CI``/``GITHUB_ACTIONS`` would otherwise gate RFE_CREATOR_EXTRA_TYPES, and
+    a stray ``JIRA_PROJECT`` would move a ``resolve`` binding."""
     env = {
         k: v
         for k, v in os.environ.items()
-        if not k.startswith("RFE_CREATOR_") and k not in type_registry.HEADLESS_MARKER_VARS
+        if not k.startswith("RFE_CREATOR_")
+        and k not in type_registry.HEADLESS_MARKER_VARS
+        and k not in _SHORTHAND_VARS
     }
     env.update(extra)
     return env
@@ -450,7 +469,14 @@ RFE_DESCRIPTOR_BINDING = {
         "close_superseded": {"transition": "Closed", "resolution": "Obsolete"},
     },
     "local_prefix": "RFE-",
+    "local_id_pattern": r"^RFE-\d+$",
     "source": "descriptor",
+    "overrides": [],
+}
+# What ``python3 scripts/type_registry.py binding rfe`` prints with nothing overridden: the
+# PR-1 keys, byte for byte (the CLI view drops the two keys that only restate the descriptor).
+RFE_DESCRIPTOR_BINDING_CLI = {
+    k: v for k, v in RFE_DESCRIPTOR_BINDING.items() if k not in ("local_id_pattern", "overrides")
 }
 
 
@@ -784,11 +810,65 @@ class TestHeadlessGate:
         assert result.returncode == 0, result.stderr
         assert result.stdout == "rfe\ndocs\ninitiative\n"
 
+    def test_headless_flag_gates_the_env_root(self, extra, capsys):
+        """PR-3 D4, one predicate: ``load(headless=True)`` — the explicit ``--headless`` —
+        gates the seam exactly like a marker, with no marker set."""
+        env = {"RFE_CREATOR_EXTRA_TYPES": str(extra)}
+        assert load(root=TYPES_ROOT, env=env).headless is False
+        reg = load(root=TYPES_ROOT, env=env, headless=True)
+        assert reg.headless is True
+        assert reg.names() == ["rfe", "initiative"]
+        assert reg.ignored_extra_roots == [extra]
+        err = capsys.readouterr().err
+        assert err.count("\n") == 1 and "headless/CI run" in err and str(extra) in err
+        # allowlisted: honoured under the flag as under a marker
+        env["RFE_CREATOR_EXTRA_TYPES_ALLOWLIST"] = str(extra)
+        assert load(root=TYPES_ROOT, env=env, headless=True).names() == [
+            "rfe",
+            "docs",
+            "initiative",
+        ]
+        assert capsys.readouterr().err == ""
+        # explicit extra_roots stay a deliberate caller action, flag or not
+        assert "docs" in load(root=TYPES_ROOT, extra_roots=[extra], env={}, headless=True)
+
+    def test_resolve_cli_headless_flag_gates_the_env_root(self, extra):
+        """``resolve --headless`` reaches the seam through ``load(headless=...)``: a drop-in
+        that is not allowlisted is dropped before resolution, so an explicit ``--type``
+        naming it is unknown and its ids fall to the provisional Jira grammar."""
+        env = {"RFE_CREATOR_EXTRA_TYPES": str(extra)}
+        interactive = _cli("resolve", "--type", "docs", env=env)
+        assert interactive.returncode == 0, interactive.stderr
+        assert interactive.stdout == "TYPE RESOLVED: docs (--type)\n"
+        headless = _cli("resolve", "--headless", "--type", "docs", env=env)
+        assert headless.returncode == 1
+        assert headless.stdout == ""
+        assert (
+            "ignoring RFE_CREATOR_EXTRA_TYPES root(s) not in RFE_CREATOR_EXTRA_TYPES_ALLOWLIST"
+            in headless.stderr
+        )
+        assert "ERROR: unknown type 'docs' (--type); registered types: rfe, initiative" in (
+            headless.stderr
+        )
+        by_id = _cli("resolve", "--headless", "DOCS-1", env=env)
+        assert by_id.returncode == 3
+        assert "candidates rfe, initiative" in by_id.stderr
+        allowed = _cli(
+            "resolve",
+            "--headless",
+            "--type",
+            "docs",
+            env={**env, "RFE_CREATOR_EXTRA_TYPES_ALLOWLIST": str(extra)},
+        )
+        assert allowed.returncode == 0, allowed.stderr
+        assert allowed.stdout == "TYPE RESOLVED: docs (--type)\n"
+
 
 # ── import-clean invariant (Q5, design §10 item 1) ────────────────────────────────
 
-# `copy` is stdlib: binding() deep-copies the identity block so callers never alias descriptor data.
-ALLOWED_IMPORTS = {"argparse", "copy", "json", "os", "re", "sys", "pathlib", "yaml"}
+# `copy` is stdlib: binding() deep-copies the identity block so callers never alias descriptor
+# data; `dataclasses` is stdlib: the Candidates / Resolution result objects (PR-3a).
+ALLOWED_IMPORTS = {"argparse", "copy", "dataclasses", "json", "os", "re", "sys", "pathlib", "yaml"}
 
 
 class TestImportClean:
@@ -908,7 +988,24 @@ class TestCli:
     def test_binding_json_default(self):
         result = _cli("binding", "rfe", "--json")
         assert result.returncode == 0, result.stderr
-        assert json.loads(result.stdout) == RFE_DESCRIPTOR_BINDING
+        assert json.loads(result.stdout) == RFE_DESCRIPTOR_BINDING_CLI
+
+    def test_binding_zero_override_output_is_the_pr1_output(self):
+        """PR-3a neutrality: with nothing overridden the diagnostic CLI prints exactly the
+        PR-1 keys in the PR-1 order — ``overrides`` (empty) and ``local_id_pattern`` (the
+        descriptor's own) belong to the API dict, not to the CLI view (``_binding_view``)."""
+        text = _cli("binding", "rfe")
+        assert text.returncode == 0, text.stderr
+        assert list(yaml.safe_load(text.stdout)) == list(RFE_DESCRIPTOR_BINDING_CLI)
+        assert yaml.safe_load(text.stdout) == RFE_DESCRIPTOR_BINDING_CLI
+        assert list(json.loads(_cli("binding", "rfe", "--json").stdout)) == list(
+            RFE_DESCRIPTOR_BINDING_CLI
+        )
+        for name in ("rfe", "initiative"):
+            for out in (_cli("binding", name).stdout, _cli("binding", name, "--json").stdout):
+                assert "overrides" not in out and "local_id_pattern" not in out, (name, out)
+        # the API keeps both keys: the CLI is a view over it
+        assert _shipped().get("rfe").binding() == RFE_DESCRIPTOR_BINDING
 
     def test_binding_text_is_yaml(self):
         result = _cli("binding", "initiative")
@@ -1003,7 +1100,8 @@ class TestDetect:
 
     Three rungs, each tried across every type before the next: local_id_pattern full-match,
     tracker key_prefixes prefix, local_prefix prefix (the parity rung of the sniffs PR-2
-    replaces). Descriptor values only; multi-candidate resolution is PR-3.
+    replaces). Descriptor values only; the multi-candidate form over effective bindings is
+    ``candidates()`` (``TestCandidates`` below).
     """
 
     @pytest.mark.parametrize(
@@ -1107,3 +1205,1410 @@ class TestDetect:
         assert reg.get("rfe").binding()["key_prefixes"][0] == "OTHER-"
         assert reg.detect("OTHER-1") is None
         assert reg.detect("RHAIRFE-1").name == "rfe"
+
+
+# ── the one headless predicate (PR-3 D4) ─────────────────────────────────────────
+
+
+class TestHeadlessPredicate:
+    def test_explicit_flag_short_circuits(self):
+        assert type_registry.is_headless({}, True) is True
+        assert type_registry.is_headless({"CI": "0"}, flag=True) is True
+
+    def test_flag_false_leaves_the_markers_in_charge(self):
+        assert type_registry.is_headless({"CI": "true"}, False) is True
+        assert type_registry.is_headless({"CI": "0"}, False) is False
+
+    def test_one_argument_form_is_unchanged(self):
+        assert type_registry.is_headless({}) is False
+        assert type_registry.is_headless({"RFE_CREATOR_HEADLESS": "1"}) is True
+
+
+# ── binding sources (§3.2.1: env > shorthand > workspace > descriptor; D13) ──────
+
+WORKSPACE = {"rfe": {"jira": {"project": "KONFLUX", "issue_type": "Feature Request"}}}
+WORKSPACE_YAML = (
+    "bindings:\n  rfe:\n    jira:\n      project: KONFLUX\n      issue_type: Feature Request\n"
+)
+
+
+class TestBindingSources:
+    def test_default_binding_carries_the_pattern_and_no_overrides(self):
+        binding = _shipped().get("rfe").binding()
+        assert binding["local_id_pattern"] == r"^RFE-\d+$"
+        assert binding["overrides"] == []
+        assert binding["source"] == "descriptor"
+        initiative = _shipped().get("initiative").binding()
+        assert initiative["local_id_pattern"] == r"^INIT-\d+$"
+        assert initiative["overrides"] == []
+
+    def test_overrides_are_listed_in_field_order_whatever_the_env_order(self):
+        env = {
+            "RFE_CREATOR_BINDING_RFE_LOCAL_PREFIX": "REQ-",
+            "RFE_CREATOR_BINDING_RFE_PROJECT": "ACME",
+        }
+        binding = _shipped().get("rfe").binding(env)
+        assert binding["overrides"] == ["project", "local_prefix"]
+        assert binding["source"] == "env"
+
+    # -- D13: LOCAL_PREFIX re-renders local_id_pattern ---------------------------------
+
+    def test_local_prefix_override_rerenders_the_pattern(self):
+        desc = _shipped().get("rfe")
+        binding = desc.binding({"RFE_CREATOR_BINDING_RFE_LOCAL_PREFIX": "REQ-"})
+        assert binding["local_prefix"] == "REQ-"
+        assert binding["local_id_pattern"] == "^" + re.escape("REQ-") + r"\d+$"
+        assert re.fullmatch(binding["local_id_pattern"], "REQ-001")
+        assert not re.fullmatch(binding["local_id_pattern"], "RFE-001")
+        assert binding["overrides"] == ["local_prefix"]
+        # the descriptor and the default binding are untouched
+        assert desc.local_id_pattern == r"^RFE-\d+$"
+        assert desc.binding({})["local_id_pattern"] == r"^RFE-\d+$"
+
+    def test_an_escaped_descriptor_prefix_head_is_recognised(self, tmp_path):
+        root = tmp_path / "types"
+        _add_type(root, "esc", project="ESC", local_prefix="ES-", local_id_pattern=r"^ES\-\d{3}$")
+        env = {"RFE_CREATOR_BINDING_ESC_LOCAL_PREFIX": "XY-"}
+        binding = load(root=root, extra_roots=[], env=env).get("esc").binding()
+        assert binding["local_id_pattern"] == r"^XY\-\d{3}$"
+        assert re.fullmatch(binding["local_id_pattern"], "XY-007")
+
+    def test_pattern_not_starting_with_the_descriptor_prefix_is_a_hard_error(self, tmp_path):
+        root = tmp_path / "types"
+        _add_type(root, "odd", project="ODD", local_prefix="OD-", local_id_pattern=r"^(OD-\d+)$")
+        env = {"RFE_CREATOR_BINDING_ODD_LOCAL_PREFIX": "XY-"}
+        reg = load(root=root, extra_roots=[], env=env)
+        with pytest.raises(RegistryError, match=r"odd: cannot override local_prefix to 'XY-'") as e:
+            reg.get("odd").binding()
+        assert repr(r"^(OD-\d+)$") in str(e.value)
+        assert "D13" in str(e.value)
+
+    def test_prefix_only_in_the_middle_of_the_pattern_is_a_hard_error(self, tmp_path):
+        root = tmp_path / "types"
+        _add_type(root, "mid", project="MID", local_prefix="MI-", local_id_pattern=r"^X-MI-\d+$")
+        reg = load(root=root, extra_roots=[], env={"RFE_CREATOR_BINDING_MID_LOCAL_PREFIX": "XY-"})
+        with pytest.raises(RegistryError, match="does not start with"):
+            reg.get("mid").binding()
+
+    def test_rerendered_pattern_that_does_not_compile_is_a_hard_error(self, tmp_path):
+        root = tmp_path / "types"
+        _add_type(root, "bad", project="BAD", local_prefix="BA-", local_id_pattern=r"^BA-\d+(")
+        reg = load(root=root, extra_roots=[], env={"RFE_CREATOR_BINDING_BAD_LOCAL_PREFIX": "XY-"})
+        with pytest.raises(RegistryError, match="is not a valid regex"):
+            reg.get("bad").binding()
+
+    def test_descriptor_without_a_pattern_keeps_none(self, tmp_path):
+        root = tmp_path / "types"
+        data = _minimal("bare", project="B")
+        del data["identity"]["local_id_pattern"]
+        _add_type(root, "bare", data=data)
+        env = {"RFE_CREATOR_BINDING_BARE_LOCAL_PREFIX": "XY-"}
+        binding = load(root=root, extra_roots=[], env=env).get("bare").binding()
+        assert binding["local_prefix"] == "XY-"
+        assert binding["local_id_pattern"] is None
+
+    def test_pattern_without_a_descriptor_prefix_cannot_be_rerendered(self, tmp_path):
+        root = tmp_path / "types"
+        data = _minimal("nop", project="NOP")
+        del data["identity"]["local_prefix"]
+        _add_type(root, "nop", data=data)
+        env = {"RFE_CREATOR_BINDING_NOP_LOCAL_PREFIX": "XY-"}
+        with pytest.raises(RegistryError, match="descriptor local_prefix None"):
+            load(root=root, extra_roots=[], env=env).get("nop").binding()
+
+    # -- shorthand: JIRA_PROJECT / JIRA_ISSUE_TYPE, resolved type only --------------------
+
+    def test_shorthand_applies_only_when_asked_for(self):
+        env = {"JIRA_PROJECT": "KONFLUX", "JIRA_ISSUE_TYPE": "Story"}
+        desc = _shipped().get("rfe")
+        assert desc.binding(env)["source"] == "descriptor"
+        assert desc.binding(env)["project"] == "RHAIRFE"
+        binding = desc.binding(env, shorthand=True)
+        assert (binding["project"], binding["issue_type"]) == ("KONFLUX", "Story")
+        assert binding["key_prefixes"] == ["KONFLUX-", "RHAIRFE-"]
+        assert binding["source"] == "shorthand"
+        assert binding["overrides"] == ["project", "issue_type"]
+
+    def test_typed_variable_beats_the_shorthand(self):
+        env = {"JIRA_PROJECT": "KONFLUX", "RFE_CREATOR_BINDING_RFE_PROJECT": "ACME"}
+        binding = _shipped().get("rfe").binding(env, shorthand=True)
+        assert binding["project"] == "ACME"
+        assert binding["source"] == "env"  # the shorthand contributed nothing
+
+    def test_env_and_shorthand_combine_in_precedence_order(self):
+        env = {"JIRA_ISSUE_TYPE": "Story", "RFE_CREATOR_BINDING_RFE_PROJECT": "ACME"}
+        binding = _shipped().get("rfe").binding(env, shorthand=True)
+        assert (binding["project"], binding["issue_type"]) == ("ACME", "Story")
+        assert binding["source"] == "env+shorthand"
+        assert binding["overrides"] == ["project", "issue_type"]
+
+    def test_shorthand_values_pass_the_same_grammar(self):
+        with pytest.raises(RegistryError, match="JIRA_PROJECT='konflux'"):
+            _shipped().get("rfe").binding({"JIRA_PROJECT": "konflux"}, shorthand=True)
+
+    def test_blank_shorthand_counts_as_unset(self):
+        binding = _shipped().get("rfe").binding({"JIRA_PROJECT": "  "}, shorthand=True)
+        assert binding["source"] == "descriptor"
+
+    def test_shorthand_is_jira_only(self):
+        data = {
+            "type": "gh",
+            "identity": {
+                "tracker": "github",
+                "github": {"repo": "acme/widgets", "kind": "issue", "alias_prefix": "GH-"},
+            },
+        }
+        binding = Descriptor("gh", data).binding({"JIRA_PROJECT": "KONFLUX"}, shorthand=True)
+        assert binding["source"] == "descriptor"
+        assert binding["project"] is None
+
+    def test_registry_bindings_never_apply_the_shorthand(self):
+        reg = load(root=TYPES_ROOT, extra_roots=[], env={"JIRA_PROJECT": "KONFLUX"})
+        assert all(b["source"] == "descriptor" for b in reg.bindings().values())
+
+    # -- workspace mapping -----------------------------------------------------------------
+
+    def test_workspace_override(self):
+        reg = _shipped()
+        binding = reg.get("rfe").binding({}, workspace=WORKSPACE)
+        assert binding["project"] == "KONFLUX"
+        assert binding["key_prefixes"] == ["KONFLUX-", "RHAIRFE-"]
+        assert binding["source"] == "workspace"
+        assert binding["overrides"] == ["project", "issue_type"]
+        assert reg.get("initiative").binding({}, workspace=WORKSPACE)["source"] == "descriptor"
+
+    def test_env_beats_the_workspace(self):
+        env = {"RFE_CREATOR_BINDING_RFE_PROJECT": "ACME"}
+        binding = _shipped().get("rfe").binding(env, workspace=WORKSPACE)
+        assert binding["project"] == "ACME"
+        assert binding["issue_type"] == "Feature Request"
+        assert binding["source"] == "env+workspace"
+        assert binding["overrides"] == ["project", "issue_type"]
+
+    def test_shorthand_beats_the_workspace(self):
+        env = {"JIRA_PROJECT": "SHORT"}
+        binding = _shipped().get("rfe").binding(env, workspace=WORKSPACE, shorthand=True)
+        assert binding["project"] == "SHORT"
+        assert binding["source"] == "shorthand+workspace"
+
+    def test_all_three_sources(self):
+        env = {"RFE_CREATOR_BINDING_RFE_LOCAL_PREFIX": "REQ-", "JIRA_ISSUE_TYPE": "Story"}
+        workspace = {"rfe": {"jira": {"project": "KONFLUX"}}}
+        binding = _shipped().get("rfe").binding(env, workspace=workspace, shorthand=True)
+        assert (binding["project"], binding["issue_type"]) == ("KONFLUX", "Story")
+        assert binding["local_prefix"] == "REQ-"
+        assert binding["local_id_pattern"] == r"^REQ\-\d+$"
+        assert binding["source"] == "env+shorthand+workspace"
+        assert binding["overrides"] == ["project", "issue_type", "local_prefix"]
+
+    def test_workspace_values_pass_the_same_grammar(self):
+        bad = {"rfe": {"jira": {"project": "konflux"}}}
+        with pytest.raises(RegistryError, match=r"bindings\.rfe\.jira\.project='konflux'"):
+            _shipped().get("rfe").binding({}, workspace=bad)
+        bad = {"rfe": {"jira": {"local_prefix": "req-"}}}
+        with pytest.raises(RegistryError, match="expected an upper-case prefix ending in '-'"):
+            _shipped().get("rfe").binding({}, workspace=bad)
+        with pytest.raises(RegistryError, match="expected a non-empty string"):
+            _shipped().get("rfe").binding({}, workspace={"rfe": {"jira": {"project": 5}}})
+
+    def test_workspace_entries_for_another_tracker_or_type_are_ignored(self):
+        desc = _shipped().get("rfe")
+        assert desc.binding({}, workspace={"rfe": {"github": {"project": "X"}}})["source"] == (
+            "descriptor"
+        )
+        assert desc.binding({}, workspace={"epic": {"jira": {"project": "X"}}})["source"] == (
+            "descriptor"
+        )
+        assert desc.binding({}, workspace={})["source"] == "descriptor"
+        assert desc.binding({}, workspace=None)["source"] == "descriptor"
+
+    def test_registry_bindings_pass_the_workspace_through(self):
+        bindings = _shipped().bindings({}, workspace=WORKSPACE)
+        assert bindings["rfe"]["project"] == "KONFLUX"
+        assert bindings["initiative"]["source"] == "descriptor"
+
+    def test_binding_never_mutates_the_workspace_mapping(self):
+        workspace = {"rfe": {"jira": {"project": "KONFLUX"}}}
+        before = json.dumps(workspace, sort_keys=True)
+        binding = _shipped().get("rfe").binding({}, workspace=workspace)
+        binding["project"] = "MUTATED"
+        assert json.dumps(workspace, sort_keys=True) == before
+
+
+# ── the workspace file and its trust boundary (§3.2.1 g) ─────────────────────────
+
+
+class TestWorkspaceFile:
+    @staticmethod
+    def _write(root, content):
+        (root / "rfe-creator.yaml").write_text(content, encoding="utf-8")
+        return root
+
+    def test_missing_file_block_or_root_reads_as_empty(self, tmp_path):
+        assert load_workspace_bindings(None) == {}
+        assert load_workspace_bindings(tmp_path) == {}
+        assert load_workspace_bindings(tmp_path / "nope") == {}
+        assert load_workspace_bindings(self._write(tmp_path, "other: 1\n")) == {}
+        assert load_workspace_bindings(self._write(tmp_path, "")) == {}
+        assert load_workspace_bindings(self._write(tmp_path, "bindings:\n")) == {}
+        assert load_workspace_bindings(self._write(tmp_path, "bindings: {}\n")) == {}
+
+    def test_bindings_block_is_returned(self, tmp_path):
+        assert load_workspace_bindings(self._write(tmp_path, WORKSPACE_YAML)) == WORKSPACE
+        assert load_workspace_bindings(str(tmp_path)) == WORKSPACE
+
+    @pytest.mark.parametrize(
+        "content, match",
+        [
+            ("- a\n", "expected a mapping at the top level, got list"),
+            ("bindings: [rfe]\n", "'bindings' must be a mapping"),
+            ("bindings:\n  rfe: jira\n", r"bindings\.rfe: expected a mapping of tracker"),
+            (
+                "bindings:\n  rfe:\n    jira: KONFLUX\n",
+                r"bindings\.rfe\.jira: expected a mapping of binding fields",
+            ),
+            (
+                "bindings:\n  rfe:\n    jira:\n      projekt: KONFLUX\n",
+                r"unknown field\(s\) projekt; overridable fields: project, issue_type, "
+                r"local_prefix",
+            ),
+            (
+                "bindings:\n  rfe:\n    jira:\n      project: 5\n",
+                r"bindings\.rfe\.jira\.project: expected a non-empty string, got 5",
+            ),
+            ("bindings:\n  rfe:\n    jira:\n      project: ''\n", "expected a non-empty string"),
+            ("bindings: [unclosed\n", "invalid YAML"),
+        ],
+    )
+    def test_invalid_shapes_raise(self, tmp_path, content, match):
+        self._write(tmp_path, content)
+        with pytest.raises(RegistryError, match=match) as excinfo:
+            load_workspace_bindings(tmp_path)
+        assert str(tmp_path / "rfe-creator.yaml") in str(excinfo.value)
+
+    def test_registry_without_workspace_root_reads_nothing(self, tmp_path):
+        self._write(tmp_path, WORKSPACE_YAML)
+        reg = load(root=TYPES_ROOT, extra_roots=[], env={})
+        assert reg.workspace_root is None
+        assert reg.workspace_bindings() == {}
+
+    def test_interactive_run_honours_the_file(self, tmp_path, capsys):
+        self._write(tmp_path, WORKSPACE_YAML)
+        reg = load(root=TYPES_ROOT, extra_roots=[], env={}, workspace_root=tmp_path)
+        workspace = reg.workspace_bindings()
+        assert workspace == WORKSPACE
+        assert reg.bindings(workspace=workspace)["rfe"]["project"] == "KONFLUX"
+        assert reg.get("rfe").binding(workspace=workspace)["source"] == "workspace"
+        assert capsys.readouterr().err == ""
+
+    @pytest.mark.parametrize("marker", type_registry.HEADLESS_MARKER_VARS)
+    def test_headless_marker_ignores_the_file_with_one_stderr_line(self, tmp_path, marker, capsys):
+        self._write(tmp_path, WORKSPACE_YAML)
+        reg = load(root=TYPES_ROOT, extra_roots=[], env={marker: "1"}, workspace_root=tmp_path)
+        assert reg.workspace_bindings() == {}
+        err = capsys.readouterr().err
+        assert err.count("\n") == 1, err
+        assert "headless/CI run" in err
+        assert str(tmp_path / "rfe-creator.yaml") in err
+        assert "RFE_CREATOR_BINDING_" in err
+
+    def test_headless_flag_ignores_the_file(self, tmp_path, capsys):
+        self._write(tmp_path, WORKSPACE_YAML)
+        reg = load(root=TYPES_ROOT, extra_roots=[], env={}, workspace_root=tmp_path)
+        assert reg.workspace_bindings(headless=True) == {}
+        assert capsys.readouterr().err.count("\n") == 1
+        assert reg.workspace_bindings(headless=False) == WORKSPACE
+
+    def test_registry_headless_flag_ignores_the_file(self, tmp_path, capsys):
+        """``load(headless=True)`` (the ``resolve --headless`` path) is the same predicate:
+        the per-call argument can add to it, never switch it back (PR-3 D4)."""
+        self._write(tmp_path, WORKSPACE_YAML)
+        reg = load(root=TYPES_ROOT, extra_roots=[], env={}, workspace_root=tmp_path, headless=True)
+        assert reg.workspace_bindings() == {}
+        assert capsys.readouterr().err.count("\n") == 1
+        assert reg.workspace_bindings(headless=False) == {}
+
+    def test_headless_without_an_effective_block_is_silent(self, tmp_path, capsys):
+        reg = load(root=TYPES_ROOT, extra_roots=[], env={"CI": "true"}, workspace_root=tmp_path)
+        assert reg.workspace_bindings() == {}  # no file at all
+        self._write(tmp_path, "other: 1\n")
+        assert reg.workspace_bindings() == {}
+        self._write(tmp_path, "bindings: {}\n")
+        assert reg.workspace_bindings() == {}
+        assert capsys.readouterr().err == ""
+
+    def test_malformed_file_raises_in_both_modes(self, tmp_path):
+        self._write(tmp_path, "bindings: [x]\n")
+        for env in ({}, {"CI": "true"}):
+            reg = load(root=TYPES_ROOT, extra_roots=[], env=env, workspace_root=tmp_path)
+            with pytest.raises(RegistryError, match="'bindings' must be a mapping"):
+                reg.workspace_bindings()
+
+
+# ── candidates (design §5 rung 3 over effective bindings, D5) ────────────────────
+
+
+class TestCandidates:
+    @pytest.mark.parametrize(
+        "item_id, rung, names, provisional",
+        [
+            ("RFE-001", "local_id_pattern", ["rfe"], False),
+            ("INIT-001", "local_id_pattern", ["initiative"], False),
+            ("RHAIRFE-1", "key_prefix", ["rfe"], False),
+            ("RHOAIENG-1", "key_prefix", ["initiative"], False),
+            ("RHAIRFE-1234x", "key_prefix", ["rfe"], False),
+            ("INIT-x", "local_prefix", ["initiative"], False),
+            ("RFE-", "local_prefix", ["rfe"], False),
+            ("KONFLUX-12", "tracker_grammar", ["rfe", "initiative"], True),
+            ("RHAISTRAT-1", "tracker_grammar", ["rfe", "initiative"], True),
+            ("AB1-9", "tracker_grammar", ["rfe", "initiative"], True),
+            ("konflux-12", None, [], False),
+            ("KONFLUX-", None, [], False),
+            ("K-1", None, [], False),  # the grammar needs at least two leading characters
+            ("KONFLUX-12x", None, [], False),
+            ("free text idea", None, [], False),
+            ("", None, [], False),
+        ],
+    )
+    def test_shipped_ids(self, item_id, rung, names, provisional):
+        found = _shipped().candidates(item_id)
+        assert (found.rung, found.names, found.provisional) == (rung, names, provisional)
+        assert all(isinstance(d, Descriptor) for d in found.matches)
+
+    def test_none_and_non_strings_match_nothing(self):
+        reg = _shipped()
+        for value in (None, 1234, ["RFE-1"]):
+            found = reg.candidates(value)
+            assert found.matches == [] and found.rung is None and found.provisional is False
+
+    def test_result_object(self):
+        found = _shipped().candidates("RFE-001")
+        assert isinstance(found, Candidates)
+        assert found.matches[0] is _shipped().get("rfe") or found.matches[0].name == "rfe"
+        assert type_registry.CANDIDATE_RUNGS == (
+            "local_id_pattern",
+            "key_prefix",
+            "local_prefix",
+            "tracker_grammar",
+        )
+
+    def test_rung_order_and_provisional_flag_are_consistent_with_detect(self):
+        reg = _shipped()
+        for item_id in ("RFE-001", "RHAIRFE-1", "INIT-x", "RHOAIENG-1", "RHAISTRAT-1", "nope"):
+            found = reg.candidates(item_id)
+            owner = reg.detect(item_id)
+            if owner is not None:
+                assert found.names == [owner.name] and not found.provisional
+            else:
+                assert found.provisional or not found.matches
+
+    def test_project_override_moves_a_foreign_key_to_the_key_prefix_rung(self):
+        reg = _shipped()
+        env = {"RFE_CREATOR_BINDING_RFE_PROJECT": "KONFLUX"}
+        found = reg.candidates("KONFLUX-12", env)
+        assert (found.rung, found.names, found.provisional) == ("key_prefix", ["rfe"], False)
+        # detect() keeps its descriptor-values-only contract
+        assert reg.detect("KONFLUX-12") is None
+        # the descriptor prefix stays a read prefix
+        assert reg.candidates("RHAIRFE-1", env).names == ["rfe"]
+        # other projects stay provisional
+        assert reg.candidates("OTHER-1", env).rung == "tracker_grammar"
+
+    def test_registry_env_is_the_default(self):
+        env = {"RFE_CREATOR_BINDING_INITIATIVE_PROJECT": "PLAN"}
+        reg = load(root=TYPES_ROOT, extra_roots=[], env=env)
+        found = reg.candidates("PLAN-3")
+        assert (found.rung, found.names) == ("key_prefix", ["initiative"])
+        assert reg.candidates("PLAN-3", {}).rung == "tracker_grammar"  # explicit env wins
+
+    def test_local_prefix_override_rerenders_rung_one(self):
+        reg = _shipped()
+        env = {"RFE_CREATOR_BINDING_RFE_LOCAL_PREFIX": "REQ-"}
+        assert reg.candidates("REQ-7", env).rung == "local_id_pattern"
+        assert reg.candidates("REQ-7", env).names == ["rfe"]
+        assert reg.candidates("REQ-x", env).rung == "local_prefix"
+        # read parity: the descriptor pattern stays a READ form, so the local ids minted before
+        # the override are still rfe's (the effective pattern governs minting, not reading)
+        found = reg.candidates("RFE-7", env)
+        assert (found.rung, found.names, found.provisional) == ("local_id_pattern", ["rfe"], False)
+
+    def test_workspace_mapping_is_honoured(self):
+        found = _shipped().candidates("KONFLUX-12", {}, workspace=WORKSPACE)
+        assert (found.rung, found.names) == ("key_prefix", ["rfe"])
+
+    def test_every_type_matching_at_the_winning_rung_is_returned(self, tmp_path):
+        root = tmp_path / "types"
+        _add_type(root, "alpha", project="SHARED")
+        _add_type(root, "beta", project="SHARED", issue_type="Epic")
+        reg = load(root=root, extra_roots=[], env={})
+        found = reg.candidates("SHARED-1")
+        assert (found.rung, found.names, found.provisional) == (
+            "key_prefix",
+            ["alpha", "beta"],
+            False,
+        )
+        assert reg.detect("SHARED-1").name == "alpha"  # the router keeps its first match
+
+    def test_first_rung_with_a_match_wins_across_types(self, tmp_path):
+        root = tmp_path / "types"
+        _add_type(root, "alpha", project="AB")
+        _add_type(root, "beta", project="ZZ", local_prefix="AB-")
+        reg = load(root=root, extra_roots=[], env={})
+        assert reg.candidates("AB-7").names == ["beta"]  # beta's local pattern beats alpha's key
+        assert reg.candidates("AB-7").rung == "local_id_pattern"
+        assert reg.candidates("AB-7x").names == ["alpha"]
+        assert reg.candidates("AB-7x").rung == "key_prefix"
+
+    def test_tracker_grammar_is_per_tracker(self, tmp_path):
+        root = tmp_path / "types"
+        _add_type(root, "jira-one", project="ONE")
+        data = _minimal("gh", project="X")
+        data["identity"]["tracker"] = "github"
+        data["identity"]["github"] = {"repo": "o/r", "kind": "issue", "alias_prefix": "GH-"}
+        del data["identity"]["jira"]
+        _add_type(root, "gh", data=data)
+        reg = load(root=root, extra_roots=[], env={})
+        found = reg.candidates("ZZZ-1")
+        assert (found.rung, found.names, found.provisional) == (
+            "tracker_grammar",
+            ["jira-one"],
+            True,
+        )
+        assert reg.candidates("GH-1").names == ["gh"]
+
+
+# ── assert_registered_binding (§3.2.1 g, §3.3 rule 1 at runtime) ─────────────────
+
+
+class TestAssertRegisteredBinding:
+    def test_default_binding_passes_and_is_returned(self):
+        reg = _shipped()
+        binding = assert_registered_binding(reg.get("rfe"), env={}, registry=reg)
+        assert binding == RFE_DESCRIPTOR_BINDING
+        assert assert_registered_binding(reg.get("initiative"), env={}, registry=reg)[
+            "project"
+        ] == ("RHOAIENG")
+
+    def test_registry_defaults_to_a_fresh_load_with_the_same_env(self):
+        desc = _shipped().get("rfe")
+        assert assert_registered_binding(desc, env={})["source"] == "descriptor"
+        env = {
+            "RFE_CREATOR_BINDING_RFE_PROJECT": "RHOAIENG",
+            "RFE_CREATOR_BINDING_RFE_ISSUE_TYPE": "Initiative",
+        }
+        with pytest.raises(RegistryError, match="registered for type 'initiative'"):
+            assert_registered_binding(desc, env=env)
+
+    def test_override_selecting_another_types_pair_is_rejected(self):
+        reg = _shipped()
+        env = {
+            "RFE_CREATOR_BINDING_RFE_PROJECT": "RHOAIENG",
+            "RFE_CREATOR_BINDING_RFE_ISSUE_TYPE": "Initiative",
+        }
+        with pytest.raises(RegistryError) as excinfo:
+            assert_registered_binding(reg.get("rfe"), env=env, registry=reg)
+        message = str(excinfo.value)
+        assert message.startswith("rfe: effective binding ('jira', 'RHOAIENG', 'Initiative')")
+        assert "registered for type 'initiative'" in message
+        assert "--type initiative" in message
+
+    def test_ownership_not_membership_for_the_shorthand(self):
+        reg = _shipped()
+        env = {"JIRA_PROJECT": "RHOAIENG", "JIRA_ISSUE_TYPE": "Initiative"}
+        # without shorthand the pair is not applied at all
+        assert assert_registered_binding(reg.get("rfe"), env=env, registry=reg)["source"] == (
+            "descriptor"
+        )
+        with pytest.raises(RegistryError, match="registered for type 'initiative'"):
+            assert_registered_binding(reg.get("rfe"), env=env, registry=reg, shorthand=True)
+        # the initiative type itself owns the pair
+        binding = assert_registered_binding(
+            reg.get("initiative"), env=env, registry=reg, shorthand=True
+        )
+        assert binding["source"] == "shorthand"
+
+    def test_same_project_with_a_distinct_issue_type_is_owned(self):
+        reg = _shipped()
+        env = {"RFE_CREATOR_BINDING_RFE_PROJECT": "RHOAIENG"}
+        binding = assert_registered_binding(reg.get("rfe"), env=env, registry=reg)
+        assert (binding["project"], binding["issue_type"]) == ("RHOAIENG", "Feature Request")
+
+    def test_effective_triples_are_compared(self):
+        """The rule is over EFFECTIVE bindings: a pair another type moved away from is free."""
+        reg = _shipped()
+        env = {
+            "RFE_CREATOR_BINDING_RFE_PROJECT": "RHOAIENG",
+            "RFE_CREATOR_BINDING_RFE_ISSUE_TYPE": "Initiative",
+            "RFE_CREATOR_BINDING_INITIATIVE_PROJECT": "PLAN",
+        }
+        assert assert_registered_binding(reg.get("rfe"), env=env, registry=reg)["project"] == (
+            "RHOAIENG"
+        )
+
+    def test_workspace_override_is_rejected_when_headless(self):
+        reg = _shipped()
+        workspace = {"rfe": {"jira": {"project": "KONFLUX"}}}
+        ok = assert_registered_binding(reg.get("rfe"), env={}, registry=reg, workspace=workspace)
+        assert ok["project"] == "KONFLUX" and ok["source"] == "workspace"
+        with pytest.raises(RegistryError, match="workspace file") as excinfo:
+            assert_registered_binding(
+                reg.get("rfe"), env={}, registry=reg, workspace=workspace, headless=True
+            )
+        assert "project" in str(excinfo.value) and "RFE_CREATOR_BINDING_" in str(excinfo.value)
+        with pytest.raises(RegistryError, match="not trusted in a headless/CI run"):
+            assert_registered_binding(
+                reg.get("rfe"), env={"CI": "true"}, registry=reg, workspace=workspace
+            )
+
+    def test_registry_headless_flag_rejects_the_workspace_override(self):
+        """A registry built with ``headless=True`` is headless here too (one predicate)."""
+        reg = load(root=TYPES_ROOT, extra_roots=[], env={}, headless=True)
+        workspace = {"rfe": {"jira": {"project": "KONFLUX"}}}
+        with pytest.raises(RegistryError, match="not trusted in a headless/CI run"):
+            assert_registered_binding(reg.get("rfe"), env={}, registry=reg, workspace=workspace)
+
+    def test_env_override_is_fine_when_headless(self):
+        reg = _shipped()
+        env = {"CI": "true", "RFE_CREATOR_BINDING_RFE_PROJECT": "KONFLUX"}
+        binding = assert_registered_binding(reg.get("rfe"), env=env, registry=reg, headless=True)
+        assert binding["project"] == "KONFLUX" and binding["source"] == "env"
+
+    def test_env_beating_the_workspace_is_fine_when_headless(self):
+        """Only a CONTRIBUTING workspace source is untrusted: a field the env already set does
+        not make the workspace a source."""
+        reg = _shipped()
+        env = {"CI": "true", "RFE_CREATOR_BINDING_RFE_PROJECT": "ACME"}
+        workspace = {"rfe": {"jira": {"project": "KONFLUX"}}}
+        binding = assert_registered_binding(
+            reg.get("rfe"), env=env, registry=reg, workspace=workspace
+        )
+        assert binding["project"] == "ACME" and binding["source"] == "env"
+
+    def test_env_defaults_to_the_descriptors_registry_env(self):
+        env = {
+            "RFE_CREATOR_BINDING_RFE_PROJECT": "RHOAIENG",
+            "RFE_CREATOR_BINDING_RFE_ISSUE_TYPE": "Initiative",
+        }
+        reg = load(root=TYPES_ROOT, extra_roots=[], env=env)
+        with pytest.raises(RegistryError, match="registered for type 'initiative'"):
+            assert_registered_binding(reg.get("rfe"), registry=reg)
+
+    def test_github_pair_is_compared_on_repo_and_kind(self, tmp_path):
+        root = tmp_path / "types"
+        for name, kind in (("gh-a", "issue"), ("gh-b", "pull")):
+            data = _minimal(name, project="X")
+            data["identity"]["tracker"] = "github"
+            data["identity"]["github"] = {
+                "repo": "o/r",
+                "kind": kind,
+                "alias_prefix": f"{kind[:2].upper()}-",
+            }
+            del data["identity"]["jira"]
+            _add_type(root, name, data=data)
+        reg = load(root=root, extra_roots=[], env={})
+        assert (
+            assert_registered_binding(reg.get("gh-a"), env={}, registry=reg)["tracker"] == "github"
+        )
+
+
+# ── resolve (design §5) ──────────────────────────────────────────────────────────
+
+
+def _artifact(path, frontmatter=None, body="Body\n"):
+    """Write a markdown artifact; ``frontmatter`` None writes no block at all."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = body
+    if frontmatter is not None:
+        block = yaml.safe_dump(frontmatter, sort_keys=False) if frontmatter else ""
+        text = f"---\n{block}---\n{body}"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+class TestResolve:
+    # -- rung 1: --type ---------------------------------------------------------------------
+
+    def test_explicit_type(self):
+        res = resolve(_shipped(), explicit_type="initiative", env={})
+        assert isinstance(res, Resolution)
+        assert res.type_name == "initiative" and res.desc.name == "initiative"
+        assert res.rung == "--type" and res.provisional is False and res.candidates == []
+        assert res.binding["source"] == "descriptor" and res.ambiguous is False
+        assert res.line() == "TYPE RESOLVED: initiative (--type)"
+
+    def test_unknown_explicit_type_lists_the_registered_types(self):
+        with pytest.raises(ResolveError) as excinfo:
+            resolve(_shipped(), explicit_type="epic", env={})
+        assert excinfo.value.exit_code == 1
+        assert (
+            str(excinfo.value) == "unknown type 'epic' (--type); registered types: rfe, initiative"
+        )
+
+    def test_resolve_error_is_a_registry_error_with_an_exit_code(self):
+        assert issubclass(ResolveError, RegistryError)
+        assert ResolveError("x").exit_code == 1
+        assert ResolveError("x", exit_code=3).exit_code == 3
+
+    # -- rung 2: batch type ----------------------------------------------------------------
+
+    def test_batch_mapping_type(self, tmp_path):
+        batch = _write_yaml(tmp_path / "b.yaml", {"type": "initiative", "items": [{"prompt": "x"}]})
+        res = resolve(_shipped(), batch=batch, env={})
+        assert (res.type_name, res.rung) == ("initiative", "batch type")
+        assert res.line() == "TYPE RESOLVED: initiative (batch type)"
+
+    def test_batch_mapping_agreeing_with_explicit_type_is_rung_one(self, tmp_path):
+        batch = _write_yaml(tmp_path / "b.yaml", {"type": "initiative", "items": []})
+        res = resolve(_shipped(), explicit_type="initiative", batch=str(batch), env={})
+        assert (res.type_name, res.rung) == ("initiative", "--type")
+
+    def test_batch_mapping_disagreeing_with_explicit_type_is_an_error(self, tmp_path):
+        batch = _write_yaml(tmp_path / "b.yaml", {"type": "initiative", "items": []})
+        with pytest.raises(
+            ResolveError, match="--type rfe disagrees with .*b.yaml type: initiative"
+        ) as e:
+            resolve(_shipped(), explicit_type="rfe", batch=batch, env={})
+        assert e.value.exit_code == 1 and "D1" in str(e.value)
+
+    def test_batch_mapping_with_an_unknown_type(self, tmp_path):
+        batch = _write_yaml(tmp_path / "b.yaml", {"type": "epic", "items": []})
+        with pytest.raises(ResolveError, match="unknown type 'epic' \\(.*b.yaml type:\\)"):
+            resolve(_shipped(), batch=batch, env={})
+
+    @pytest.mark.parametrize(
+        "root",
+        [
+            [{"prompt": "x", "type": "initiative"}],
+            [{"prompt": "x"}, {"prompt": "y", "type": "rfe"}],
+            {"type": "rfe", "items": [{"prompt": "x", "type": "rfe"}]},
+        ],
+    )
+    def test_per_item_type_is_rejected(self, tmp_path, root):
+        batch = _write_yaml(tmp_path / "b.yaml", root)
+        with pytest.raises(ResolveError, match="per-item 'type' key") as excinfo:
+            resolve(_shipped(), batch=batch, env={})
+        assert excinfo.value.exit_code == 1 and "D2" in str(excinfo.value)
+
+    def test_per_item_type_is_rejected_even_with_an_explicit_type(self, tmp_path):
+        batch = _write_yaml(tmp_path / "b.yaml", [{"prompt": "x", "type": "rfe"}])
+        with pytest.raises(ResolveError, match="per-item 'type' key"):
+            resolve(_shipped(), explicit_type="rfe", batch=batch, env={})
+
+    def test_legacy_list_gives_no_rung_two_signal_but_its_string_items_join_the_ids(self, tmp_path):
+        batch = _write_yaml(tmp_path / "b.yaml", ["RHOAIENG-1", {"prompt": "x"}, "RHOAIENG-2"])
+        res = resolve(_shipped(), batch=batch, env={})
+        assert (res.type_name, res.rung) == ("initiative", "id grammar")
+        prompts_only = _write_yaml(tmp_path / "p.yaml", [{"prompt": "x"}, {"prompt": "y"}])
+        res = resolve(_shipped(), batch=prompts_only, env={})
+        assert (res.type_name, res.rung) == ("rfe", "legacy default")
+
+    def test_mapping_form_string_items_join_the_ids_too(self, tmp_path):
+        batch = _write_yaml(tmp_path / "b.yaml", {"type": "initiative", "items": ["RFE-1"]})
+        with pytest.raises(
+            ResolveError, match="conflicting type signals: batch type initiative vs RFE-1 -> rfe"
+        ):
+            resolve(_shipped(), batch=batch, env={})
+
+    @pytest.mark.parametrize(
+        "content, match",
+        [
+            ("type: rfe\n", "expected a list of items .* got a mapping with keys type"),
+            ("items: []\n", "expected a list of items .* got a mapping with keys items"),
+            ("42\n", "got int"),
+            ("", "got nothing"),
+            ("type: rfe\nitems: nope\n", "'items' must be a list, got str"),
+            ("type: 5\nitems: []\n", "'type' must be a non-empty string, got 5"),
+            ("type: ''\nitems: []\n", "'type' must be a non-empty string"),
+            ("- [unclosed\n", "invalid YAML in batch file"),
+        ],
+    )
+    def test_other_root_shapes_are_errors(self, tmp_path, content, match):
+        batch = tmp_path / "b.yaml"
+        batch.write_text(content, encoding="utf-8")
+        with pytest.raises(ResolveError, match=match) as excinfo:
+            resolve(_shipped(), batch=batch, env={})
+        assert excinfo.value.exit_code == 1
+
+    def test_unreadable_batch_is_an_error(self, tmp_path):
+        with pytest.raises(ResolveError, match="cannot read batch file"):
+            resolve(_shipped(), batch=tmp_path / "missing.yaml", env={})
+
+    # -- rung 3: artifact and id signals --------------------------------------------------
+
+    def test_frontmatter_type(self, tmp_path):
+        art = _artifact(tmp_path / "anywhere" / "X-1.md", {"type": "initiative", "title": "t"})
+        res = resolve(_shipped(), artifact=art, env={})
+        assert (res.type_name, res.rung, res.provisional) == (
+            "initiative",
+            "frontmatter type",
+            False,
+        )
+        assert res.line() == "TYPE RESOLVED: initiative (frontmatter type)"
+
+    def test_frontmatter_type_beats_the_directory_and_the_stem(self, tmp_path):
+        art = _artifact(tmp_path / "rfe-tasks" / "RFE-001.md", {"type": "initiative"})
+        assert resolve(_shipped(), artifact=str(art), env={}).type_name == "initiative"
+
+    def test_frontmatter_type_unknown(self, tmp_path):
+        art = _artifact(tmp_path / "x" / "X-1.md", {"type": "epic"})
+        with pytest.raises(
+            ResolveError, match="unknown type 'epic' \\(.*X-1.md frontmatter type:\\)"
+        ):
+            resolve(_shipped(), artifact=art, env={})
+
+    def test_frontmatter_type_must_be_a_string(self, tmp_path):
+        art = _artifact(tmp_path / "x" / "X-1.md", {"type": 5})
+        with pytest.raises(ResolveError, match="frontmatter 'type' must be a non-empty string"):
+            resolve(_shipped(), artifact=art, env={})
+
+    def test_null_frontmatter_type_is_no_signal(self, tmp_path):
+        art = _artifact(tmp_path / "initiatives" / "X-1.md", {"type": None, "title": "t"})
+        res = resolve(_shipped(), artifact=art, env={})
+        assert (res.type_name, res.rung) == ("initiative", "artifact dir")
+
+    def test_artifact_dir_when_no_frontmatter_type(self, tmp_path):
+        art = _artifact(tmp_path / "initiatives" / "X-1.md", {"title": "t"})
+        res = resolve(_shipped(), artifact=art, env={})
+        assert (res.type_name, res.rung) == ("initiative", "artifact dir")
+        assert res.line() == "TYPE RESOLVED: initiative (artifact dir)"
+        for directory in ("rfe-tasks", "rfe-originals", "rfe-reviews"):
+            art = _artifact(tmp_path / directory / "X-1-review.md")  # no frontmatter at all
+            assert resolve(_shipped(), artifact=art, env={}).rung == "artifact dir"
+            assert resolve(_shipped(), artifact=art, env={}).type_name == "rfe"
+
+    def test_artifact_stem_joins_the_ids_when_the_dir_is_unknown(self, tmp_path):
+        art = _artifact(tmp_path / "misc" / "RHOAIENG-42.md")
+        res = resolve(_shipped(), artifact=art, env={})
+        assert (res.type_name, res.rung) == ("initiative", "id grammar")
+        art = _artifact(tmp_path / "misc" / "RHAIRFE-1595-comments.md")
+        assert resolve(_shipped(), artifact=art, env={}).type_name == "rfe"
+        art = _artifact(tmp_path / "misc" / "notes.md")
+        assert resolve(_shipped(), artifact=art, env={}).rung == "legacy default"
+
+    def test_bare_artifact_name_has_no_directory_signal(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(_artifact(tmp_path / "rfe-tasks" / "notes.md").parent)
+        assert resolve(_shipped(), artifact="notes.md", env={}).rung == "legacy default"
+
+    def test_missing_or_broken_artifact(self, tmp_path):
+        with pytest.raises(ResolveError, match="artifact file not found"):
+            resolve(_shipped(), artifact=tmp_path / "nope.md", env={})
+        broken = tmp_path / "x" / "X.md"
+        broken.parent.mkdir()
+        broken.write_text("---\ntype: [unclosed\n---\nBody\n", encoding="utf-8")
+        with pytest.raises(ResolveError, match="invalid frontmatter YAML"):
+            resolve(_shipped(), artifact=broken, env={})
+
+    def test_frontmatter_parser_edge_cases(self):
+        parse = type_registry._parse_frontmatter
+        assert parse("---\ntype: rfe\n---\nBody\n", "p") == {"type": "rfe"}
+        assert parse("---\n---\nBody\n", "p") == {}
+        assert parse("# Heading\n---\ntype: rfe\n---\n", "p") == {}  # must start on line 1
+        assert parse("---\ntype: rfe\n", "p") == {}  # unterminated
+        assert parse("---\n- a\n---\n", "p") == {}  # not a mapping
+        assert parse("", "p") == {}
+
+    def test_ids_resolve_at_the_id_grammar_rung(self):
+        res = resolve(_shipped(), ids=["RHAIRFE-1", "RFE-002"], env={})
+        assert (res.type_name, res.rung, res.provisional) == ("rfe", "id grammar", False)
+        assert res.line() == "TYPE RESOLVED: rfe (id grammar)"
+        res = resolve(_shipped(), ids=("INIT-1",), env={})
+        assert res.type_name == "initiative"
+
+    def test_unowned_ids_and_non_strings_are_no_signal(self):
+        res = resolve(_shipped(), ids=["free text idea", "", None, 12], env={})
+        assert (res.type_name, res.rung) == ("rfe", "legacy default")
+
+    def test_the_strongest_rung_labels_the_resolution(self, tmp_path):
+        typed = _artifact(tmp_path / "misc" / "X.md", {"type": "rfe"})
+        assert (
+            resolve(_shipped(), artifact=typed, ids=["RHAIRFE-1"], env={}).rung
+            == "frontmatter type"
+        )
+        placed = _artifact(tmp_path / "rfe-tasks" / "X.md", {"title": "t"})
+        assert (
+            resolve(_shipped(), artifact=placed, ids=["RHAIRFE-1"], env={}).rung == "artifact dir"
+        )
+
+    # -- conflicts --------------------------------------------------------------------------
+
+    def test_conflicting_id_signals(self):
+        with pytest.raises(ResolveError) as excinfo:
+            resolve(_shipped(), ids=["RFE-1", "INIT-2"], env={})
+        message = str(excinfo.value)
+        assert message.startswith("conflicting type signals: RFE-1 -> rfe, INIT-2 -> initiative")
+        assert excinfo.value.exit_code == 1
+
+    def test_conflict_between_an_artifact_and_an_id(self, tmp_path):
+        art = _artifact(tmp_path / "x" / "X.md", {"type": "initiative"})
+        with pytest.raises(
+            ResolveError, match="X.md \\(type: initiative\\) -> initiative, RFE-1 -> rfe"
+        ):
+            resolve(_shipped(), artifact=art, ids=["RFE-1"], env={})
+        art = _artifact(tmp_path / "initiatives" / "X.md")
+        with pytest.raises(
+            ResolveError, match="X.md \\(dir initiatives\\) -> initiative, RFE-1 -> rfe"
+        ):
+            resolve(_shipped(), artifact=art, ids=["RFE-1"], env={})
+
+    def test_explicit_type_conflicting_with_a_deterministic_signal(self):
+        with pytest.raises(ResolveError) as excinfo:
+            resolve(_shipped(), explicit_type="initiative", ids=["RFE-1"], env={})
+        assert str(excinfo.value).startswith(
+            "conflicting type signals: --type initiative vs RFE-1 -> rfe"
+        )
+        assert excinfo.value.exit_code == 1
+
+    def test_explicit_type_with_agreeing_and_provisional_signals(self):
+        res = resolve(_shipped(), explicit_type="rfe", ids=["RFE-1", "KONFLUX-12"], env={})
+        assert (res.type_name, res.rung, res.provisional) == ("rfe", "--type", False)
+        res = resolve(_shipped(), explicit_type="initiative", ids=["KONFLUX-12"], env={})
+        assert (res.type_name, res.rung, res.provisional) == ("initiative", "--type", False)
+
+    def test_conflicts_are_detected_even_in_headless_runs(self):
+        with pytest.raises(ResolveError, match="conflicting type signals"):
+            resolve(_shipped(), ids=["RFE-1", "INIT-2"], env={"CI": "true"})
+
+    # -- provisional (tracker grammar) ------------------------------------------------------
+
+    def test_provisional_single_type(self, tmp_path):
+        root = _copy_types(tmp_path / "types", names=("rfe",))
+        res = resolve(load(root=root, extra_roots=[], env={}), ids=["KONFLUX-12"], env={})
+        assert (res.type_name, res.rung, res.provisional) == ("rfe", "id grammar", True)
+        assert res.candidates == []
+        assert res.line() == "TYPE RESOLVED: rfe (id grammar)"
+
+    def test_project_override_makes_the_key_deterministic(self):
+        env = {"RFE_CREATOR_BINDING_RFE_PROJECT": "KONFLUX"}
+        res = resolve(_shipped(), ids=["KONFLUX-12"], env=env)
+        assert (res.type_name, res.rung, res.provisional) == ("rfe", "id grammar", False)
+        assert res.line() == "TYPE RESOLVED: rfe (id grammar; binding override project=KONFLUX)"
+
+    def test_a_deterministic_signal_beats_provisional_ones(self):
+        res = resolve(_shipped(), ids=["KONFLUX-12", "INIT-1", "OTHER-3"], env={})
+        assert (res.type_name, res.rung, res.provisional) == ("initiative", "id grammar", False)
+
+    # -- ambiguity ---------------------------------------------------------------------------
+
+    @pytest.mark.parametrize("kwargs", [{"env": {"CI": "true"}}, {"env": {}, "headless": True}])
+    def test_ambiguous_headless_is_a_resolve_error_with_exit_3(self, kwargs):
+        with pytest.raises(ResolveError) as excinfo:
+            resolve(_shipped(), ids=["KONFLUX-12"], **kwargs)
+        assert excinfo.value.exit_code == 3
+        message = str(excinfo.value)
+        assert "KONFLUX-12" in message and "candidates rfe, initiative" in message
+        assert "--type" in message
+
+    def test_ambiguous_interactive_returns_the_candidates(self):
+        res = resolve(_shipped(), ids=["KONFLUX-12"], env={})
+        assert res.ambiguous is True
+        assert res.type_name is None and res.desc is None and res.rung is None
+        assert res.binding is None
+        assert res.candidates == ["rfe", "initiative"]
+        assert res.provisional is True
+        assert res.line() == "TYPE AMBIGUOUS: rfe, initiative - pass --type"
+
+    def test_shared_prefix_ambiguity_is_deterministic_but_unresolved(self, tmp_path):
+        root = tmp_path / "types"
+        _add_type(root, "alpha", project="SHARED")
+        _add_type(root, "beta", project="SHARED", issue_type="Epic")
+        reg = load(root=root, extra_roots=[], env={})
+        res = resolve(reg, ids=["SHARED-1"], env={})
+        assert res.type_name is None and res.candidates == ["alpha", "beta"]
+        assert res.provisional is False
+        with pytest.raises(ResolveError) as excinfo:
+            resolve(reg, ids=["SHARED-1"], env={}, headless=True)
+        assert excinfo.value.exit_code == 3
+        # a second, single-type signal narrows the candidate set down
+        res = resolve(reg, ids=["SHARED-1", "ALPHA-2"], env={})
+        assert (res.type_name, res.rung) == ("alpha", "id grammar")
+        # and one outside the set conflicts
+        with pytest.raises(ResolveError, match="conflicting type signals"):
+            _add_type(root, "gamma", project="GAMMA")
+            resolve(load(root=root, extra_roots=[], env={}), ids=["SHARED-1", "GAMMA-1"], env={})
+
+    # -- rung 5: legacy default -------------------------------------------------------------
+
+    def test_legacy_default(self):
+        res = resolve(_shipped(), env={})
+        assert (res.type_name, res.rung, res.provisional) == ("rfe", "legacy default", False)
+        assert res.line() == "TYPE RESOLVED: rfe (legacy default)"
+        assert resolve(_shipped(), env={"CI": "true"}).rung == "legacy default"
+
+    def test_legacy_default_requires_rfe(self, tmp_path):
+        root = _copy_types(tmp_path / "types", names=("initiative",))
+        with pytest.raises(ResolveError) as excinfo:
+            resolve(load(root=root, extra_roots=[], env={}), env={})
+        assert excinfo.value.exit_code == 1
+        assert "legacy default type 'rfe' is not registered" in str(excinfo.value)
+        assert "registered types: initiative" in str(excinfo.value)
+
+    # -- binding and the printed line -----------------------------------------------------
+
+    def test_binding_applies_the_shorthand_to_the_resolved_type_only(self):
+        reg = _shipped()
+        env = {"JIRA_PROJECT": "KONFLUX"}
+        res = resolve(reg, explicit_type="rfe", env=env)
+        assert res.binding["project"] == "KONFLUX" and res.binding["source"] == "shorthand"
+        assert res.line() == "TYPE RESOLVED: rfe (--type; binding override project=KONFLUX)"
+        assert reg.get("initiative").binding(env)["source"] == "descriptor"
+        assert reg.bindings(env)["rfe"]["source"] == "descriptor"
+
+    def test_line_renders_overrides_in_field_order(self):
+        env = {
+            "RFE_CREATOR_BINDING_RFE_LOCAL_PREFIX": "REQ-",
+            "RFE_CREATOR_BINDING_RFE_ISSUE_TYPE": "Story",
+            "RFE_CREATOR_BINDING_RFE_PROJECT": "KONFLUX",
+        }
+        res = resolve(_shipped(), explicit_type="rfe", env=env)
+        assert res.line() == (
+            "TYPE RESOLVED: rfe (--type; binding override project=KONFLUX issue_type=Story "
+            "local_prefix=REQ-)"
+        )
+        res = resolve(_shipped(), explicit_type="rfe", env={"JIRA_ISSUE_TYPE": "Story"})
+        assert res.line() == "TYPE RESOLVED: rfe (--type; binding override issue_type=Story)"
+
+    def test_env_defaults_to_the_registry_env(self):
+        reg = load(
+            root=TYPES_ROOT, extra_roots=[], env={"RFE_CREATOR_BINDING_RFE_PROJECT": "KONFLUX"}
+        )
+        assert resolve(reg, explicit_type="rfe").line() == (
+            "TYPE RESOLVED: rfe (--type; binding override project=KONFLUX)"
+        )
+        headless = load(root=TYPES_ROOT, extra_roots=[], env={"CI": "true"})
+        with pytest.raises(ResolveError) as excinfo:
+            resolve(headless, ids=["KONFLUX-12"])
+        assert excinfo.value.exit_code == 3
+
+    def test_workspace_binding_in_the_resolution(self):
+        workspace = {"rfe": {"jira": {"project": "KONFLUX"}}}
+        res = resolve(_shipped(), explicit_type="rfe", env={}, workspace=workspace)
+        assert res.binding["source"] == "workspace"
+        assert res.line() == "TYPE RESOLVED: rfe (--type; binding override project=KONFLUX)"
+        assert (
+            resolve(_shipped(), ids=["KONFLUX-12"], env={}, workspace=workspace).type_name == "rfe"
+        )
+
+    def test_registry_headless_flag_makes_ambiguity_an_error(self):
+        """A registry built with ``headless=True`` resolves headless without a per-call
+        flag and without a marker (PR-3 D4)."""
+        reg = load(root=TYPES_ROOT, extra_roots=[], env={}, headless=True)
+        with pytest.raises(ResolveError) as excinfo:
+            resolve(reg, ids=["KONFLUX-12"])
+        assert excinfo.value.exit_code == 3
+        assert resolve(reg, explicit_type="rfe").line() == "TYPE RESOLVED: rfe (--type)"
+
+    def test_workspace_sourced_binding_is_refused_headless(self):
+        workspace = {"rfe": {"jira": {"project": "KONFLUX"}}}
+        with pytest.raises(ResolveError, match="workspace file") as excinfo:
+            resolve(_shipped(), explicit_type="rfe", env={}, headless=True, workspace=workspace)
+        assert excinfo.value.exit_code == 1
+        with pytest.raises(ResolveError, match="not trusted in a headless/CI run"):
+            resolve(_shipped(), explicit_type="rfe", env={"CI": "1"}, workspace=workspace)
+        # an env override for the same field keeps the workspace out of the sources
+        env = {"CI": "1", "RFE_CREATOR_BINDING_RFE_PROJECT": "ACME"}
+        assert (
+            resolve(_shipped(), explicit_type="rfe", env=env, workspace=workspace).binding["source"]
+            == "env"
+        )
+
+    def test_invalid_override_surfaces_as_a_registry_error(self):
+        with pytest.raises(RegistryError, match="RFE_CREATOR_BINDING_RFE_PROJECT='konflux'"):
+            resolve(
+                _shipped(), explicit_type="rfe", env={"RFE_CREATOR_BINDING_RFE_PROJECT": "konflux"}
+            )
+
+    def test_as_dict_shape(self):
+        res = resolve(_shipped(), explicit_type="rfe", env={})
+        data = res.as_dict()
+        assert list(data) == ["type", "rung", "provisional", "binding", "candidates", "line"]
+        assert data["type"] == "rfe" and data["line"] == res.line()
+        assert json.loads(json.dumps(data)) == data
+        ambiguous = resolve(_shipped(), ids=["KONFLUX-12"], env={}).as_dict()
+        assert ambiguous["type"] is None and ambiguous["binding"] is None
+        assert ambiguous["candidates"] == ["rfe", "initiative"]
+
+    def test_rung_vocabulary_is_pinned(self):
+        assert type_registry.RESOLVE_RUNGS == (
+            "--type",
+            "batch type",
+            "frontmatter type",
+            "artifact dir",
+            "id grammar",
+            "legacy default",
+        )
+        assert type_registry.LEGACY_DEFAULT_TYPE == "rfe"
+        assert type_registry.EXIT_AMBIGUOUS == 3
+
+
+# ── resolve / candidates CLI ─────────────────────────────────────────────────────
+
+
+class TestResolveCli:
+    def test_explicit_type_prints_the_line(self):
+        result = _cli("resolve", "--type", "rfe")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "TYPE RESOLVED: rfe (--type)\n"
+        assert result.stderr == ""
+
+    def test_unknown_type_exits_1_with_the_registered_list(self):
+        result = _cli("resolve", "--type", "epic")
+        assert result.returncode == 1
+        assert result.stdout == ""
+        assert result.stderr.strip() == (
+            "ERROR: unknown type 'epic' (--type); registered types: rfe, initiative"
+        )
+
+    def test_legacy_default_is_printed_by_the_resolve_cli(self):
+        result = _cli("resolve")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "TYPE RESOLVED: rfe (legacy default)\n"
+
+    def test_ids(self):
+        result = _cli("resolve", "RHOAIENG-1", "INIT-2")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "TYPE RESOLVED: initiative (id grammar)\n"
+
+    def test_conflict_exits_1(self):
+        result = _cli("resolve", "RFE-1", "INIT-1")
+        assert result.returncode == 1
+        assert result.stdout == ""
+        assert result.stderr.startswith(
+            "ERROR: conflicting type signals: RFE-1 -> rfe, INIT-1 -> initiative"
+        )
+
+    def test_ambiguous_interactive_exits_3_on_stdout(self):
+        result = _cli("resolve", "KONFLUX-12")
+        assert result.returncode == 3
+        assert result.stdout == "TYPE AMBIGUOUS: rfe, initiative - pass --type\n"
+        assert result.stderr == ""
+
+    def test_ambiguous_headless_flag_exits_3_on_stderr(self):
+        result = _cli("resolve", "--headless", "KONFLUX-12")
+        assert result.returncode == 3
+        assert result.stdout == ""
+        assert result.stderr.startswith(
+            "ERROR: ambiguous type for KONFLUX-12: candidates rfe, initiative"
+        )
+
+    @pytest.mark.parametrize("marker", type_registry.HEADLESS_MARKER_VARS)
+    def test_ambiguous_headless_marker_exits_3(self, marker):
+        result = _cli("resolve", "KONFLUX-12", env={marker: "true"})
+        assert result.returncode == 3
+        assert result.stdout == "" and "ERROR: ambiguous type" in result.stderr
+
+    def test_override_shows_in_the_line(self):
+        env = {"RFE_CREATOR_BINDING_RFE_PROJECT": "KONFLUX"}
+        result = _cli("resolve", "KONFLUX-12", env=env)
+        assert result.returncode == 0, result.stderr
+        assert (
+            result.stdout == "TYPE RESOLVED: rfe (id grammar; binding override project=KONFLUX)\n"
+        )
+
+    def test_shorthand_applies_to_the_resolved_type(self):
+        result = _cli("resolve", "--type", "initiative", env={"JIRA_PROJECT": "PLAN"})
+        assert result.returncode == 0, result.stderr
+        assert (
+            result.stdout == "TYPE RESOLVED: initiative (--type; binding override project=PLAN)\n"
+        )
+
+    def test_json_output(self):
+        result = _cli("resolve", "--json", "--type", "rfe", env={"JIRA_PROJECT": "KONFLUX"})
+        assert result.returncode == 0, result.stderr
+        data = json.loads(result.stdout)
+        assert list(data) == ["type", "rung", "provisional", "binding", "candidates", "line"]
+        assert data["type"] == "rfe" and data["rung"] == "--type" and data["provisional"] is False
+        assert data["binding"]["project"] == "KONFLUX"
+        assert data["binding"]["source"] == "shorthand"
+        assert data["binding"]["overrides"] == ["project"]
+        assert data["candidates"] == []
+        assert data["line"] == "TYPE RESOLVED: rfe (--type; binding override project=KONFLUX)"
+
+    def test_json_ambiguous(self):
+        result = _cli("--json", "resolve", "KONFLUX-12")
+        assert result.returncode == 3
+        data = json.loads(result.stdout)
+        assert data["type"] is None and data["rung"] is None and data["binding"] is None
+        assert data["provisional"] is True
+        assert data["candidates"] == ["rfe", "initiative"]
+        assert data["line"] == "TYPE AMBIGUOUS: rfe, initiative - pass --type"
+
+    def test_json_provisional_single_type(self, tmp_path):
+        root = _copy_types(tmp_path / "types", names=("rfe",))
+        result = _cli("resolve", "--json", "--root", str(root), "KONFLUX-12")
+        assert result.returncode == 0, result.stderr
+        data = json.loads(result.stdout)
+        assert (data["type"], data["rung"], data["provisional"]) == ("rfe", "id grammar", True)
+
+    def test_batch_option(self, tmp_path):
+        batch = _write_yaml(tmp_path / "b.yaml", {"type": "initiative", "items": [{"prompt": "x"}]})
+        result = _cli("resolve", "--batch", str(batch))
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "TYPE RESOLVED: initiative (batch type)\n"
+        conflict = _cli("resolve", "--type", "rfe", "--batch", str(batch))
+        assert conflict.returncode == 1
+        assert conflict.stderr.startswith("ERROR: --type rfe disagrees with")
+        typed_item = _write_yaml(tmp_path / "t.yaml", [{"prompt": "x", "type": "rfe"}])
+        rejected = _cli("resolve", "--batch", str(typed_item))
+        assert rejected.returncode == 1 and "per-item 'type' key" in rejected.stderr
+
+    def test_artifact_option(self, tmp_path):
+        art = _artifact(tmp_path / "x" / "X.md", {"type": "initiative"})
+        result = _cli("resolve", "--artifact", str(art))
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "TYPE RESOLVED: initiative (frontmatter type)\n"
+        placed = _artifact(tmp_path / "rfe-tasks" / "X.md")
+        assert (
+            _cli("resolve", "--artifact", str(placed)).stdout
+            == "TYPE RESOLVED: rfe (artifact dir)\n"
+        )
+        missing = _cli("resolve", "--artifact", str(tmp_path / "nope.md"))
+        assert missing.returncode == 1 and "artifact file not found" in missing.stderr
+
+    def test_workspace_root_is_honoured_interactively(self, tmp_path):
+        (tmp_path / "rfe-creator.yaml").write_text(WORKSPACE_YAML, encoding="utf-8")
+        result = _cli("resolve", "--workspace-root", str(tmp_path), "--type", "rfe")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == (
+            "TYPE RESOLVED: rfe (--type; binding override project=KONFLUX "
+            "issue_type=Feature Request)\n"
+        )
+        assert result.stderr == ""
+        as_json = _cli("resolve", "--json", "--workspace-root", str(tmp_path), "--type", "rfe")
+        assert json.loads(as_json.stdout)["binding"]["source"] == "workspace"
+
+    def test_workspace_root_is_ignored_headless_with_one_stderr_line(self, tmp_path):
+        (tmp_path / "rfe-creator.yaml").write_text(WORKSPACE_YAML, encoding="utf-8")
+        for args, env in ((("--headless",), {}), ((), {"CI": "true"})):
+            result = _cli(
+                "resolve", *args, "--workspace-root", str(tmp_path), "--type", "rfe", env=env
+            )
+            assert result.returncode == 0, result.stderr
+            assert result.stdout == "TYPE RESOLVED: rfe (--type)\n"
+            assert result.stderr.count("\n") == 1
+            assert "ignoring the workspace bindings file" in result.stderr
+
+    def test_the_cwd_is_never_probed(self, tmp_path):
+        (tmp_path / "rfe-creator.yaml").write_text(WORKSPACE_YAML, encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(REPO_ROOT / SCRIPT), "resolve", "--type", "rfe"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=_clean_env(),
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "TYPE RESOLVED: rfe (--type)\n"
+
+    def test_invalid_workspace_file_exits_1(self, tmp_path):
+        (tmp_path / "rfe-creator.yaml").write_text("bindings: [x]\n", encoding="utf-8")
+        result = _cli("resolve", "--workspace-root", str(tmp_path), "--type", "rfe")
+        assert result.returncode == 1
+        assert (
+            result.stderr.startswith("ERROR: ") and "'bindings' must be a mapping" in result.stderr
+        )
+
+    def test_invalid_env_override_exits_1(self):
+        result = _cli(
+            "resolve", "--type", "rfe", env={"RFE_CREATOR_BINDING_RFE_PROJECT": "konflux"}
+        )
+        assert result.returncode == 1
+        assert "RFE_CREATOR_BINDING_RFE_PROJECT='konflux'" in result.stderr
+
+    def test_resolve_help_lists_the_options(self):
+        result = _cli("resolve", "--help")
+        assert result.returncode == 0
+        for option in (
+            "--type",
+            "--batch",
+            "--artifact",
+            "--headless",
+            "--workspace-root",
+            "--json",
+        ):
+            assert option in result.stdout
+
+    def test_candidates_subcommand(self):
+        assert (
+            _cli("candidates", "KONFLUX-12").stdout
+            == "tracker_grammar (provisional): rfe initiative\n"
+        )
+        assert _cli("candidates", "RFE-1").stdout == "local_id_pattern: rfe\n"
+        assert _cli("candidates", "RHOAIENG-1").stdout == "key_prefix: initiative\n"
+        assert _cli("candidates", "INIT-x").stdout == "local_prefix: initiative\n"
+        none = _cli("candidates", "nope")
+        assert none.returncode == 0 and none.stdout == "none: -\n"
+        env = {"RFE_CREATOR_BINDING_RFE_PROJECT": "KONFLUX"}
+        assert _cli("candidates", "KONFLUX-12", env=env).stdout == "key_prefix: rfe\n"
+
+    def test_candidates_json(self):
+        result = _cli("candidates", "RHAIRFE-1", "--json")
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == {
+            "id": "RHAIRFE-1",
+            "rung": "key_prefix",
+            "provisional": False,
+            "types": ["rfe"],
+        }
+
+    def test_binding_cli_carries_the_new_keys_once_they_inform(self):
+        """The CLI view shows ``overrides`` as soon as something is overridden and the
+        ``local_id_pattern`` as soon as it differs from the descriptor's (D13 re-render)."""
+        env = {"RFE_CREATOR_BINDING_RFE_LOCAL_PREFIX": "REQ-"}
+        binding = json.loads(_cli("binding", "rfe", "--json", env=env).stdout)
+        assert binding["local_id_pattern"] == r"^REQ\-\d+$"
+        assert binding["overrides"] == ["local_prefix"]
+        # a project override lists itself but leaves the (unchanged) pattern out
+        env = {"RFE_CREATOR_BINDING_RFE_PROJECT": "KONFLUX"}
+        binding = json.loads(_cli("binding", "rfe", "--json", env=env).stdout)
+        assert binding["overrides"] == ["project"] and binding["source"] == "env"
+        assert "local_id_pattern" not in binding
+        text = _cli("binding", "rfe", env=env).stdout
+        assert text.endswith("source: env\noverrides:\n- project\n")
+        assert "local_id_pattern" not in text
+        # the binding CLI never applies the shorthand: it is not a resolve
+        binding = json.loads(
+            _cli("binding", "rfe", "--json", env={"JIRA_PROJECT": "KONFLUX"}).stdout
+        )
+        assert binding["source"] == "descriptor"
+        assert "overrides" not in binding
+
+
+# ── the shared --type hand-parser (PR-3a) ─────────────────────────────────────────
+
+
+class TestParseTypeArg:
+    """``parse_type_arg`` is the one hand-parser behind check_revised / check_right_sized /
+    check_autofix_complete; each prints ``ERROR: <message>`` and exits with ``exit_code``, so
+    the error text is pinned once, here."""
+
+    UNKNOWN = "unknown --type 'bogus'; registered types: rfe, initiative"
+    TRAILING = "--type requires a value; registered types: rfe, initiative"
+
+    def test_pops_the_flag_and_value_wherever_they_sit(self):
+        reg = _shipped()
+        assert parse_type_arg(reg, ["--type", "initiative"]) == ("initiative", [])
+        assert parse_type_arg(reg, ["a", "--type", "initiative", "b"]) == ("initiative", ["a", "b"])
+        assert parse_type_arg(reg, ["a", "--type", "rfe"]) == ("rfe", ["a"])
+
+    def test_default_when_the_flag_is_absent(self):
+        reg = _shipped()
+        assert parse_type_arg(reg, []) == ("rfe", [])
+        assert parse_type_arg(reg, ["--batch", "X"]) == ("rfe", ["--batch", "X"])
+        assert parse_type_arg(reg, ["x"], default="initiative") == ("initiative", ["x"])
+
+    def test_argv_is_not_mutated_and_only_the_first_flag_is_consumed(self):
+        argv = ["--type", "rfe", "--type", "bogus"]
+        assert parse_type_arg(_shipped(), argv) == ("rfe", ["--type", "bogus"])
+        assert argv == ["--type", "rfe", "--type", "bogus"]
+        assert parse_type_arg(_shipped(), ("--type", "rfe")) == ("rfe", [])
+
+    def test_unknown_type_is_a_usage_error_with_the_registered_list(self):
+        with pytest.raises(ResolveError) as excinfo:
+            parse_type_arg(_shipped(), ["--type", "bogus", "--batch"])
+        assert excinfo.value.exit_code == 2
+        assert str(excinfo.value) == self.UNKNOWN
+
+    def test_trailing_flag_is_a_usage_error(self):
+        with pytest.raises(ResolveError) as excinfo:
+            parse_type_arg(_shipped(), ["--batch", "--type"])
+        assert excinfo.value.exit_code == 2
+        assert str(excinfo.value) == self.TRAILING
+
+    def test_unregistered_default_is_a_usage_error(self, tmp_path):
+        root = tmp_path / "root"
+        _add_type(root, "docs", project="DOCS")
+        reg = load(root=root, extra_roots=[], env={})
+        with pytest.raises(ResolveError) as excinfo:
+            parse_type_arg(reg, [])
+        assert excinfo.value.exit_code == 2
+        assert str(excinfo.value) == (
+            "no --type given and the default type 'rfe' is not registered; registered types: docs"
+        )
+        assert parse_type_arg(reg, ["--type", "docs"]) == ("docs", [])
+
+    def test_custom_flag(self):
+        assert parse_type_arg(_shipped(), ["--kind", "initiative"], flag="--kind") == (
+            "initiative",
+            [],
+        )
+        with pytest.raises(ResolveError, match="unknown --kind 'x'"):
+            parse_type_arg(_shipped(), ["--kind", "x"], flag="--kind")
+
+    def test_the_three_gates_share_it(self):
+        """Source-form pin: no gate carries its own copy — the drift this helper exists to
+        prevent — and each prints the message behind an ``ERROR:`` prefix with its exit code."""
+        for rel in ("check_revised.py", "check_right_sized.py", "check_autofix_complete.py"):
+            text = (REPO_ROOT / "scripts" / rel).read_text(encoding="utf-8")
+            assert "type_registry.parse_type_arg(_TYPES, sys.argv[1:])" in text, rel
+            assert "def _parse_type_arg" not in text, rel
+            assert 'print(f"ERROR: {exc}", file=sys.stderr)' in text, rel
+            assert "sys.exit(exc.exit_code)" in text, rel
+
+
+# ── PR-3a review follow-ups ─────────────────────────────────────────────────────
+
+
+class TestReadParityStrictIdsAndWorkspaceNames:
+    """Read parity under a ``LOCAL_PREFIX`` override, D5 for headless unowned ids, artifact
+    stems as conflict signals, and unregistered type names in the workspace file."""
+
+    def test_local_prefix_override_keeps_descriptor_forms_readable(self):
+        reg = _shipped()
+        env = {"RFE_CREATOR_BINDING_RFE_LOCAL_PREFIX": "REQ-"}
+        assert reg.candidates("REQ-7", env).names == ["rfe"]
+        found = reg.candidates("RFE-001", env)
+        assert (found.names, found.rung, found.provisional) == (["rfe"], "local_id_pattern", False)
+        assert reg.candidates("RFE-x", env).rung == "local_prefix"
+        res = resolve(reg, ids=["RFE-001"], env=env)
+        assert (res.type_name, res.rung, res.provisional) == ("rfe", "id grammar", False)
+
+    def test_headless_unowned_id_is_an_error(self):
+        with pytest.raises(ResolveError, match="no registered type owns id 'free text'") as excinfo:
+            resolve(_shipped(), ids=["free text"], env={"RFE_CREATOR_HEADLESS": "1"})
+        assert excinfo.value.exit_code == 1
+
+    def test_headless_unowned_id_is_fine_under_an_explicit_or_batch_type(self, tmp_path):
+        env = {"RFE_CREATOR_HEADLESS": "1"}
+        assert resolve(_shipped(), explicit_type="rfe", ids=["free text"], env=env).rung == "--type"
+        batch = _write_yaml(tmp_path / "b.yaml", {"type": "initiative", "items": ["free text"]})
+        assert resolve(_shipped(), batch=batch, env=env).rung == "batch type"
+
+    def test_interactive_unowned_id_is_no_signal(self):
+        res = resolve(_shipped(), ids=["free text"], env={})
+        assert (res.type_name, res.rung) == ("rfe", "legacy default")
+
+    def test_artifact_stem_is_never_strict(self, tmp_path):
+        art = _artifact(tmp_path / "misc" / "notes.md", {"title": "t"})
+        res = resolve(_shipped(), artifact=art, env={"RFE_CREATOR_HEADLESS": "1"})
+        assert (res.type_name, res.rung) == ("rfe", "legacy default")
+
+    def test_artifact_stem_owned_by_another_type_conflicts_with_its_dir(self, tmp_path):
+        art = _artifact(tmp_path / "initiatives" / "RHAIRFE-7.md", {"title": "t"})
+        with pytest.raises(ResolveError) as excinfo:
+            resolve(_shipped(), artifact=art, env={})
+        message = str(excinfo.value)
+        assert message.startswith("conflicting type signals:")
+        assert "-> initiative" in message and "RHAIRFE-7 -> rfe" in message
+
+    def test_artifact_stem_agreeing_with_its_dir_resolves_at_artifact_dir(self, tmp_path):
+        art = _artifact(tmp_path / "initiatives" / "RHOAIENG-7.md", {"title": "t"})
+        res = resolve(_shipped(), artifact=art, env={})
+        assert (res.type_name, res.rung) == ("initiative", "artifact dir")
+
+    def test_cli_headless_unowned_id_exits_1(self):
+        result = _cli("resolve", "--headless", "free-text")
+        assert result.returncode == 1
+        assert result.stderr.startswith("ERROR: no registered type owns id 'free-text'")
+        assert result.stdout == ""
+
+    @pytest.mark.parametrize("env", [{}, {"RFE_CREATOR_HEADLESS": "1"}])
+    def test_workspace_unknown_type_name_is_an_error(self, tmp_path, env):
+        (tmp_path / "rfe-creator.yaml").write_text(
+            "bindings:\n  rfes:\n    jira:\n      project: KONFLUX\n", encoding="utf-8"
+        )
+        reg = load(root=TYPES_ROOT, extra_roots=[], env=env, workspace_root=tmp_path)
+        with pytest.raises(
+            RegistryError, match="bindings.rfes: unknown type; registered types: rfe, initiative"
+        ):
+            reg.workspace_bindings()

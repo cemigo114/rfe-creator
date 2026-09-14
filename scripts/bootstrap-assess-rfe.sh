@@ -28,13 +28,64 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-case "$PIPELINE_TYPE" in
-  rfe | initiative) ;;
-  *)
-    echo "ERROR: unknown --type '$PIPELINE_TYPE' (expected rfe or initiative)" >&2
+# The registered type names come from the registry (scripts/type_registry.py list,
+# one name per line): an unknown --type fails with the registered list (design §5
+# rung 1) and a type added under types/ is accepted without editing this script.
+# Validation stays ahead of the RFE_SKIP_BOOTSTRAP short-circuit — a mistyped
+# pipeline must fail even in an offline run. This script IS the dependency
+# bootstrap, so it must not need a bootstrapped Python itself: when the registry
+# cannot be read (no PyYAML yet, no python3 on PATH) the names fall back to the
+# shipped root, <scripts>/../types/<name>/type.yaml — the set `list` prints when
+# RFE_CREATOR_EXTRA_TYPES is unset (a drop-in root needs the registry) — and the
+# registry's own stderr is not shown, so a valid --type behaves exactly as before
+# the registry existed. Only when that root holds no descriptor either is the
+# failure fatal (exit 2).
+SCRIPT_DIR="$(dirname "$0")"
+TYPES_ROOT="$SCRIPT_DIR/../types"
+
+registered_types_from_root() {
+  # rfe first, then the rest in glob order — the order `list` prints (names()).
+  # Directories starting with "_" (types/_schema) are never types.
+  local descriptor name rest="" have_rfe=0
+  for descriptor in "$TYPES_ROOT"/*/type.yaml; do
+    [ -f "$descriptor" ] || continue
+    name="$(basename "$(dirname "$descriptor")")"
+    case "$name" in _*) continue ;; esac
+    if [ "$name" = "rfe" ]; then
+      have_rfe=1
+    else
+      rest+="$name"$'\n'
+    fi
+  done
+  if [ "$have_rfe" -eq 1 ]; then
+    echo "rfe"
+  fi
+  printf '%s' "$rest"
+}
+
+REGISTERED="$(python3 "$SCRIPT_DIR/type_registry.py" list 2>/dev/null)" || REGISTERED=""
+if [ -z "$REGISTERED" ]; then
+  REGISTERED="$(registered_types_from_root)"
+  if [ -z "$REGISTERED" ]; then
+    echo "ERROR: could not read the type registry (python3 $SCRIPT_DIR/type_registry.py list failed and $TYPES_ROOT holds no <name>/type.yaml)" >&2
     exit 2
-    ;;
-esac
+  fi
+fi
+KNOWN=0
+REGISTERED_LIST=""
+while IFS= read -r registered_type; do
+  [ -n "$registered_type" ] || continue
+  if [ "$registered_type" = "$PIPELINE_TYPE" ]; then
+    KNOWN=1
+  fi
+  REGISTERED_LIST="${REGISTERED_LIST:+$REGISTERED_LIST, }$registered_type"
+done <<EOF
+$REGISTERED
+EOF
+if [ "$KNOWN" -ne 1 ]; then
+  echo "ERROR: unknown --type '$PIPELINE_TYPE' (registered types: $REGISTERED_LIST)" >&2
+  exit 2
+fi
 
 if [ -n "${RFE_SKIP_BOOTSTRAP:-}" ]; then
   echo "RFE_SKIP_BOOTSTRAP set - skipping dependency bootstrapping step"

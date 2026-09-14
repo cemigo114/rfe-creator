@@ -10,13 +10,15 @@ reference). Design: `design-proposals/work-item-types-unified.md` §3.2 (contrac
 and are invoked by their cwd-relative path (`python3 scripts/type_registry.py …`, design §3.5.1).
 The provider guide is `docs/type-provider-guide.md`.
 
-**Status (PR-2d): 26 scripts read the registry** (table below). An adopted script does
+**Status (PR-3a): 28 scripts read the registry** (table below). An adopted script does
 `import type_registry` and `_TYPES = type_registry.load()` once at import and builds its per-type
 table over the registry (`_TYPES.names()` or iteration — both in `names()` order), so a drop-in
 type appears in it without a code change. Adopted scripts use DESCRIPTOR values only (`Descriptor.get`, `dirs()`, `labels`,
 `key_prefixes`, `write_prefix`, `local_prefix`, `local_id_pattern`, `id_field`, `score_fields`;
-the prefix sniffs became `TypeRegistry.detect()`); the effective binding (`binding()`) and
-`resolve` are PR-3. Since PR-2b the artifact schemas and the poll phase table are projections
+the prefix sniffs became `TypeRegistry.detect()`); the effective binding (`binding()`) and the
+resolution ladder (`candidates()`, `resolve`, `assert_registered_binding()`) ship in the registry
+since PR-3a ("Resolution" below) and the entry scripts wire them in PR-3b/PR-3c. Since PR-2b the
+artifact schemas and the poll phase table are projections
 too: `artifact_utils.SCHEMAS` builds `<type>-task` / `<type>-review` for every registered type
 that declares `identity.{tracker,id_field,local_id_pattern}`, `conventions.parent_key_patterns`,
 `schema.task.priority.enum` and `schema.review.score_fields` (plus the optional
@@ -75,9 +77,9 @@ itself is fine — `resolve()` follows the link).
 | `batch_summary.py` | `_TYPE_CONFIG` (dirs view of `generate_run_report.TYPE_CONFIG`), `--type` choices | PR-2a |
 | `bootstrap_snapshot.py` | `BOOTSTRAP_CONFIG` (`snapshot.report_prefix`, `reporting.item_key`), `--type` choices | PR-2c; the `issue-snapshot-` run-dir probe (`_run_dir_has_snapshots`) reads the rfe descriptor's `snapshot.prefix` and stays rfe-only for every `--type` (grandfathered; the per-type probe is a deliberate follow-up, design §10 PR-10) |
 | `check_conflicts.py` | `_TYPE_CONFIG`, `--type` choices; task scan via `artifact_utils.scan_tasks(desc)` | PR-2a, PR-2b; `startswith(jira_prefix)` → prefix-union pending |
-| `check_revised.py` | `_TYPE_CONFIG` | PR-2a |
+| `check_revised.py` | `_TYPE_CONFIG`; `--type` validated through `type_registry.parse_type_arg` (unknown → exit 2 with the registered list) | PR-2a; PR-3a (validation) |
 | `check_review_progress.py` | `PHASE_CHECKS`, `check_id` id field + modes by phase base, `--phase` / `--also-phase` choices | PR-2b; `_detect_fast` config allowlist literal until the `initiative-speedrun-config` drift is fixed deliberately; the rfe-only `create` row (`_CREATE_BARRIER_TYPES`, lifted in PR-5) and the initiative row order (`_LEGACY_ROW_ORDER`, CLI choices text) are documented legacy literals |
-| `check_right_sized.py` | `_TYPE_CONFIG`, `pipeline.resplit` | PR-2a |
+| `check_right_sized.py` | `_TYPE_CONFIG`, `pipeline.resplit`; `--type` validated through `type_registry.parse_type_arg` (unknown → exit 2 with the registered list) | PR-2a; PR-3a (validation) |
 | `collect_children.py` | `id_field`, `--type` choices; task scan via `artifact_utils.scan_tasks(desc)` | PR-2a, PR-2b |
 | `collect_recommendations.py` | `_review_dir`, `--type` choices | PR-2a |
 | `error_collect.py` | `_TYPE_CONFIG`, `--type` choices | PR-2a |
@@ -97,12 +99,12 @@ itself is fine — `resolve()` follows the link).
 | `submit.py` | `TYPE_CONFIGS` (descriptor projection over `names()`), `--type` choices, task scan / rename via `artifact_utils.scan_tasks` / `rename_to_tracker_key(desc)`, approve target from `identity.jira.state_map.approved` | PR-2d; grandfathered: the rfe `snapshot_prefix` `''` sentinel and the `split_type_arg` / report `--type` argv convention (no `--type` for rfe); the `auto-created` / `auto-revised` / `needs-attention` / `split-quarantine` labels are still composed from `conventions.label_prefix` |
 | `validate_batch_input.py` | `ALLOWED_PRIORITIES`, known fields, `--type` choices | PR-2a; `PARENT_KEY_PATTERN` literal until PR-3 (Q14) |
 | `verify_phase.py` | phase tables, `_TYPE_CONFIG`, error-stub score tail, `--type` choices | PR-2a |
-| `check_autofix_complete.py` | `_TYPE_CONFIG` | pending |
+| `check_autofix_complete.py` | `--type` validated through `type_registry.parse_type_arg` (unknown → exit 2 with the registered list); `_TYPE_CONFIG` literal, pinned | PR-3a (validation); table pending |
 | `check_content_preservation.py` | inline dir branch | pending |
 | `cleanup_partial_split.py` | inline dir branch | pending |
 | `compare_review_outputs.py` | `_TYPE_CONFIG` | pending |
 | `jira_utils.py` | `strip_metadata` prefix regex | pending |
-| `pipeline_state.py` | `PIPELINE_TYPES` (prompt/skill entries move in PR-5) | pending |
+| `pipeline_state.py` | `init --type` choices = `_TYPES.choices()` (unknown → argparse exit 2 with the registered list); `PIPELINE_TYPES` literal, pinned (prompt/skill entries move in PR-5) | PR-3a (choices); table pending |
 
 ## Adding a type
 
@@ -121,7 +123,8 @@ itself is fine — `resolve()` follows the link).
 During development a drop-in root can be registered with `RFE_CREATOR_EXTRA_TYPES` (`os.pathsep`
 separated directories, each holding `<name>/type.yaml`). Directories whose name starts with `_`
 are skipped; a duplicate type name across roots is an error. The seam is dev/test only: in a
-headless or CI run (`RFE_CREATOR_HEADLESS`, `CI` or `GITHUB_ACTIONS` set) an entry is honoured only
+headless or CI run (`RFE_CREATOR_HEADLESS`, `CI` or `GITHUB_ACTIONS` set, or `resolve --headless`) an
+entry is honoured only
 when its canonical path is listed in `RFE_CREATOR_EXTRA_TYPES_ALLOWLIST` (a protected CI variable);
 the rest are dropped with one stderr line. Explicit `--extra-roots` values are never gated.
 
@@ -170,18 +173,80 @@ without criteria, remote-children skip checks, sibling `Blocks` links, attachmen
 ## Deployment binding override (§3.2.1)
 
 `identity.<tracker>` is the **default** binding. `type_registry.Descriptor.binding()` returns the
-**effective** binding: the descriptor overlaid with `RFE_CREATOR_BINDING_<TYPE>_{PROJECT,ISSUE_TYPE,
-LOCAL_PREFIX}` (`TYPE` upper-cased). Overridable: `project`, `issue_type`, `key_prefixes` (write
-prefix becomes `<PROJECT>-`, descriptor prefixes stay as read prefixes), `query_default`, link
-types, `state_map`, `parent_key_patterns`, optionally `local_prefix`. Never: judgement content,
-`dirs`, `schema`, `rubric`, `eval`. Rules: zero-config default (no required env var); the uniqueness
-lint runs on *effective* bindings and no `local_prefix` stem may equal any effective project key; the
-dry-run sentinel is `<PROJECT>-DRY`; run reports and snapshots record the effective binding.
+**effective** binding: the descriptor overlaid with up to three sources, highest precedence first.
+
+1. **env** — `RFE_CREATOR_BINDING_<TYPE>_{PROJECT,ISSUE_TYPE,LOCAL_PREFIX}` (`TYPE` upper-cased,
+   non-alphanumerics mapped to `_`); the only source a headless or CI run honours.
+2. **shorthand** — bare `JIRA_PROJECT` / `JIRA_ISSUE_TYPE`, applied by `resolve` to the **resolved
+   type only** (`binding(shorthand=True)`); `binding <type>`, `bindings()` and every other reader
+   ignore it, so one shorthand can never move two types.
+3. **workspace** — the `bindings:` block of `rfe-creator.yaml` in the directory passed as
+   `--workspace-root` / `workspace_root=` (the cwd is never probed implicitly), read by
+   `load_workspace_bindings()` and handed out by `TypeRegistry.workspace_bindings()` in interactive
+   runs only:
+
+   ```yaml
+   bindings:
+     rfe:
+       jira: { project: KONFLUX, issue_type: Feature Request }   # project | issue_type | local_prefix
+   ```
+
+Overridable: `project`, `issue_type`, `key_prefixes` (write prefix becomes `<PROJECT>-`, descriptor
+prefixes stay as read prefixes), `local_prefix` (the effective `local_id_pattern` is re-rendered by
+substituting the new prefix at the anchored start of the descriptor pattern, D13 — a pattern that
+does not start with `^` + the descriptor prefix makes the override a hard error) and, once the
+adapter renders them, `query_default`, link types, `state_map`, `parent_key_patterns`. Never:
+judgement content, `dirs`, `schema`, `rubric`, `eval`. Every value passes the same grammar checks
+whatever its source. The result carries `source` (`descriptor`, `env`, `shorthand`, `workspace`, or
+the contributing sources `+`-joined in precedence order) and `overrides` (the overridden fields).
+`python3 scripts/type_registry.py binding <type>` prints that dict minus the keys that only
+restate the descriptor — `overrides` when empty, `local_id_pattern` when it is the descriptor's
+own — so with nothing overridden its output is unchanged from PR-1 (`resolve --json` shows the
+full dict). Rules: zero-config default (no required env var); the uniqueness lint runs on
+*effective* bindings and no `local_prefix` stem may equal any effective project key; the dry-run
+sentinel is `<PROJECT>-DRY`; run reports and snapshots record the effective binding.
 **Trust boundary:** headless and CI runs honour an override only from the environment (protected CI
-variables), never from a workspace file the checkout could carry; the effective `(project,
-issue_type)` pair is printed at resolve time and checked against the registered bindings before the
-first tracker write — an untrusted source or an unregistered pair is a hard failure. `DRAFT-` is not
-adopted at v1.
+variables), never from a workspace file the checkout could carry — `workspace_bindings()` returns
+`{}` there and prints one stderr line when the file would have overridden something. The effective
+`(project, issue_type)` pair is printed at resolve time and `assert_registered_binding()` is the
+check before the first tracker write: a workspace-sourced override in a headless run, or an
+effective `(tracker, project, issue_type)` that **another** registered type owns (ownership, not
+membership: an rfe override that selects the initiative pair is refused even though the pair is
+registered), is a hard failure. `DRAFT-` is not adopted at v1.
+
+## Resolution (§5)
+
+`python3 scripts/type_registry.py resolve [--type T] [--batch FILE] [--artifact PATH] [--headless]
+[--workspace-root DIR] [--json] [ID ...]` runs the deterministic ladder and prints one line,
+`TYPE RESOLVED: <type> (<rung>)` — with `; binding override project=KONFLUX ...` inside the
+parentheses when the effective binding carries overrides (`project`, `issue_type`, `local_prefix`
+order). The `resolve` CLI always prints it; the entry scripts (wired in PR-3b/PR-3c) stay silent for
+the legacy default so existing invocations remain byte-identical (D3). `--json` prints
+`{type, rung, provisional, binding, candidates, line}` instead. Rungs, strongest first:
+
+| Rung | Signal | Notes |
+|---|---|---|
+| `--type` | explicit type | unknown → exit 1 with the registered list |
+| `batch type` | `{type: <t>, items: [...]}` batch root | a legacy bare list gives no signal (its string items join the ids); `--type` disagreeing with `type:` is an error (D1); an item carrying its own `type` key is an error (D2); any other root shape is an error |
+| `frontmatter type` | artifact frontmatter `type:` | `--artifact PATH`; the block between the first two `---` lines |
+| `artifact dir` | the artifact's parent directory is one of a type's `dirs` | when there is no frontmatter `type:`; the file stem always joins the ids too, so a stem owned by another type is a conflict, not a silent directory win |
+| `id grammar` | ids through `candidates()` | rungs `local_id_pattern` → `key_prefix` → `local_prefix` → the Jira grammar `^[A-Z][A-Z0-9]+-[0-9]+$` (provisional: every Jira-bound type), each over **effective** bindings; under a `LOCAL_PREFIX` override the descriptor's own pattern and prefix stay read forms, so ids minted before the override still resolve |
+| `legacy default` | nothing | `rfe`, when registered |
+
+Two or more deterministic signals naming different types are a hard error (`conflicting type
+signals: RFE-1 -> rfe, INIT-2 -> initiative`, exit 1), never a question, also under an explicit
+`--type`. An id no registered type owns (`foo`, a lower-case key) is no signal in an interactive run
+(the ladder falls through to the legacy default); in a headless run with neither `--type` nor a
+batch `type:` it is a hard error, exit 1 (D5: headless never guesses) — an `--artifact` stem is never
+held to that rule. Provisional-only candidates (a key from a project no type is bound to, `KONFLUX-12`)
+resolve when they single out one type; otherwise the run is **ambiguous**: headless → `ERROR:
+ambiguous type ... pass --type` on stderr, exit 3; interactive → `TYPE AMBIGUOUS: rfe, initiative -
+pass --type` on stdout, exit 3 (the hook for the interactive picker, which is not implemented).
+Headless means `is_headless(env, flag)`: `RFE_CREATOR_HEADLESS` (exported by the headless pipeline),
+`CI` or `GITHUB_ACTIONS` set, or `--headless` passed (`load(headless=True)` in code) — one
+predicate for the extra-roots seam, the workspace file and resolve (D4). `python3 scripts/type_registry.py candidates <ID>` prints the rung
+and the candidate types of one id (`tracker_grammar (provisional): rfe initiative`). `detect()` is
+unchanged (one Descriptor or `None`, descriptor values only) for the per-id routers.
 
 ## Lint gates (§3.3)
 

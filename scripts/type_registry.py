@@ -6,10 +6,14 @@ Usage:
     python3 scripts/type_registry.py show <type> [--json]
     python3 scripts/type_registry.py get <type> <dotted.path> [--json]
     python3 scripts/type_registry.py binding <type> [--json]
+    python3 scripts/type_registry.py candidates <id> [--json]
+    python3 scripts/type_registry.py resolve [--type T] [--batch FILE] [--artifact PATH]
+                                             [--headless] [--workspace-root DIR] [--json] [ID ...]
 
     Options: --root DIR (default: <repo>/types), --extra-roots A:B (default: env
     RFE_CREATOR_EXTRA_TYPES). Exit 0 on success, 1 on an unknown type / unreadable
-    registry / missing key, 2 on a usage error.
+    registry / missing key / conflicting or invalid resolve input, 2 on a usage error,
+    3 when ``resolve`` is ambiguous (``TYPE AMBIGUOUS: a, b - pass --type``).
 
 Import-clean invariant (design work-item-types-unified.md §10 item 1, PR-1; Q5)
 --------------------------------------------------------------------------------
@@ -21,33 +25,76 @@ be lifted verbatim into the ``creator-core`` follow-up (design §10 item 10), so
 them free of repo-specific helpers: JSON-Schema validation lives in
 ``scripts/validate_types.py`` (the only place ``jsonschema`` is imported), not here.
 
-Adoption status (PR-2d): 26 scripts load the registry at import (module-level
+Adoption status (PR-3a): 28 scripts load the registry at import (module-level
 ``_TYPES = type_registry.load()``; the table in ``types/README.md`` lists them) and use
-DESCRIPTOR values only; ``detect()``/``owns()`` are the design §5 rung-3 seed. The values a
+DESCRIPTOR values only; ``detect()``/``owns()`` are the design §5 rung-3 routers. The values a
 pending script still carries are pinned equal to the descriptors by test, and the remaining
-scripts adopt the registry one PR at a time (design §10 items 2-5); ``binding()`` overrides
-and ``resolve`` land in PR-3.
+scripts adopt the registry one PR at a time (design §10 items 2-5). The resolution ladder
+(``candidates``, ``resolve``, ``assert_registered_binding``) ships here; the entry scripts
+wire it in PR-3b/PR-3c, so no production invocation prints a ``TYPE RESOLVED`` line yet.
+``parse_type_arg`` is the one hand-parser behind the pipeline gates that take ``--type``
+without argparse (``check_revised``, ``check_right_sized``, ``check_autofix_complete``), so
+their error text cannot drift.
 
 Deployment binding override (design §3.2.1)
 --------------------------------------------
 ``identity.<tracker>`` in the descriptor is the DEFAULT binding. ``Descriptor.binding``
-computes the EFFECTIVE binding by overlaying the explicit, type-scoped environment
-variables ``RFE_CREATOR_BINDING_<TYPE>_{PROJECT,ISSUE_TYPE,LOCAL_PREFIX}`` (``<TYPE>`` is
-the type name upper-cased, non-alphanumerics mapped to ``_``). When ``PROJECT`` is
-overridden the write prefix ``<PROJECT>-`` is derived and placed first in
-``key_prefixes``; the descriptor's own prefixes are kept after it as read prefixes.
-Only binding fields are overridable — never judgement content, dirs, schema, rubric or
-eval. Zero-config default: with no variable set the effective binding IS the descriptor
-binding (``source: descriptor``); nothing here is required.
+computes the EFFECTIVE binding by overlaying, in precedence order:
 
-NOT implemented in PR-1 (lands with ``resolve`` in PR-3): the bare ``JIRA_PROJECT`` /
-``JIRA_ISSUE_TYPE`` shorthand, which is only valid for the *resolved* type, and the
-workspace ``rfe-creator.yaml`` ``bindings:`` file. Trust-boundary rule for whoever adds
-them (§3.2.1 g): in headless and CI runs an override is honoured ONLY from the
-environment (protected CI variables), never from a workspace file the checkout could
-carry; the effective ``(project, issue_type)`` pair is printed at resolve time and
-checked against the registered bindings before the first tracker write, and an
-untrusted source or an unregistered pair is a hard failure, not a warning.
+1. ``env`` — the explicit, type-scoped variables
+   ``RFE_CREATOR_BINDING_<TYPE>_{PROJECT,ISSUE_TYPE,LOCAL_PREFIX}`` (``<TYPE>`` is the type
+   name upper-cased, non-alphanumerics mapped to ``_``);
+2. ``shorthand`` — the bare ``JIRA_PROJECT`` / ``JIRA_ISSUE_TYPE`` variables, honoured ONLY
+   when ``binding(shorthand=True)`` is asked for, which ``resolve`` does for the RESOLVED
+   type alone (a shorthand can name one project, so it can bind one type per run);
+3. ``workspace`` — the ``bindings:`` block of a workspace ``rfe-creator.yaml``
+   (``bindings: {rfe: {jira: {project: KONFLUX, issue_type: Feature Request}}}``), read by
+   ``load_workspace_bindings(root)`` and passed in as the ``workspace`` mapping;
+4. the descriptor.
+
+Every value passes the same grammar checks whatever its source. When ``project`` is
+overridden the write prefix ``<PROJECT>-`` is derived and placed first in
+``key_prefixes``; the descriptor's own prefixes are kept after it as read prefixes. When
+``local_prefix`` is overridden the effective ``local_id_pattern`` is re-rendered by
+substituting the new prefix for the descriptor prefix at the anchored start of the pattern
+(PR-3 D13); a pattern that does not start with ``^`` + the descriptor prefix makes the
+override a hard error. The result carries ``source`` (``descriptor``, ``env``, ``shorthand``,
+``workspace`` or a ``+``-joined combination of the sources that contributed, in precedence
+order) and ``overrides`` (the overridden field names). Only binding fields are overridable —
+never judgement content, dirs, schema, rubric or eval. Zero-config default: with nothing set
+the effective binding IS the descriptor binding (``source: descriptor``).
+
+Trust boundary (§3.2.1 g): in a headless or CI run an override is honoured ONLY from the
+environment (protected CI variables), never from a workspace file the checkout could carry.
+``TypeRegistry.workspace_bindings()`` returns the file's mapping in an interactive run and
+``{}`` (with one stderr line when the file would have overridden something) in a headless
+one; ``assert_registered_binding`` — the runtime twin of the gate-1 uniqueness rule, called
+before the first tracker write — rejects a workspace-sourced override in a headless run and
+an effective ``(tracker, project, issue_type)`` that another registered type owns (ownership,
+not membership: an rfe override that selects the initiative pair is refused even though the
+pair is registered).
+
+Type resolution (design §5, PR-3a)
+-----------------------------------
+``TypeRegistry.candidates(item_id)`` is the multi-candidate form of ``detect()`` over
+EFFECTIVE bindings: rungs ``local_id_pattern`` full-match, ``key_prefix`` (effective and
+descriptor prefixes), ``local_prefix``, then the Jira adapter's generic key grammar
+``^[A-Z][A-Z0-9]+-[0-9]+$`` as a PROVISIONAL last rung (every Jira-bound type is a candidate,
+discriminated post-fetch). The first rung with a match wins and returns every type matching
+there. ``detect()`` keeps its Descriptor-or-None, descriptor-values-only contract for the
+per-id routers.
+
+``resolve(registry, ...)`` runs the ladder: ``--type`` (rung 1) > batch mapping ``type:``
+(rung 2; a per-item ``type`` key and a ``--type`` that disagrees with the mapping are hard
+errors, D1/D2) > deterministic signals (rung 3: artifact frontmatter ``type:``, else the
+artifact's parent directory against every type's ``dirs``, else ids through ``candidates``)
+> the grandfathered ``rfe`` default (rung 5). Conflicting deterministic signals are a hard
+error, never a question. Provisional-only signals resolve when they single out one type and
+are otherwise ambiguous: headless -> ``ResolveError`` (exit 3), interactive -> a
+``Resolution`` with ``type_name None`` and ``candidates`` filled — the hook for the
+interactive rung 4 (classification / picker), which is not implemented here. The resolved
+line is ``TYPE RESOLVED: <type> (<rung>[; binding override project=...])``; the ``resolve``
+CLI always prints it (D3), entry scripts stay silent for the legacy default.
 
 Drop-in roots
 -------------
@@ -58,16 +105,19 @@ name present in two roots is an error, and a ``type.yaml`` that resolves outside
 shipped types before any binding is used.
 
 The seam is development and test only (design §3.5, PR1-05): in a headless or CI run —
-any of ``RFE_CREATOR_HEADLESS``, ``CI``, ``GITHUB_ACTIONS`` set to a truthy value in the
-registry's environment — an ``RFE_CREATOR_EXTRA_TYPES`` entry is honoured only when its
+``is_headless(env, flag)``: any of ``RFE_CREATOR_HEADLESS``, ``CI``, ``GITHUB_ACTIONS`` set to
+a truthy value in the registry's environment, or an explicit ``--headless`` flag, which
+reaches the seam as ``load(headless=True)`` / ``TypeRegistry.headless`` (the ``resolve`` CLI
+passes its flag; one predicate, PR-3 D4) — an ``RFE_CREATOR_EXTRA_TYPES`` entry is honoured
+only when its
 canonical path is allowlisted, via ``RFE_CREATOR_EXTRA_TYPES_ALLOWLIST`` (a protected CI
 variable, the same trust boundary as §3.2.1 g) or the ``allowlisted_extra_roots`` argument.
 Every other entry is dropped with one stderr line and recorded in
 ``TypeRegistry.ignored_extra_roots``. Explicit ``extra_roots=`` / ``--extra-roots`` values
 are a deliberate caller action and are never gated. The marker is environment-only: this
 module never probes the cwd (``tmp/pipeline-state.yaml`` is the pipeline's business — a
-headless launcher exports ``RFE_CREATOR_HEADLESS=1`` for its subprocesses when a consumer
-lands, PR-2/PR-3).
+headless pipeline exports ``RFE_CREATOR_HEADLESS=1`` for its subprocesses), and the
+workspace file is read only from an explicit ``workspace_root`` / ``--workspace-root``.
 """
 
 import argparse
@@ -76,6 +126,7 @@ import json
 import os
 import re
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -90,8 +141,8 @@ EXTRA_ROOTS_ENV = "RFE_CREATOR_EXTRA_TYPES"
 EXTRA_ROOTS_ALLOWLIST_ENV = "RFE_CREATOR_EXTRA_TYPES_ALLOWLIST"
 # Headless/CI markers, checked in the registry's env only (never the cwd). CI / GITHUB_ACTIONS
 # are the conventional CI variables; RFE_CREATOR_HEADLESS is the explicit pipeline marker
-# (exported by the headless launcher once a consumer needs the gate, PR-3; the PR-2a adopters
-# read descriptor values only).
+# (exported by pipeline_state.py for a headless pipeline so every subprocess shares the
+# predicate, PR-3 D4).
 HEADLESS_MARKER_VARS = ("RFE_CREATOR_HEADLESS", "CI", "GITHUB_ACTIONS")
 _FALSE_VALUES = {"", "0", "false", "no", "off"}
 BINDING_ENV_PREFIX = "RFE_CREATOR_BINDING_"
@@ -101,14 +152,43 @@ BINDING_OVERRIDE_FIELDS = {
     "ISSUE_TYPE": "issue_type",
     "LOCAL_PREFIX": "local_prefix",
 }
+# The overridable fields in the order the resolve line and ``overrides`` list them.
+BINDING_FIELD_ORDER = ("project", "issue_type", "local_prefix")
+# Bare shorthand variables per tracker (design §3.2.1): honoured for the RESOLVED type only,
+# below the typed RFE_CREATOR_BINDING_* variables and above the workspace file.
+SHORTHAND_ENV_VARS = {"jira": {"JIRA_PROJECT": "project", "JIRA_ISSUE_TYPE": "issue_type"}}
+# Override sources in precedence order; the descriptor is the implicit last layer.
+BINDING_SOURCES = ("env", "shorthand", "workspace")
+# Workspace override file (design §3.2.1), read only from an explicit root — never the cwd.
+WORKSPACE_FILENAME = "rfe-creator.yaml"
+WORKSPACE_BINDINGS_KEY = "bindings"
 # Q13: descriptors store dirs as "artifacts/<name>"; the bare form drops this component.
 ARTIFACTS_DIR = "artifacts"
 DIR_FORMS = ("artifacts", "bare")
 
-# Value grammars for env overrides. A lower-case or dash-less typo must fail loudly instead
-# of silently minting a bogus write prefix (the §3.2.1 (b)/(g) lint runs on these values).
+# Value grammars for overrides. A lower-case or dash-less typo must fail loudly instead of
+# silently minting a bogus write prefix (the §3.2.1 (b)/(g) lint runs on these values).
 _PROJECT_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _LOCAL_PREFIX_RE = re.compile(r"^[A-Z][A-Z0-9]{0,31}-$")
+
+# Design §3.2.1 (f): each tracker adapter contributes a generic key grammar as the provisional
+# last detection rung, so keys from an overridden project still resolve to a candidate set.
+TRACKER_KEY_GRAMMARS = {"jira": re.compile(r"^[A-Z][A-Z0-9]+-[0-9]+$")}
+# ``candidates()`` rungs, most specific first; only the last one is provisional.
+CANDIDATE_RUNGS = ("local_id_pattern", "key_prefix", "local_prefix", "tracker_grammar")
+PROVISIONAL_RUNG = "tracker_grammar"
+# ``resolve()`` rungs, strongest first (design §5; rung 4, the interactive picker, is not here).
+RESOLVE_RUNGS = (
+    "--type",
+    "batch type",
+    "frontmatter type",
+    "artifact dir",
+    "id grammar",
+    "legacy default",
+)
+# Design §5 rung 5: the grandfathered default when nothing else decides.
+LEGACY_DEFAULT_TYPE = "rfe"
+EXIT_AMBIGUOUS = 3
 
 # Sentinel for Descriptor.get(): "no default supplied" must be distinguishable from None,
 # because null is a legitimate descriptor value (e.g. pipeline.rubric.export for initiative).
@@ -120,7 +200,17 @@ _INDEX_RE = re.compile(r"-?[0-9]+")
 
 
 class RegistryError(ValueError):
-    """The registry could not be loaded (bad root, unreadable/invalid descriptor, duplicate)."""
+    """The registry could not be loaded (bad root, unreadable/invalid descriptor, duplicate),
+    or an override / workspace file is invalid."""
+
+
+class ResolveError(RegistryError):
+    """``resolve`` could not decide: unknown type, conflicting signals, invalid batch or
+    artifact input (``exit_code`` 1) or an ambiguous headless run (``exit_code`` 3)."""
+
+    def __init__(self, message, exit_code=1):
+        super().__init__(message)
+        self.exit_code = exit_code
 
 
 def binding_env_var(type_name, field):
@@ -142,9 +232,16 @@ def parse_extra_roots(value):
     return [Path(p).expanduser() for p in value.split(os.pathsep) if p.strip()]
 
 
-def is_headless(env):
-    """True when ``env`` carries a headless/CI marker (design §3.5): ``RFE_CREATOR_HEADLESS``,
-    ``CI`` or ``GITHUB_ACTIONS`` set to anything but an empty/false value."""
+def is_headless(env, flag=False):
+    """The one headless predicate (design §3.5, PR-3 D4).
+
+    True when ``flag`` is set (an explicit ``--headless``) or when ``env`` carries a
+    headless/CI marker: ``RFE_CREATOR_HEADLESS``, ``CI`` or ``GITHUB_ACTIONS`` set to anything
+    but an empty/false value. The flag can only add: an explicit ``False`` does not switch a
+    marked environment back to interactive.
+    """
+    if flag:
+        return True
     for var in HEADLESS_MARKER_VARS:
         value = env.get(var, "")
         if str(value).strip().lower() not in _FALSE_VALUES:
@@ -169,12 +266,18 @@ def _flatten(mapping, prefix=""):
     return out
 
 
+def _env_value(env, var):
+    """The stripped string value of ``var`` in ``env``; blank or non-string counts as unset."""
+    value = env.get(var, "")
+    return value.strip() if isinstance(value, str) else ""
+
+
 class Descriptor:
     """Thin wrapper over one parsed ``type.yaml`` dict.
 
     The raw mapping is available as ``data``; the accessors below are the projections the
-    pin tests and (from PR-2) the scripts consume. Accessors return DESCRIPTOR values;
-    only ``binding()`` applies the §3.2.1 environment overlay.
+    pin tests and the adopted scripts consume. Accessors return DESCRIPTOR values; only
+    ``binding()`` applies the §3.2.1 override overlay.
     """
 
     def __init__(self, name, data, path=None, env=None):
@@ -261,7 +364,7 @@ class Descriptor:
     def id_field(self):
         return self.get("identity.id_field")
 
-    # -- identity detection (PR-2 seed of the design §5 ladder) ---------------------------
+    # -- identity detection (design §5 rung 3, single-type routers) -----------------------
 
     def _matches_local_id(self, item_id):
         pattern = self.get("identity.local_id_pattern", None)
@@ -281,7 +384,7 @@ class Descriptor:
         ``identity.local_id_pattern`` (most specific), else a tracker ``key_prefixes`` prefix
         match (Jira grammar), else an ``identity.local_prefix`` prefix match. Case-sensitive;
         ``None`` and the empty string never match. DESCRIPTOR values only — the §3.2.1 binding
-        overlay is not consulted (that lands with ``resolve`` in PR-3).
+        overlay is consulted by ``TypeRegistry.candidates`` / ``resolve``, not here.
         """
         if not isinstance(item_id, str) or not item_id:
             return False
@@ -291,16 +394,27 @@ class Descriptor:
             or self._has_local_prefix(item_id)
         )
 
-    def binding(self, env=None):
+    # -- effective binding (design §3.2.1) --------------------------------------------------
+
+    def binding(self, env=None, workspace=None, shorthand=False):
         """Return the EFFECTIVE tracker binding (design §3.2.1).
 
-        ``identity.<tracker>`` overlaid with ``RFE_CREATOR_BINDING_<TYPE>_{PROJECT,ISSUE_TYPE,
-        LOCAL_PREFIX}`` from ``env`` (default: the registry's environment, else ``os.environ``).
+        ``identity.<tracker>`` overlaid, in precedence order, with the type-scoped
+        ``RFE_CREATOR_BINDING_<TYPE>_{PROJECT,ISSUE_TYPE,LOCAL_PREFIX}`` variables from ``env``
+        (default: the registry's environment, else ``os.environ``); with the bare
+        ``JIRA_PROJECT`` / ``JIRA_ISSUE_TYPE`` shorthand when ``shorthand`` is true (``resolve``
+        passes it for the resolved type only); and with ``workspace[<type>][<tracker>]`` — the
+        mapping ``load_workspace_bindings`` returns (obtain it through
+        ``TypeRegistry.workspace_bindings`` so the headless trust boundary applies).
+
         Keys: ``tracker``, ``project``, ``issue_type``, ``key_prefixes`` (write prefix first —
         derived ``<PROJECT>-`` when the project is overridden, descriptor prefixes kept as read
-        prefixes), ``local_prefix`` (effective), every other key of the binding block verbatim,
-        and ``source`` (``"descriptor"`` or ``"env"``). Empty variables count as unset.
-        ``local_id_pattern`` is NOT re-derived from an overridden ``local_prefix`` in PR-1.
+        prefixes), ``local_prefix`` (effective), ``local_id_pattern`` (effective — re-rendered
+        for an overridden local prefix, PR-3 D13), every other key of the binding block
+        verbatim, ``source`` (``descriptor``, or the contributing sources ``+``-joined in
+        precedence order: ``env``, ``shorthand``, ``workspace``) and ``overrides`` (the
+        overridden field names in ``project, issue_type, local_prefix`` order). Blank
+        variables count as unset; every value passes the same grammar checks.
         """
         if env is None:
             env = self._env if self._env is not None else os.environ
@@ -312,24 +426,67 @@ class Descriptor:
         effective.setdefault("project", None)
         effective.setdefault("issue_type", None)
         effective["key_prefixes"] = self.key_prefixes
-        effective["local_prefix"] = self.get("identity.local_prefix", None)
+        descriptor_prefix = self.get("identity.local_prefix", None)
+        effective["local_prefix"] = descriptor_prefix
+        effective["local_id_pattern"] = self.get("identity.local_id_pattern", None)
 
-        overrides = {}
-        for suffix, field in BINDING_OVERRIDE_FIELDS.items():
-            var = binding_env_var(self.name, suffix)
-            value = env.get(var, "")
-            value = value.strip() if isinstance(value, str) else ""
-            if value:
-                overrides[field] = _validate_override(var, field, value)
+        layers = [("env", self._env_overrides(env))]
+        if shorthand:
+            layers.append(("shorthand", self._shorthand_overrides(env)))
+        if workspace:
+            layers.append(("workspace", self._workspace_overrides(workspace)))
+        overrides, origin = {}, {}
+        for source, values in layers:
+            for name, value in values.items():
+                if name not in overrides:
+                    overrides[name] = value
+                    origin[name] = source
 
         if "project" in overrides:
-            project = overrides["project"]
-            derived = f"{project}-"
+            derived = f"{overrides['project']}-"
             read_prefixes = [p for p in effective["key_prefixes"] if p != derived]
             effective["key_prefixes"] = [derived] + read_prefixes
+        if "local_prefix" in overrides:
+            effective["local_id_pattern"] = _rerender_local_id_pattern(
+                self.name,
+                effective["local_id_pattern"],
+                descriptor_prefix,
+                overrides["local_prefix"],
+            )
         effective.update(overrides)
-        effective["source"] = "env" if overrides else "descriptor"
+        contributing = [s for s in BINDING_SOURCES if s in origin.values()]
+        effective["source"] = "+".join(contributing) if contributing else "descriptor"
+        effective["overrides"] = [f for f in BINDING_FIELD_ORDER if f in overrides]
         return effective
+
+    def _env_overrides(self, env):
+        out = {}
+        for suffix, name in BINDING_OVERRIDE_FIELDS.items():
+            var = binding_env_var(self.name, suffix)
+            value = _env_value(env, var)
+            if value:
+                out[name] = _validate_override(var, name, value)
+        return out
+
+    def _shorthand_overrides(self, env):
+        out = {}
+        for var, name in SHORTHAND_ENV_VARS.get(self.tracker, {}).items():
+            value = _env_value(env, var)
+            if value:
+                out[name] = _validate_override(var, name, value)
+        return out
+
+    def _workspace_overrides(self, workspace):
+        per_type = workspace.get(self.name) if isinstance(workspace, dict) else None
+        block = per_type.get(self.tracker) if isinstance(per_type, dict) else None
+        if not isinstance(block, dict):
+            return {}
+        out = {}
+        for name in BINDING_FIELD_ORDER:
+            if name in block:
+                label = f"{WORKSPACE_FILENAME} bindings.{self.name}.{self.tracker}.{name}"
+                out[name] = _validate_override(label, name, block[name])
+        return out
 
     # -- layout / conventions / schema ------------------------------------------------------
 
@@ -365,6 +522,8 @@ def _bare_dir(value):
 
 
 def _validate_override(var, field, value):
+    if not isinstance(value, str) or not value.strip():
+        raise RegistryError(f"{var}={value!r}: expected a non-empty string")
     if field == "project" and not _PROJECT_KEY_RE.match(value):
         raise RegistryError(f"{var}={value!r}: expected an upper-case tracker project key")
     if field == "local_prefix" and not _LOCAL_PREFIX_RE.match(value):
@@ -372,12 +531,172 @@ def _validate_override(var, field, value):
     return value
 
 
+def _rerender_local_id_pattern(type_name, pattern, descriptor_prefix, new_prefix):
+    """Re-render ``identity.local_id_pattern`` for an overridden local prefix (PR-3 D13).
+
+    The descriptor pattern must start with ``^`` followed by ``descriptor_prefix`` — either
+    literally (``^RFE-\\d+$``) or as ``re.escape(descriptor_prefix)`` (``^RFE\\-\\d+$``); that
+    head is replaced by ``^`` + ``re.escape(new_prefix)`` and the result must compile and
+    match against ``f"{new_prefix}1"`` without a regex error. Anything else is a hard error
+    naming the type and the pattern. A descriptor without a pattern has nothing to pair and
+    keeps ``None``.
+    """
+    if not pattern:
+        return pattern
+    heads = []
+    if isinstance(descriptor_prefix, str) and descriptor_prefix:
+        heads = sorted({descriptor_prefix, re.escape(descriptor_prefix)}, key=len, reverse=True)
+    for head in heads:
+        anchored = f"^{head}"
+        if pattern.startswith(anchored):
+            rendered = f"^{re.escape(new_prefix)}{pattern[len(anchored) :]}"
+            try:
+                re.compile(rendered).fullmatch(f"{new_prefix}1")
+            except re.error as exc:
+                raise RegistryError(
+                    f"{type_name}: identity.local_id_pattern {pattern!r} re-rendered for local "
+                    f"prefix {new_prefix!r} is not a valid regex ({rendered!r}): {exc}"
+                ) from exc
+            return rendered
+    raise RegistryError(
+        f"{type_name}: cannot override local_prefix to {new_prefix!r}: identity.local_id_pattern "
+        f"{pattern!r} does not start with '^' followed by the descriptor local_prefix "
+        f"{descriptor_prefix!r} (PR-3 D13: prefix and pattern are paired)"
+    )
+
+
+def load_workspace_bindings(root):
+    """Return the ``bindings`` mapping of ``<root>/rfe-creator.yaml``, or ``{}``.
+
+    Shape: ``{<type name>: {<tracker>: {project | issue_type | local_prefix: <str>}}}``. A
+    missing file, an empty file or a file without a ``bindings`` block yields ``{}``; any
+    other shape (a non-mapping level, an unknown field, a blank or non-string value) raises
+    ``RegistryError`` naming the path and the offending key. ``root`` ``None`` reads nothing.
+    Whether the mapping may be USED is decided by ``TypeRegistry.workspace_bindings`` (the
+    §3.2.1 g trust boundary); this function only reads.
+    """
+    if root is None:
+        return {}
+    path = Path(root).expanduser() / WORKSPACE_FILENAME
+    if not path.is_file():
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+    except yaml.YAMLError as exc:
+        raise RegistryError(f"{path}: invalid YAML: {exc}") from exc
+    except OSError as exc:
+        raise RegistryError(f"{path}: {exc}") from exc
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise RegistryError(f"{path}: expected a mapping at the top level, got {_shape(data)}")
+    bindings = data.get(WORKSPACE_BINDINGS_KEY)
+    if bindings is None:
+        return {}
+    if not isinstance(bindings, dict):
+        raise RegistryError(
+            f"{path}: '{WORKSPACE_BINDINGS_KEY}' must be a mapping of type name -> tracker -> "
+            f"fields, got {_shape(bindings)}"
+        )
+    result = {}
+    for type_name, trackers in bindings.items():
+        where = f"{path}: {WORKSPACE_BINDINGS_KEY}.{type_name}"
+        if not isinstance(type_name, str) or not isinstance(trackers, dict):
+            raise RegistryError(f"{where}: expected a mapping of tracker -> fields")
+        result[type_name] = {}
+        for tracker, fields in trackers.items():
+            where = f"{path}: {WORKSPACE_BINDINGS_KEY}.{type_name}.{tracker}"
+            if not isinstance(tracker, str) or not isinstance(fields, dict):
+                raise RegistryError(f"{where}: expected a mapping of binding fields")
+            unknown = sorted(str(k) for k in fields if k not in BINDING_FIELD_ORDER)
+            if unknown:
+                raise RegistryError(
+                    f"{where}: unknown field(s) {', '.join(unknown)}; overridable fields: "
+                    f"{', '.join(BINDING_FIELD_ORDER)}"
+                )
+            for name, value in fields.items():
+                if not isinstance(value, str) or not value.strip():
+                    raise RegistryError(
+                        f"{where}.{name}: expected a non-empty string, got {value!r}"
+                    )
+            result[type_name][tracker] = dict(fields)
+    return result
+
+
+def _shape(value):
+    """Human-readable YAML shape for error messages."""
+    if value is None:
+        return "nothing"
+    if isinstance(value, dict):
+        keys = ", ".join(str(k) for k in value) or "(no keys)"
+        return f"a mapping with keys {keys}"
+    return type(value).__name__
+
+
+def _binding_identity(binding):
+    """The per-tracker identity key the uniqueness rule compares (design §3.3 rule 1):
+    jira -> ``(tracker, project, issue_type)``; other trackers -> their own pair."""
+    tracker = binding.get("tracker")
+    if tracker == "jira":
+        return (tracker, binding.get("project"), binding.get("issue_type"))
+    return (tracker, binding.get("repo", binding.get("project")), str(binding.get("kind")))
+
+
+@dataclass(frozen=True)
+class Candidates:
+    """Result of ``TypeRegistry.candidates``: the descriptors matching at the winning rung
+    (``names()`` order), the rung name (``None`` when nothing matched) and whether the rung
+    is provisional (only ``tracker_grammar`` is)."""
+
+    matches: list
+    rung: "str | None"
+    provisional: bool
+
+    @property
+    def names(self):
+        return [desc.name for desc in self.matches]
+
+
+def _rung_matches(rung, desc, binding, item_id):
+    # Read parity under a LOCAL_PREFIX override: the effective (re-rendered, D13) pattern and
+    # prefix govern minting, but the descriptor's own stay READ forms, exactly as an overridden
+    # project keeps the descriptor key prefixes as read prefixes — the local ids a deployment
+    # minted before the override are still its own.
+    if rung == "local_id_pattern":
+        patterns = (binding.get("local_id_pattern"), desc.get("identity.local_id_pattern", None))
+        return any(p and re.fullmatch(p, item_id) is not None for p in patterns)
+    if rung == "key_prefix":
+        # binding() already lists every descriptor prefix as a read prefix after the write one.
+        return any(item_id.startswith(p) for p in binding.get("key_prefixes") or [] if p)
+    if rung == "local_prefix":
+        prefixes = (binding.get("local_prefix"), desc.get("identity.local_prefix", None))
+        return any(p and item_id.startswith(p) for p in prefixes)
+    grammar = TRACKER_KEY_GRAMMARS.get(binding.get("tracker"))
+    return grammar is not None and grammar.fullmatch(item_id) is not None
+
+
 class TypeRegistry:
     """Static enumeration of ``<root>/<name>/type.yaml`` descriptors across one or more roots."""
 
-    def __init__(self, root=None, extra_roots=None, env=None, allowlisted_extra_roots=None):
+    def __init__(
+        self,
+        root=None,
+        extra_roots=None,
+        env=None,
+        allowlisted_extra_roots=None,
+        workspace_root=None,
+        headless=False,
+    ):
         self.env = os.environ if env is None else env
+        # The explicit --headless flag (PR-3 D4): together with the env markers it is the one
+        # predicate for the extra-roots seam, the workspace file, resolve and the ownership
+        # check; a per-call ``headless`` argument can add to it, never switch it back.
+        self.headless = bool(headless)
         self.root = Path(root) if root is not None else DEFAULT_ROOT
+        # Directory whose rfe-creator.yaml may carry a bindings: block; None (the default)
+        # reads no file at all — the cwd is never probed implicitly.
+        self.workspace_root = Path(workspace_root).expanduser() if workspace_root else None
         # RFE_CREATOR_EXTRA_TYPES entries dropped by the headless/CI gate (design §3.5).
         self.ignored_extra_roots = []
         if extra_roots is None:
@@ -390,10 +709,12 @@ class TypeRegistry:
 
     def _extra_roots_from_env(self, allowlisted):
         """The env seam (PR1-05): every RFE_CREATOR_EXTRA_TYPES entry in a normal run; in a
-        headless/CI run only the entries whose canonical path is allowlisted — by the
-        ``allowlisted_extra_roots`` argument or RFE_CREATOR_EXTRA_TYPES_ALLOWLIST."""
+        headless/CI run — ``is_headless(self.env, self.headless)``, so an explicit
+        ``--headless`` gates the seam exactly like a marker — only the entries whose canonical
+        path is allowlisted, by the ``allowlisted_extra_roots`` argument or
+        RFE_CREATOR_EXTRA_TYPES_ALLOWLIST."""
         roots = parse_extra_roots(self.env.get(EXTRA_ROOTS_ENV, ""))
-        if not roots or not is_headless(self.env):
+        if not roots or not is_headless(self.env, self.headless):
             return roots
         allowed = {_canonical(p) for p in (allowlisted or [])}
         allowed.update(
@@ -465,16 +786,53 @@ class TypeRegistry:
     def __contains__(self, name):
         return name in self._types
 
-    def bindings(self, env=None):
-        """Effective binding per type (design §3.2.1), keyed by type name in ``names()`` order."""
-        return {name: self._types[name].binding(env) for name in self.names()}
+    # -- effective bindings (design §3.2.1) -------------------------------------------------
+
+    def bindings(self, env=None, workspace=None):
+        """Effective binding per type (design §3.2.1), keyed by type name in ``names()`` order.
+        ``workspace`` is the mapping ``workspace_bindings()`` returns (or ``None``)."""
+        return {name: self._types[name].binding(env, workspace=workspace) for name in self.names()}
+
+    def workspace_bindings(self, headless=None):
+        """The workspace ``bindings:`` mapping this run may honour (design §3.2.1 g).
+
+        Reads ``<workspace_root>/rfe-creator.yaml`` (nothing when the registry was built
+        without ``workspace_root``). In an interactive run the mapping is returned as read. In
+        a headless/CI run — ``is_headless(self.env, headless)``, or a registry built with
+        ``headless=True`` — the file is never honoured:
+        the result is ``{}`` and, when the file exists and carries a non-empty ``bindings``
+        block, exactly one stderr line says it was ignored. A malformed file raises in both
+        modes.
+        """
+        if self.workspace_root is None:
+            return {}
+        mapping = load_workspace_bindings(self.workspace_root)
+        # A block keyed by an unregistered name is a typo, not a no-op: it fails like a typo in
+        # a field name does, in both modes (the file is malformed for this registry).
+        unknown = [name for name in mapping if name not in self._types]
+        if unknown:
+            raise RegistryError(
+                f"{self.workspace_root / WORKSPACE_FILENAME}: {WORKSPACE_BINDINGS_KEY}."
+                f"{unknown[0]}: unknown type; registered types: "
+                f"{', '.join(self.names()) or '(none)'}"
+            )
+        if not is_headless(self.env, self.headless or bool(headless)):
+            return mapping
+        if mapping:
+            print(
+                f"type_registry: headless/CI run — ignoring the workspace bindings file "
+                f"{self.workspace_root / WORKSPACE_FILENAME} ({WORKSPACE_BINDINGS_KEY}: is "
+                f"honoured only in an interactive run; use {BINDING_ENV_PREFIX}* variables)",
+                file=sys.stderr,
+            )
+        return {}
 
     # -- detection --------------------------------------------------------------------------
 
     def detect(self, item_id):
         """Return the ``Descriptor`` that owns ``item_id``, or ``None`` when no type does.
 
-        PR-2 seed of the design §5 ladder — rung 3's deterministic id signal, single candidate
+        The design §5 rung-3 deterministic id signal for the per-id routers, single candidate
         by construction. Three prefix rungs, each tried across every type in ``names()`` order
         before the next (so the most specific signal always wins, whatever the type order):
 
@@ -482,16 +840,16 @@ class TypeRegistry:
         2. ``item_id`` starts with one of the tracker's ``identity.<tracker>.key_prefixes``
            (``RHAIRFE-1``, ``RHOAIENG-1`` — the Jira key grammar, design §3.6);
         3. ``item_id`` starts with ``identity.local_prefix`` — the parity rung: the sniffs this
-           replaces tested ``startswith(local_prefix) or startswith(key_prefix)``, so a
+           replaced tested ``startswith(local_prefix) or startswith(key_prefix)``, so a
            malformed local id (``INIT-x``) stays with the type it went to before PR-2. Ranked
-           last so a tracker key always beats a local prefix, and kept separate so PR-3 can
-           drop it for types whose ``local_prefix`` is only a placeholder (the epic fixture).
+           last so a tracker key always beats a local prefix, and kept separate so a later PR
+           can drop it for types whose ``local_prefix`` is only a placeholder (the epic
+           fixture; D6 deferred).
 
         Anything else — a peer pipeline's key (``RHAISTRAT-1``), lower-case, empty, ``None`` —
         returns ``None``; callers keep their own default (today: ``detect(x) or get("rfe")``).
-        Uses DESCRIPTOR values only; the §3.2.1 binding overlay, multi-candidate resolution
-        (shared prefixes → candidate set, tie-broken on the binding's ``issue_type``) and the
-        post-fetch ``(project, issue_type)`` check are PR-3 (``resolve``).
+        Uses DESCRIPTOR values only. The multi-candidate form over EFFECTIVE bindings, with the
+        provisional tracker-grammar rung, is ``candidates()``; ``resolve`` builds on that.
         """
         if not isinstance(item_id, str) or not item_id:
             return None
@@ -504,6 +862,34 @@ class TypeRegistry:
                 if rung(desc, item_id):
                     return desc
         return None
+
+    def candidates(self, item_id, env=None, workspace=None):
+        """Return the ``Candidates`` for ``item_id`` over EFFECTIVE bindings (design §5, D5).
+
+        Each type's binding is computed once (``env`` / ``workspace`` as for ``bindings()``),
+        then the rungs run in order and the first with at least one match wins, returning
+        EVERY type matching at that rung in ``names()`` order:
+
+        1. ``local_id_pattern`` — the effective pattern (re-rendered for an overridden local
+           prefix, D13) or the descriptor's own pattern, kept as a read form, full-matches;
+        2. ``key_prefix`` — a prefix match on any effective ``key_prefixes`` entry (the
+           overridden write prefix first, the descriptor prefixes kept as read prefixes);
+        3. ``local_prefix`` — a prefix match on the effective or the descriptor local prefix
+           (parity rung);
+        4. ``tracker_grammar`` — the Jira adapter's generic key grammar
+           ``^[A-Z][A-Z0-9]+-[0-9]+$``: every Jira-bound type is a PROVISIONAL candidate
+           (``provisional=True``), to be discriminated post-fetch on ``(project, issue_type)``.
+
+        ``None``, the empty string and non-strings yield no matches (``rung None``).
+        """
+        if not isinstance(item_id, str) or not item_id:
+            return Candidates([], None, False)
+        bindings = self.bindings(env, workspace)
+        for rung in CANDIDATE_RUNGS:
+            matches = [d for d in self if _rung_matches(rung, d, bindings[d.name], item_id)]
+            if matches:
+                return Candidates(matches, rung, rung == PROVISIONAL_RUNG)
+        return Candidates([], None, False)
 
 
 def _read_descriptor(path, expected_name):
@@ -524,14 +910,419 @@ def _read_descriptor(path, expected_name):
     return data
 
 
-def load(root=None, extra_roots=None, env=None, allowlisted_extra_roots=None):
-    """Load a fresh registry (never cached — callers that want one instance keep it)."""
+def load(
+    root=None,
+    extra_roots=None,
+    env=None,
+    allowlisted_extra_roots=None,
+    workspace_root=None,
+    headless=False,
+):
+    """Load a fresh registry (never cached — callers that want one instance keep it).
+
+    ``headless=True`` is the explicit ``--headless`` flag (PR-3 D4): the registry then gates
+    ``RFE_CREATOR_EXTRA_TYPES``, ignores the workspace file and treats ``resolve`` as headless
+    even when no ``RFE_CREATOR_HEADLESS`` / ``CI`` / ``GITHUB_ACTIONS`` marker is set.
+    """
     return TypeRegistry(
         root=root,
         extra_roots=extra_roots,
         env=env,
         allowlisted_extra_roots=allowlisted_extra_roots,
+        workspace_root=workspace_root,
+        headless=headless,
     )
+
+
+# -- ownership check (design §3.2.1 g, §3.3 rule 1 at runtime) ------------------------------
+
+
+def assert_registered_binding(
+    desc, env=None, registry=None, workspace=None, headless=None, shorthand=False
+):
+    """Prove that ``desc``'s effective binding may be written to (design §3.2.1 g).
+
+    Computes the effective binding (``env`` defaults to the descriptor's registry environment,
+    ``shorthand`` as for ``binding()`` — pass it for the resolved type) and raises
+    ``RegistryError`` when (i) the run is headless (``is_headless(env, headless)``, or the
+    ``registry`` was built with ``headless=True``) and any
+    override came from the workspace file, or (ii) the effective identity — for Jira the
+    ``(tracker, project, issue_type)`` triple — equals the effective identity of ANY OTHER
+    registered type (ownership, not membership: an rfe override that selects the initiative
+    pair is rejected even though the pair is registered). ``registry`` defaults to a fresh
+    ``load()`` with the same ``env``. Returns the effective binding on success. The write
+    scripts call this after ``resolve`` and before the first tracker write (PR-3c).
+    """
+    if env is None:
+        env = desc._env if desc._env is not None else os.environ
+    if registry is None:
+        registry = load(env=env)
+    binding = desc.binding(env, workspace=workspace, shorthand=shorthand)
+    headless_run = is_headless(env, bool(headless) or registry.headless)
+    if headless_run and "workspace" in binding["source"].split("+"):
+        raise RegistryError(
+            f"{desc.name}: binding override(s) {', '.join(binding['overrides'])} come from the "
+            f"workspace file ({WORKSPACE_FILENAME}), which is not trusted in a headless/CI run; "
+            f"set {BINDING_ENV_PREFIX}* variables instead (design §3.2.1 g)"
+        )
+    own = _binding_identity(binding)
+    for other in registry:
+        if other.name == desc.name:
+            continue
+        if _binding_identity(other.binding(env, workspace=workspace)) == own:
+            raise RegistryError(
+                f"{desc.name}: effective binding {own} (source: {binding['source']}) is the "
+                f"binding registered for type {other.name!r}; a tracker binding must be owned by "
+                f"exactly one type (design §3.3 rule 1) — fix the override or pass --type "
+                f"{other.name}"
+            )
+    return binding
+
+
+# -- resolve (design §5) --------------------------------------------------------------------
+
+
+@dataclass
+class Resolution:
+    """Outcome of ``resolve``: the type (``type_name`` ``None`` when ambiguous), its
+    descriptor, the deciding rung, whether the decision is provisional (tracker-grammar
+    candidates only), the effective binding (shorthand included) and, when ambiguous, the
+    candidate type names."""
+
+    type_name: "str | None"
+    desc: "Descriptor | None"
+    rung: "str | None"
+    provisional: bool = False
+    binding: "dict | None" = None
+    candidates: list = field(default_factory=list)
+
+    @property
+    def ambiguous(self):
+        return self.type_name is None
+
+    def line(self):
+        """``TYPE RESOLVED: <type> (<rung>[; binding override <field>=<value> ...])`` — the
+        override fields in ``project, issue_type, local_prefix`` order (design §3.2.1 c) — or
+        ``TYPE AMBIGUOUS: <a>, <b> - pass --type`` when no type was decided."""
+        if self.type_name is None:
+            return f"TYPE AMBIGUOUS: {', '.join(self.candidates)} - pass --type"
+        detail = self.rung
+        overrides = (self.binding or {}).get("overrides") or []
+        if overrides:
+            rendered = " ".join(
+                f"{name}={self.binding[name]}" for name in BINDING_FIELD_ORDER if name in overrides
+            )
+            detail = f"{detail}; binding override {rendered}"
+        return f"TYPE RESOLVED: {self.type_name} ({detail})"
+
+    def as_dict(self):
+        return {
+            "type": self.type_name,
+            "rung": self.rung,
+            "provisional": self.provisional,
+            "binding": self.binding,
+            "candidates": list(self.candidates),
+            "line": self.line(),
+        }
+
+
+def resolve(
+    registry,
+    *,
+    explicit_type=None,
+    batch=None,
+    artifact=None,
+    ids=(),
+    env=None,
+    headless=None,
+    workspace=None,
+):
+    """Run the design §5 resolution ladder and return a ``Resolution``.
+
+    Rungs, strongest first:
+
+    1. ``--type`` — ``explicit_type``; an unregistered name is a ``ResolveError`` listing the
+       registered types.
+    2. ``batch type`` — ``batch`` is a YAML path. A mapping root with ``type`` and ``items``
+       is the mapping form and its ``type`` is the signal (a disagreeing ``explicit_type`` is
+       an error, D1). A bare list root is the legacy form: no rung-2 signal, its string items
+       join ``ids``. Any item — in either form — that is a mapping carrying a ``type`` key is
+       an error (D2: per-item types are rejected). Any other root shape is an error.
+    3. deterministic signals — ``artifact`` (a markdown path): a string frontmatter ``type``
+       is ``frontmatter type``; else its parent directory name against every type's ``dirs``
+       is ``artifact dir`` AND its stem joins ``ids`` (so a stem owned by another type is a
+       conflict, not a silent directory win). Every id goes through ``candidates()``; a
+       non-provisional match is ``id grammar``. One type across the deterministic signals
+       resolves it at the strongest rung that produced it; two or more is a ``conflicting
+       type signals`` error (never a question). With an explicit or batch type, rung-3
+       signals are evaluated only to detect a deterministic signal for a DIFFERENT type
+       (error). Provisional-only candidates resolve with ``provisional=True`` when they
+       single out one type. An id no type owns is no signal in an interactive run; in a
+       headless run with neither an explicit nor a batch type it is an error (D5: headless
+       never guesses) — an artifact stem is never held to that rule.
+    4. (interactive classification / picker — not implemented; the ambiguous result is its
+       hook): several candidates and nothing deterministic -> headless
+       (``is_headless(env, headless)``, ``env`` defaulting to the registry's and a registry
+       built with ``headless=True`` counting as headless) raises
+       ``ResolveError`` with ``exit_code`` 3 naming the candidates; interactive returns a
+       ``Resolution`` with ``type_name None`` and ``candidates`` filled.
+    5. ``legacy default`` — no signal at all -> ``rfe`` when registered, else an error.
+
+    The binding on the result is ``desc.binding(env, workspace, shorthand=True)`` — the bare
+    ``JIRA_PROJECT`` / ``JIRA_ISSUE_TYPE`` shorthand applies to the resolved type only.
+    ``workspace`` is the mapping ``TypeRegistry.workspace_bindings`` returned; a headless run
+    whose resolved binding was overridden from the workspace is refused (§3.2.1 g).
+    """
+    if env is None:
+        env = registry.env
+    headless_run = is_headless(env, bool(headless) or registry.headless)
+    registered = registry.names()
+    registered_text = ", ".join(registered) or "(none)"
+
+    def known(name, where):
+        if name not in registry:
+            raise ResolveError(
+                f"unknown type {name!r} ({where}); registered types: {registered_text}"
+            )
+
+    def resolved(name, rung, provisional):
+        desc = registry.get(name)
+        binding = desc.binding(env, workspace=workspace, shorthand=True)
+        if headless_run and "workspace" in binding["source"].split("+"):
+            raise ResolveError(
+                f"{name}: binding override(s) {', '.join(binding['overrides'])} come from the "
+                f"workspace file ({WORKSPACE_FILENAME}), which is not trusted in a headless/CI "
+                f"run; set {BINDING_ENV_PREFIX}* variables instead (design §3.2.1 g)"
+            )
+        return Resolution(name, desc, rung, provisional, binding, [])
+
+    # rung 1
+    if explicit_type is not None:
+        known(explicit_type, "--type")
+
+    # rung 2 — (item_id, strict): strict ids are the caller's and the batch's; a derived
+    # artifact stem is not (D5 applies to strict ids only).
+    id_list = [(i, True) for i in ids if isinstance(i, str) and i]
+    batch_type = None
+    if batch is not None:
+        batch_type, batch_ids = _batch_signal(batch)
+        if batch_type is not None:
+            known(batch_type, f"{batch} type:")
+            if explicit_type is not None and explicit_type != batch_type:
+                raise ResolveError(
+                    f"--type {explicit_type} disagrees with {batch} type: {batch_type}; both are "
+                    f"explicit, so neither is guessed — pass one or make them agree (PR-3 D1)"
+                )
+        id_list.extend((i, True) for i in batch_ids)
+    chosen = explicit_type if explicit_type is not None else batch_type
+
+    # rung 3 signals: (rung, label, candidate type names)
+    deterministic = []
+    provisional = []
+    if artifact is not None:
+        fm_type, dir_name, stem = _artifact_signal(artifact)
+        if fm_type is not None:
+            known(fm_type, f"{artifact} frontmatter type:")
+            deterministic.append(("frontmatter type", f"{artifact} (type: {fm_type})", [fm_type]))
+        else:
+            owners = [d.name for d in registry if dir_name and dir_name in _artifact_dirs(d)]
+            if owners:
+                deterministic.append(("artifact dir", f"{artifact} (dir {dir_name})", owners))
+            id_list.append((stem, False))
+    for item_id, strict in id_list:
+        found = registry.candidates(item_id, env, workspace)
+        if not found.matches:
+            if strict and headless_run and chosen is None:
+                raise ResolveError(
+                    f"no registered type owns id {item_id!r} (registered types: "
+                    f"{registered_text}); a headless run never guesses — fix the id or pass "
+                    f"--type (PR-3 D5)"
+                )
+            continue
+        if found.provisional:
+            provisional.append((item_id, found.names))
+        else:
+            deterministic.append(("id grammar", item_id, found.names))
+
+    if chosen is not None:
+        conflicts = [(label, names) for _, label, names in deterministic if chosen not in names]
+        if conflicts:
+            origin = "--type" if explicit_type is not None else "batch type"
+            raise ResolveError(
+                f"conflicting type signals: {origin} {chosen} vs {_render_pairs(conflicts)}; a "
+                f"run is single-typed — split the input by type"
+            )
+        return resolved(chosen, "--type" if explicit_type is not None else "batch type", False)
+
+    if deterministic:
+        common = set(deterministic[0][2])
+        for _, _, names in deterministic[1:]:
+            common &= set(names)
+        if not common:
+            pairs = [(label, names) for _, label, names in deterministic]
+            raise ResolveError(
+                f"conflicting type signals: {_render_pairs(pairs)}; a run is single-typed — "
+                f"split the input by type or pass --type"
+            )
+        if len(common) == 1:
+            (name,) = common
+            rung = min(
+                (r for r, _, names in deterministic if name in names), key=RESOLVE_RUNGS.index
+            )
+            return resolved(name, rung, False)
+        ambiguous = [n for n in registered if n in common]
+        labels = [label for _, label, _ in deterministic]
+        only_provisional = False
+    elif provisional:
+        union = {n for _, names in provisional for n in names}
+        if len(union) == 1:
+            (name,) = union
+            return resolved(name, "id grammar", True)
+        ambiguous = [n for n in registered if n in union]
+        labels = [label for label, _ in provisional]
+        only_provisional = True
+    else:
+        if LEGACY_DEFAULT_TYPE in registry:
+            return resolved(LEGACY_DEFAULT_TYPE, "legacy default", False)
+        raise ResolveError(
+            f"no type signal and the legacy default type {LEGACY_DEFAULT_TYPE!r} is not "
+            f"registered; pass --type (registered types: {registered_text})"
+        )
+
+    if headless_run:
+        raise ResolveError(
+            f"ambiguous type for {', '.join(labels)}: candidates {', '.join(ambiguous)} — pass "
+            f"--type",
+            exit_code=EXIT_AMBIGUOUS,
+        )
+    return Resolution(None, None, None, only_provisional, None, ambiguous)
+
+
+def _render_pairs(pairs):
+    return ", ".join(f"{label} -> {'/'.join(names)}" for label, names in pairs)
+
+
+def _load_yaml(path, what):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return yaml.safe_load(fh)
+    except yaml.YAMLError as exc:
+        raise ResolveError(f"{path}: invalid YAML in {what}: {exc}") from exc
+    except OSError as exc:
+        raise ResolveError(f"{path}: cannot read {what}: {exc}") from exc
+
+
+def _batch_signal(path):
+    """``(type or None, string item ids)`` for a batch file (design §5 rung 2, D1/D2)."""
+    data = _load_yaml(path, "batch file")
+    if isinstance(data, dict) and "type" in data and "items" in data:
+        batch_type = data["type"]
+        if not isinstance(batch_type, str) or not batch_type.strip():
+            raise ResolveError(f"{path}: 'type' must be a non-empty string, got {batch_type!r}")
+        items = data["items"]
+        if not isinstance(items, list):
+            raise ResolveError(f"{path}: 'items' must be a list, got {_shape(items)}")
+        return batch_type.strip(), _batch_item_ids(path, items)
+    if isinstance(data, list):
+        return None, _batch_item_ids(path, data)
+    raise ResolveError(
+        f"{path}: expected a list of items (legacy form) or a mapping with 'type' and 'items' "
+        f"(mapping form), got {_shape(data)}"
+    )
+
+
+def _batch_item_ids(path, items):
+    ids = []
+    for index, item in enumerate(items):
+        if isinstance(item, dict) and "type" in item:
+            raise ResolveError(
+                f"{path}: item {index} carries a per-item 'type' key ({item['type']!r}); a batch "
+                f"is single-typed (design §5, D2) — split the batch by type and declare the type "
+                f"once (--type or the mapping form's type:)"
+            )
+        if isinstance(item, str) and item.strip():
+            ids.append(item.strip())
+    return ids
+
+
+def _artifact_signal(path):
+    """``(frontmatter type or None, parent dir name, file stem)`` for an artifact path."""
+    file = Path(path)
+    if not file.is_file():
+        raise ResolveError(f"{path}: artifact file not found")
+    try:
+        text = file.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ResolveError(f"{path}: cannot read artifact: {exc}") from exc
+    front = _parse_frontmatter(text, path)
+    fm_type = front.get("type")
+    if fm_type is not None:
+        if not isinstance(fm_type, str) or not fm_type.strip():
+            raise ResolveError(
+                f"{path}: frontmatter 'type' must be a non-empty string, got {fm_type!r}"
+            )
+        fm_type = fm_type.strip()
+    return fm_type, file.parent.name, file.stem
+
+
+def _parse_frontmatter(text, path):
+    """The YAML mapping between the first two ``---`` lines (the first must be line 1), or
+    ``{}`` when there is none. Deliberately local: this module imports no repo helper."""
+    lines = text.splitlines()
+    if not lines or lines[0].rstrip() != "---":
+        return {}
+    for index in range(1, len(lines)):
+        if lines[index].rstrip() == "---":
+            try:
+                data = yaml.safe_load("\n".join(lines[1:index]))
+            except yaml.YAMLError as exc:
+                raise ResolveError(f"{path}: invalid frontmatter YAML: {exc}") from exc
+            return data if isinstance(data, dict) else {}
+    return {}
+
+
+def _artifact_dirs(desc):
+    try:
+        dirs = desc.dirs("bare")
+    except KeyError:
+        return []
+    return [value for value in dirs.values() if isinstance(value, str)]
+
+
+# -- the shared --type hand-parser (design §5 rung 1) ---------------------------------------
+
+
+def parse_type_arg(registry, argv, default=LEGACY_DEFAULT_TYPE, flag="--type"):
+    """Pop ``<flag> <name>`` out of ``argv`` and validate the name against ``registry``.
+
+    The one hand-parser behind the pipeline gates that take ``--type`` without argparse
+    (``check_revised.py``, ``check_right_sized.py``, ``check_autofix_complete.py``), so their
+    error text cannot drift. Returns ``(type_name, remaining_argv)``: only the first ``flag``
+    occurrence is consumed, wherever it sits in ``argv`` (``argv`` itself is not mutated), and
+    ``default`` (``rfe``, design §5 rung 5) is the type when the flag is absent. Raises
+    ``ResolveError`` with ``exit_code`` 2 — the usage-error code; the message is ready for an
+    ``ERROR:`` prefix and ends with the registered type list — when the flag is the last
+    token, when the name is not registered, or when the flag is absent and ``default`` is
+    not registered.
+    """
+    argv = list(argv)
+    registered = ", ".join(registry.names()) or "(none)"
+    if flag in argv:
+        idx = argv.index(flag)
+        if idx + 1 >= len(argv):
+            raise ResolveError(f"{flag} requires a value; registered types: {registered}", 2)
+        name = argv[idx + 1]
+        del argv[idx : idx + 2]
+        if name not in registry:
+            raise ResolveError(f"unknown {flag} {name!r}; registered types: {registered}", 2)
+        return name, argv
+    if default not in registry:
+        raise ResolveError(
+            f"no {flag} given and the default type {default!r} is not registered; registered "
+            f"types: {registered}",
+            2,
+        )
+    return default, argv
 
 
 # -- CLI -----------------------------------------------------------------------------------
@@ -573,8 +1364,64 @@ def _cmd_get(reg, args):
 
 def _cmd_binding(reg, args):
     desc = reg.get(args.type)
-    _emit(desc.binding(), args.json)
+    _emit(_binding_view(desc, desc.binding()), args.json)
     return 0
+
+
+def _binding_view(desc, binding):
+    """The ``binding`` CLI view of an effective binding.
+
+    ``overrides`` is dropped when empty and ``local_id_pattern`` when it is the descriptor's
+    own, so with nothing overridden the printed binding is the PR-1 output byte for byte —
+    the diagnostic CLI is held to the same no-visible-change bar as the entry scripts. Both
+    keys appear as soon as they carry information (an override is listed; a re-rendered D13
+    pattern is shown). ``binding()`` itself always carries both; ``resolve --json`` prints the
+    full dict.
+    """
+    view = dict(binding)
+    if not view.get("overrides"):
+        view.pop("overrides", None)
+    if view.get("local_id_pattern") == desc.get("identity.local_id_pattern", None):
+        view.pop("local_id_pattern", None)
+    return view
+
+
+def _cmd_candidates(reg, args):
+    found = reg.candidates(args.id)
+    if args.json:
+        _emit(
+            {
+                "id": args.id,
+                "rung": found.rung,
+                "provisional": found.provisional,
+                "types": found.names,
+            },
+            True,
+        )
+        return 0
+    rung = found.rung or "none"
+    if found.provisional:
+        rung += " (provisional)"
+    print(f"{rung}: {' '.join(found.names) or '-'}")
+    return 0
+
+
+def _cmd_resolve(reg, args):
+    workspace = reg.workspace_bindings(headless=args.headless)
+    result = resolve(
+        reg,
+        explicit_type=args.type,
+        batch=args.batch,
+        artifact=args.artifact,
+        ids=args.ids,
+        headless=args.headless,
+        workspace=workspace,
+    )
+    if args.json:
+        _emit(result.as_dict(), True)
+    else:
+        print(result.line())
+    return EXIT_AMBIGUOUS if result.ambiguous else 0
 
 
 def _add_options(parser, suppress):
@@ -621,6 +1468,46 @@ def _build_parser():
     )
     p_binding.add_argument("type")
     p_binding.set_defaults(func=_cmd_binding)
+
+    p_candidates = sub.add_parser(
+        "candidates",
+        parents=[common],
+        help="print the detection rung and the candidate types of one id",
+    )
+    p_candidates.add_argument("id", metavar="ID")
+    p_candidates.set_defaults(func=_cmd_candidates)
+
+    p_resolve = sub.add_parser(
+        "resolve",
+        parents=[common],
+        help="resolve the work-item type of a run (design §5) and print the TYPE RESOLVED line",
+    )
+    p_resolve.add_argument("--type", default=None, help="explicit type (rung 1)")
+    p_resolve.add_argument(
+        "--batch",
+        default=None,
+        metavar="FILE",
+        help="batch YAML file (rung 2: the mapping form's type:; list items join the ids)",
+    )
+    p_resolve.add_argument(
+        "--artifact",
+        default=None,
+        metavar="PATH",
+        help="artifact markdown file (rung 3: frontmatter type:, else its directory, else stem)",
+    )
+    p_resolve.add_argument(
+        "--headless",
+        action="store_true",
+        help=f"treat the run as headless (also implied by {'/'.join(HEADLESS_MARKER_VARS)})",
+    )
+    p_resolve.add_argument(
+        "--workspace-root",
+        default=None,
+        metavar="DIR",
+        help=f"directory holding {WORKSPACE_FILENAME} (default: none; the cwd is never probed)",
+    )
+    p_resolve.add_argument("ids", nargs="*", metavar="ID", help="item ids (rung 3: id grammar)")
+    p_resolve.set_defaults(func=_cmd_resolve)
     return parser
 
 
@@ -629,8 +1516,18 @@ def main(argv=None):
     args = parser.parse_args(argv)
     extra_roots = parse_extra_roots(args.extra_roots) if args.extra_roots is not None else None
     try:
-        reg = load(root=args.root, extra_roots=extra_roots)
+        reg = load(
+            root=args.root,
+            extra_roots=extra_roots,
+            workspace_root=getattr(args, "workspace_root", None),
+            # resolve's --headless gates the env seam too (PR-3 D4); the other subcommands
+            # have no such flag and rely on the env markers alone.
+            headless=getattr(args, "headless", False),
+        )
         return args.func(reg, args)
+    except ResolveError as exc:
+        print(f"ERROR: {exc.args[0]}", file=sys.stderr)
+        return exc.exit_code
     except (RegistryError, KeyError) as exc:
         message = exc.args[0] if exc.args else str(exc)
         print(f"ERROR: {message}", file=sys.stderr)

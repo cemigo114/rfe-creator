@@ -919,6 +919,147 @@ class TestCrossTypeGate:
         assert cross and all(f.types for f in cross)
         assert all(f.gate == 1 for f in report.findings)
 
+    def test_binding_error_surfaces_as_a_finding_not_a_traceback(self, types_copy, monkeypatch):
+        """The D13 hard error (an overridden local prefix whose descriptor pattern does not
+        start with the descriptor prefix) is raised by Descriptor.binding(); the lint reports
+        it under the type and the remaining checks still run on the descriptor values."""
+        original = type_registry.Descriptor.binding
+
+        def failing(self, env=None):
+            if self.name == "rfe":
+                raise type_registry.RegistryError(
+                    "RFE_CREATOR_BINDING_RFE_LOCAL_PREFIX='REQ-': identity.local_id_pattern "
+                    "'^X-\\d+$' does not start with the descriptor prefix 'RFE-'"
+                )
+            return original(self, env)
+
+        monkeypatch.setattr(type_registry.Descriptor, "binding", failing)
+        report = _validate(types_copy, env={"RFE_CREATOR_BINDING_RFE_LOCAL_PREFIX": "REQ-"})
+        hits = _assert_finding(report, "effective binding cannot be computed:", "rfe")
+        assert "RFE_CREATOR_BINDING_RFE_LOCAL_PREFIX='REQ-'" in hits[0].message
+        assert hits[0].types == frozenset({"rfe"})
+        assert not _find(report, "local id collision:")
+        assert len(report.findings) == 1
+
+
+class TestLocalIdCollisionGate:
+    """Rule (6), PR-3 D13: the ids type a mints under its EFFECTIVE local prefix must not
+    full-match any other type's EFFECTIVE local_id_pattern — detect() tries every type's
+    pattern before any prefix rung, so such an id would be routed to the other type."""
+
+    STEM = "local id collision:"
+
+    def test_shipped_pair_passes(self):
+        report = validate_all(root=TYPES_ROOT, extra_roots=[], env={})
+        assert report.ok
+        assert not _find(report, self.STEM)
+
+    def test_shipped_pair_passes_with_rfe_moved_to_req(self, types_copy):
+        env = {"RFE_CREATOR_BINDING_RFE_LOCAL_PREFIX": "REQ-"}
+        assert _validate(types_copy).ok
+        assert _validate(types_copy, env=env).ok
+
+    def test_pattern_admitting_another_types_ids_is_a_finding(self, types_copy):
+        _mutate(
+            types_copy,
+            "initiative",
+            lambda d: d["identity"].__setitem__("local_id_pattern", r"^[A-Z]+-\d+$"),
+        )
+        report = _validate(types_copy)
+        hits = _assert_finding(report, self.STEM, "*")
+        assert len(hits) == 1
+        message = hits[0].message
+        assert "identity.local_prefix 'RFE-' of type 'rfe'" in message
+        assert "'RFE-1'" in message
+        assert "identity.local_id_pattern '^[A-Z]+-\\\\d+$' of type 'initiative'" in message
+        assert "route type rfe's local ids to type initiative" in message
+        assert hits[0].types == frozenset({"rfe", "initiative"})
+        assert report.lines() == [f"ERROR *: {message}"]
+
+    def test_every_ordered_pair_is_checked(self, types_copy):
+        _mutate(
+            types_copy,
+            "rfe",
+            lambda d: d["identity"].__setitem__("local_id_pattern", r"^(RFE|INIT)-\d+$"),
+        )
+        hits = _assert_finding(_validate(types_copy), self.STEM, "*")
+        assert len(hits) == 1
+        assert "identity.local_prefix 'INIT-' of type 'initiative'" in hits[0].message
+        assert "of type 'rfe'" in hits[0].message
+
+    def test_collision_via_local_prefix_override_is_effective(self, types_copy):
+        """An overridden prefix that mints ids inside another type's grammar collides
+        (alongside rule (2)'s duplicate-prefix finding for this particular value)."""
+        env = {"RFE_CREATOR_BINDING_INITIATIVE_LOCAL_PREFIX": "RFE-"}
+        report = _validate(types_copy, env=env)
+        hits = _find(report, self.STEM, "*")
+        assert any(
+            "identity.local_prefix 'RFE-' of type 'initiative'" in h.message
+            and "'RFE-1'" in h.message
+            and "of type 'rfe'" in h.message
+            for h in hits
+        ), report.lines()
+        assert _validate(types_copy).ok
+
+    def test_effective_local_id_pattern_is_read_from_the_binding(self, types_copy, monkeypatch):
+        """D13 registry side: when binding() carries a re-rendered local_id_pattern the lint
+        reads it (descriptor pattern only as the fallback for a registry without the key)."""
+        original = type_registry.Descriptor.binding
+
+        def widened(self, env=None):
+            binding = original(self, env)
+            if self.name == "initiative":
+                binding["local_id_pattern"] = r"^(RFE|INIT)-\d+$"
+            return binding
+
+        monkeypatch.setattr(type_registry.Descriptor, "binding", widened)
+        hits = _assert_finding(_validate(types_copy), self.STEM, "*")
+        assert len(hits) == 1
+        assert "identity.local_id_pattern '^(RFE|INIT)-\\\\d+$' of type 'initiative'" in (
+            hits[0].message
+        )
+
+    def test_duplicate_effective_patterns_are_rule_2_findings(self, types_copy, monkeypatch):
+        original = type_registry.Descriptor.binding
+
+        def same(self, env=None):
+            binding = original(self, env)
+            binding["local_id_pattern"] = r"^(RFE|INIT)-\d+$"
+            return binding
+
+        monkeypatch.setattr(type_registry.Descriptor, "binding", same)
+        _assert_finding(
+            _validate(types_copy),
+            "duplicate identity.local_id_pattern '^(RFE|INIT)-\\\\d+$' shared by types: "
+            "initiative, rfe",
+            "*",
+        )
+
+    def test_uncompilable_pattern_is_the_per_type_finding_only(self, types_copy):
+        _mutate(
+            types_copy,
+            "initiative",
+            lambda d: d["identity"].__setitem__("local_id_pattern", r"^[A-Z]+-(\d+$"),
+        )
+        report = _validate(types_copy)
+        assert not _find(report, self.STEM)
+        _assert_finding(report, "is not a valid regex", "initiative")
+
+    def test_missing_or_empty_local_prefix_is_skipped(self, types_copy):
+        _mutate(types_copy, "initiative", lambda d: d["identity"].__setitem__("local_prefix", ""))
+        report = _validate(types_copy)
+        assert not _find(report, self.STEM)
+
+    def test_cli_reports_the_collision(self, types_copy):
+        _mutate(
+            types_copy,
+            "initiative",
+            lambda d: d["identity"].__setitem__("local_id_pattern", r"^[A-Z]+-\d+$"),
+        )
+        result = _cli("--root", str(types_copy))
+        assert result.returncode == 1
+        assert "ERROR *: local id collision:" in result.stdout
+
 
 # ── gate 2: --with-deps ──────────────────────────────────────────────────────────
 

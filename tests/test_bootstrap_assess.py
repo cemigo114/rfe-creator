@@ -9,6 +9,7 @@ later as wait-for-wave returning exit 3 forever with nothing to diagnose.
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -105,12 +106,119 @@ class TestTypeValidation:
         assert rc == 1, stderr
         assert "assess-initiative" in stderr
 
-    def test_unknown_type_rejected(self, fake_checkout):
+    def test_unknown_type_rejected_with_the_registered_list(self, fake_checkout):
+        """The names come from `type_registry.py list` (design §5 rung 1): the paper epic
+        descriptor is not registered, so it is refused with the list that is."""
         _add_rfe_assets(fake_checkout)
 
         _, stderr, rc = _run("--type", "epic")
         assert rc == 2
-        assert "expected rfe or initiative" in stderr
+        assert stderr == "ERROR: unknown --type 'epic' (registered types: rfe, initiative)\n"
+
+    def test_unknown_type_rejected_before_skip_bootstrap(self, fake_checkout):
+        """Validation stays ahead of the RFE_SKIP_BOOTSTRAP short-circuit."""
+        env = {**os.environ, "RFE_SKIP_BOOTSTRAP": "1"}
+        result = subprocess.run(
+            ["bash", SCRIPT, "--type", "bogus"], capture_output=True, text=True, env=env
+        )
+        assert result.returncode == 2
+        assert "registered types: rfe, initiative" in result.stderr
+        assert result.stdout == ""
+
+    def test_drop_in_type_is_accepted(self, fake_checkout, drop_in_root):
+        """A type the registry enumerates (here through the RFE_CREATOR_EXTRA_TYPES seam,
+        allowlisted so a CI run honours it too) passes without editing the script."""
+        root = drop_in_root.memo()
+        env = {
+            **os.environ,
+            "RFE_CREATOR_EXTRA_TYPES": root,
+            "RFE_CREATOR_EXTRA_TYPES_ALLOWLIST": root,
+            "RFE_SKIP_BOOTSTRAP": "1",
+        }
+        result = subprocess.run(
+            ["bash", SCRIPT, "--type", "memo"], capture_output=True, text=True, env=env
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "RFE_SKIP_BOOTSTRAP set - skipping dependency bootstrapping step\n"
+        result = subprocess.run(
+            ["bash", SCRIPT, "--type", "bogus"], capture_output=True, text=True, env=env
+        )
+        assert result.returncode == 2
+        assert "(registered types: rfe, initiative, memo)" in result.stderr
+
+    @staticmethod
+    def _env_with_python3(shim_dir):
+        env = {**os.environ, "PATH": f"{shim_dir}{os.pathsep}{os.environ['PATH']}"}
+        env["RFE_SKIP_BOOTSTRAP"] = "1"
+        env.pop("PYTHONPATH", None)
+        return env
+
+    def test_unreadable_registry_falls_back_to_the_shipped_root(self, fake_checkout, tmp_path):
+        """This script is the dependency bootstrap, so it cannot require a working registry:
+        when `type_registry.py list` fails the names come from types/<name>/type.yaml (rfe
+        first, as `list` prints them), the registry's stderr is not shown, and a registered
+        --type behaves exactly as before PR-3a."""
+        fakebin = tmp_path / "fakebin"
+        fakebin.mkdir()
+        fake_python = fakebin / "python3"
+        fake_python.write_text("#!/bin/sh\necho 'ERROR: fake registry failure' >&2\nexit 1\n")
+        fake_python.chmod(0o755)
+        env = self._env_with_python3(fakebin)
+        result = subprocess.run(
+            ["bash", SCRIPT, "--type", "initiative"], capture_output=True, text=True, env=env
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "RFE_SKIP_BOOTSTRAP set - skipping dependency bootstrapping step\n"
+        assert result.stderr == ""
+        result = subprocess.run(
+            ["bash", SCRIPT, "--type", "bogus"], capture_output=True, text=True, env=env
+        )
+        assert result.returncode == 2
+        assert result.stderr == (
+            "ERROR: unknown --type 'bogus' (registered types: rfe, initiative)\n"
+        )
+
+    def test_python_without_yaml_still_validates_the_type(self, fake_checkout, tmp_path):
+        """The interactive first run: PyYAML is not installed yet (site-packages disabled
+        stands in for that), and `--type rfe` must still exit 0 under RFE_SKIP_BOOTSTRAP."""
+        fakebin = tmp_path / "fakebin"
+        fakebin.mkdir()
+        shim = fakebin / "python3"
+        shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" -S "$@"\n')
+        shim.chmod(0o755)
+        env = self._env_with_python3(fakebin)
+        probe = subprocess.run(
+            ["python3", "-c", "import yaml"], capture_output=True, text=True, env=env
+        )
+        if probe.returncode == 0:
+            pytest.skip("this interpreter imports yaml even without site-packages")
+        result = subprocess.run(
+            ["bash", SCRIPT, "--type", "rfe"], capture_output=True, text=True, env=env
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "RFE_SKIP_BOOTSTRAP set - skipping dependency bootstrapping step\n"
+        assert result.stderr == ""
+        result = subprocess.run(
+            ["bash", SCRIPT, "--type", "epic"], capture_output=True, text=True, env=env
+        )
+        assert result.returncode == 2
+        assert result.stderr == "ERROR: unknown --type 'epic' (registered types: rfe, initiative)\n"
+
+    def test_unreadable_registry_without_a_types_root_exits_2(self, fake_checkout, tmp_path):
+        """Both sources gone — the script copied away from the repo, so neither
+        <scripts>/type_registry.py nor <scripts>/../types exists — is the one fatal case."""
+        stray = tmp_path / "stray" / "scripts"
+        stray.mkdir(parents=True)
+        copied = stray / "bootstrap-assess-rfe.sh"
+        shutil.copy(SCRIPT, copied)
+        env = {**os.environ, "RFE_SKIP_BOOTSTRAP": "1"}
+        result = subprocess.run(
+            ["bash", str(copied), "--type", "rfe"], capture_output=True, text=True, env=env
+        )
+        assert result.returncode == 2
+        assert result.stdout == ""
+        assert result.stderr.startswith("ERROR: could not read the type registry")
+        assert "holds no <name>/type.yaml" in result.stderr
 
     def test_unknown_argument_rejected(self, fake_checkout):
         _add_rfe_assets(fake_checkout)

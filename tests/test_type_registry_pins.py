@@ -273,6 +273,16 @@ MIGRATED = [
     ),
     ((105,), "batch_summary._TYPE_CONFIG", "PR-2a: dirs view of generate_run_report.TYPE_CONFIG"),
     (
+        (124,),
+        "pipeline_state init --type choices",
+        "PR-3a: registry.choices() (source form pinned by "
+        "test_migrated_argparse_choices_read_the_registry); PIPELINE_TYPES itself stays literal "
+        "(rows 108-123) and its keys are pinned equal to names(); the hand-parsed --type of "
+        "check_revised / check_right_sized / check_autofix_complete validates against the "
+        "registry through type_registry.parse_type_arg (unknown -> exit 2 with the registered "
+        "list) with no argparse choices to pin",
+    ),
+    (
         tuple(range(125, 141)),
         "check_review_progress.PHASE_CHECKS / check_id modes",
         "PR-2b: dirs x poll_prefix x {fetch, assess (shared staging), review, revise, split} + "
@@ -455,8 +465,8 @@ def fm(fields, body="Body\n"):
 
 
 class TestRegistryShape:
-    # rows: 124, 142, 159, 160, 161 + the source form of 162 (25, 46, 47-50, 53-56, 60, 62, 65,
-    # 66, 70, 87, 102, 106, 147, 148, 153-156, 162 MIGRATED)
+    # rows: 142, 159, 160, 161 + the source form of 162 (25, 46, 47-50, 53-56, 60, 62, 65, 66,
+    # 70, 87, 102, 106, 124, 147, 148, 153-156, 162 MIGRATED)
 
     def test_shipped_types_in_argparse_order(self):
         assert TYPES == ["rfe", "initiative"]
@@ -486,15 +496,16 @@ class TestRegistryShape:
     @pytest.mark.parametrize(
         "rel, flag",
         [
-            ("scripts/pipeline_state.py", "--type"),  # :848 cmd_init
             ("scripts/compare_review_outputs.py", "--type"),  # :145
             ("scripts/cleanup_partial_split.py", "--type"),  # :27
             ("scripts/check_content_preservation.py", "--type"),  # :208
         ],
     )
     def test_argparse_type_choices_are_registry_choices(self, rel, flag):
-        # rows: 124, 159, 160, 161 — the literal lists still carried (25, 46, 53, 60 MIGRATED)
-        # (check_revised.py / check_right_sized.py hand-parse --type without choices)
+        # rows: 159, 160, 161 — the literal lists still carried (25, 46, 53, 60, 124 MIGRATED)
+        # (check_revised.py / check_right_sized.py / check_autofix_complete.py hand-parse --type
+        # and validate it against the registry since PR-3a — no choices= to pin; the error path
+        # is covered by their own tests)
         got = choices(rel, flag)
         assert got, f"{rel}: no add_argument({flag!r}, choices=...) found"
         for one in got:
@@ -528,6 +539,14 @@ class TestRegistryShape:
         # test_frontmatter_schema_choices_are_the_schema_keys pins "list(SCHEMAS.keys())") so a
         # re-introduced literal list is a visible change.
         assert choices(rel, flag) == ["_TYPES.choices()"], rel
+
+    def test_pipeline_state_init_choices_are_the_registry_names_with_a_phase_table(self):
+        # PR-3a (row 124; cmd_init :848 at 8636075): the registry names filtered to the
+        # PIPELINE_TYPES keys — a drop-in type without a phase table is refused at init, before
+        # any state is written. The source form is pinned like the other migrated choices.
+        assert choices("scripts/pipeline_state.py", "--type") == [
+            "[n for n in _TYPES.choices() if n in PIPELINE_TYPES]"
+        ]
 
     def test_pipeline_types_and_state_validation_share_the_choices(self):
         # scripts/pipeline_state.py:507-509 — type binds at init (design §5)
@@ -1805,11 +1824,19 @@ class TestSkillLayer:
                 assert text.count(STALE_RFE_RUBRIC_PATH) == n and live not in text
 
     def test_bootstrap_script_text(self, ctx):
-        # rows: 193, 194 — bootstrap-assess-rfe.sh:31-37 case arms, :44-52 rubric source, :95-100,
-        # :103
+        # rows: 193, 194 — bootstrap-assess-rfe.sh:31-37 case arms (MIGRATED in PR-3a: the script
+        # reads `type_registry.py list` and fails an unknown --type with the registered list, so
+        # no literal type name is left to pin — tests/test_bootstrap_assess.py covers the paths),
+        # :44-52 rubric source, :95-100, :103
         sh = read("scripts/bootstrap-assess-rfe.sh")
-        assert f"  {' | '.join(TYPES)}) ;;" in sh, "case arm == registry choices"
-        assert f"(expected {' or '.join(TYPES)})" in sh
+        assert (
+            'REGISTERED="$(python3 "$SCRIPT_DIR/type_registry.py" list 2>/dev/null)" || '
+            'REGISTERED=""'
+        ) in sh
+        assert 'for descriptor in "$TYPES_ROOT"/*/type.yaml; do' in sh  # dependency-free fallback
+        assert "(registered types: $REGISTERED_LIST)" in sh
+        assert f"  {' | '.join(TYPES)}) ;;" not in sh, "PR-3a: no literal case arm"
+        assert f"(expected {' or '.join(TYPES)})" not in sh
         rubric = ctx.pipe["rubric"]
         assert f"ASSESS_RFE_REPO:-{rubric['repo']}" in sh
         var = "RUBRIC_FILE" if ctx.t == "rfe" else "INITIATIVE_RUBRIC"
@@ -2465,7 +2492,7 @@ class TestDeferredList:
         for rows, registry, note in MIGRATED:
             assert rows and list(rows) == sorted(rows), registry
             assert all(isinstance(row, int) for row in rows), registry
-            assert registry and note.startswith("PR-2"), registry
+            assert registry and re.match(r"PR-\d", note), registry
             assert not deferred & set(rows), (registry, deferred & set(rows))
             firsts.append(rows[0])
         assert firsts == sorted(firsts)

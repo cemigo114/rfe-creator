@@ -5,7 +5,7 @@ authoritative text lives. Design: `design-proposals/work-item-types-unified.md` 
 §3.2.1 (binding override), §3.3 (gates), §3.4 (provider obligations), §3.5 (discovery), §3.7
 (cross-type chain).
 
-**Status (PR-2d): 26 scripts read the registry at import** — the "Adoption status" table in
+**Status (PR-3a): 28 scripts read the registry at import** — the "Adoption status" table in
 [`types/README.md`](../types/README.md) lists them and what is still pending. Since PR-2b the
 artifact schemas (`artifact_utils.SCHEMAS`), the scan / rename / parse helpers and the poll phase
 table (`check_review_progress.PHASE_CHECKS`) are projections too, so a registered type gets its
@@ -17,7 +17,9 @@ prefixes and fetch layout the same way; since PR-2d the Jira write path (`submit
 `split_submit.SPLIT_CONFIG`) is a projection too, so a registered type submits, approves, splits
 and closes with its own binding and conventions. Every per-type value a pending script still carries is pinned by test to its
 descriptor projection; each adoption deletes its pin (design §10). Adopted scripts use descriptor
-values only; the effective binding override is not consulted until PR-3.
+values only; the effective binding override and the resolution ladder (`resolve`, `candidates`,
+`assert_registered_binding`) ship in the registry since PR-3a and the entry scripts wire them in
+PR-3b/PR-3c.
 
 ## The surface, in one table
 
@@ -26,7 +28,7 @@ values only; the effective binding override is not consulted until PR-3.
 | Field reference (every key, with its consuming `file:line`) | `types/_schema/type.schema.json` `description` strings; `types/rfe/type.yaml` and `types/initiative/type.yaml` |
 | Extension points vs shared machinery, reserved vocabulary, R7 frozen strings, binding override and trust boundary, gate list | [`types/README.md`](../types/README.md) |
 | Copy-from skeleton | `types/rfe/` (`cp -r types/rfe types/<name>`) |
-| Registry API and CLI | `scripts/type_registry.py` (`list`, `show`, `get`, `binding`); in code `load()`, `names()`/`choices()`/`get()`, `detect(item_id)` |
+| Registry API and CLI | `scripts/type_registry.py` (`list`, `show`, `get`, `binding`, `candidates`, `resolve`); in code `load()`, `names()`/`choices()`/`get()`, `detect(item_id)`, `candidates(item_id)`, `resolve(registry, ...)`, `assert_registered_binding(desc)`, `is_headless(env, flag)`, `parse_type_arg(registry, argv)` |
 | Validator (gates 1–3) | `scripts/validate_types.py` (`make lint` runs gate 1) |
 | Anti-regression prefix lint and its ratchet baseline | `scripts/lint_prefix_predicates.py`, `tests/data/prefix_predicate_baseline.json` (only ever shrinks) |
 | Recorded gaps (R1): what the v1 vocabulary cannot say | `NOT EXPRESSIBLE AT V1` comments in `tests/fixtures/types/epic/type.yaml`; `not_expressible_at_v1` in `tests/fixtures/types/strategy-inputs.yaml` |
@@ -113,7 +115,34 @@ boundary as the binding override — and every other entry is dropped with one s
 
 ## Deployment binding override
 
-`identity.<tracker>` is the default binding; `RFE_CREATOR_BINDING_<TYPE>_{PROJECT,ISSUE_TYPE,
-LOCAL_PREFIX}` overlays it (`python3 scripts/type_registry.py binding <type>` shows the effective
-value). The full rule set, including the trust boundary for headless and CI runs, is in
+`identity.<tracker>` is the default binding; three sources overlay it, highest precedence first:
+`RFE_CREATOR_BINDING_<TYPE>_{PROJECT,ISSUE_TYPE,LOCAL_PREFIX}` (env — the only source a headless
+or CI run honours), the bare `JIRA_PROJECT` / `JIRA_ISSUE_TYPE` shorthand (applied by `resolve` to
+the resolved type only), and the `bindings:` block of a workspace `rfe-creator.yaml` (read only
+from an explicit `--workspace-root`, honoured in interactive runs only). `python3
+scripts/type_registry.py binding <type>` shows the effective value (env and descriptor; the
+shorthand and the workspace file are resolve-time sources; `overrides` and a re-rendered
+`local_id_pattern` are printed only when something is overridden, so the zero-override output is
+the PR-1 output). An overridden `local_prefix`
+re-renders the effective `local_id_pattern` (D13) and is a hard error when the descriptor pattern
+does not start with `^` + the descriptor prefix. The full rule set, including the trust boundary
+for headless and CI runs and the ownership check before a tracker write, is in
 [`types/README.md`](../types/README.md) "Deployment binding override".
+
+## Resolution
+
+`python3 scripts/type_registry.py resolve [--type T] [--batch FILE] [--artifact PATH] [--headless]
+[--workspace-root DIR] [--json] [ID ...]` decides the type of a run and prints
+`TYPE RESOLVED: <type> (<rung>[; binding override project=...])`. Rungs: `--type` > batch mapping
+`type:` > deterministic signals (artifact frontmatter `type:`, the artifact's directory, id grammar
+through `candidates()` over effective bindings, with the Jira key grammar as a provisional last
+rung) > the legacy `rfe` default. An unknown type, a `--type` disagreeing with the batch `type:`
+(D1), a per-item `type` key (D2) and conflicting deterministic signals exit 1 with an `ERROR:`
+line; an ambiguous run exits 3 (`TYPE AMBIGUOUS: rfe, initiative - pass --type` interactively, an
+`ERROR:` line when headless). Headless is `is_headless(env, flag)`: `RFE_CREATOR_HEADLESS` (the
+headless pipeline exports it), `CI` or `GITHUB_ACTIONS`, or `--headless` — which also gates the
+`RFE_CREATOR_EXTRA_TYPES` seam and the workspace file for that run (`load(headless=True)`). A drop-in type takes part
+in every rung automatically: its `local_id_pattern`, `key_prefixes`, `local_prefix` and `dirs` are
+the signals, and its Jira binding makes it a provisional candidate for any Jira-shaped key. The rung
+table, the workspace file format and the shorthand scope are in
+[`types/README.md`](../types/README.md) "Resolution".
