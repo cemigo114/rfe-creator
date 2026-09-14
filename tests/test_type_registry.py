@@ -2810,6 +2810,33 @@ class TestResolveBatchItems:
         with pytest.raises(RegistryError, match="JIRA_PROJECT='rhairfe'"):
             resolve(_shipped(), explicit_type="rfe", env={"JIRA_PROJECT": "rhairfe"})
 
+    def test_binding_false_leaves_the_id_rungs_on_effective_bindings(self):
+        # The contract is scoped to the RESOLVED binding: ids are still matched over effective
+        # bindings (an overridden write prefix decides ownership), so a valid override still
+        # routes KONFLUX-1 to rfe and a malformed one still raises when ids are resolved.
+        res = resolve(
+            _shipped(),
+            ids=["KONFLUX-1"],
+            env={"RFE_CREATOR_BINDING_RFE_PROJECT": "KONFLUX"},
+            binding=False,
+        )
+        assert (res.type_name, res.rung, res.provisional, res.binding) == (
+            "rfe",
+            "id grammar",
+            False,
+            None,
+        )
+        with pytest.raises(RegistryError, match="expected an upper-case tracker project key"):
+            resolve(
+                _shipped(),
+                ids=["RHAIRFE-1"],
+                env={"RFE_CREATOR_BINDING_RFE_PROJECT": "bad key"},
+                binding=False,
+            )
+        # without ids the same environment is never read
+        res = resolve(_shipped(), env={"RFE_CREATOR_BINDING_RFE_PROJECT": "bad key"}, binding=False)
+        assert (res.type_name, res.rung) == ("rfe", "legacy default")
+
     def test_binding_false_skips_the_workspace_refusal_with_the_binding(self):
         workspace = {"rfe": {"jira": {"project": "KONFLUX"}}}
         res = resolve(

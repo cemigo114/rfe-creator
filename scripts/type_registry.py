@@ -1113,11 +1113,15 @@ def resolve(
     ``workspace`` is the mapping ``TypeRegistry.workspace_bindings`` returned; a headless run
     whose resolved binding was overridden from the workspace is refused (§3.2.1 g). With
     ``binding=False`` the caller wants the type verdict only (``type_name``, ``rung``,
-    ``desc``): the binding is not computed — an override in the environment is neither read
-    nor validated, so it cannot fail a caller that would never apply it — ``Resolution.binding``
-    is ``None``, the line carries no override clause and the §3.2.1 g refusal, which belongs to
-    the binding, is skipped with it. The batch-root consumers pass it (PR-3b); the writers
-    take the binding (PR-3c).
+    ``desc``): the RESOLVED type's binding is not computed — its overrides are neither read
+    nor validated, so a caller that would never apply them cannot fail on them —
+    ``Resolution.binding`` is ``None``, the line carries no override clause and the §3.2.1 g
+    refusal, which belongs to the binding, is skipped with it. The id rungs are deliberately
+    NOT affected: ``candidates()`` always matches over effective bindings (an overridden
+    write prefix decides ownership), so when ids are resolved a malformed override in the
+    environment still raises ``RegistryError`` whatever ``binding`` says. The batch-root
+    consumers pass ``binding=False`` together with ``items_are_ids=False`` and so never reach
+    that path (PR-3b); the writers take the binding (PR-3c).
     """
     if env is None:
         env = registry.env

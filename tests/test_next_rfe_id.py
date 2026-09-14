@@ -244,11 +244,25 @@ class TestLegacyListNeutrality:
         assert result.stdout == expected
         assert result.stderr == ""
 
-    def test_a_registry_error_is_exit_two_not_a_traceback(self, tmp_path):
-        # The docstring's contract: every RegistryError from the ladder is exit 2 on stderr.
+    def test_a_registry_error_is_exit_two_not_a_traceback(self, tmp_path, monkeypatch, capsys):
+        # The docstring's contract: every RegistryError the ladder raises inside load_batch is
+        # exit 2 with the message on stderr and nothing on stdout. (A registry that fails to
+        # LOAD — an invalid drop-in descriptor — fails at import, as it does in every registry
+        # consumer; that is the shared convention, not this script's contract.)
         assert issubclass(type_registry.ResolveError, type_registry.RegistryError)
-        source = open(SCRIPT, encoding="utf-8").read()
-        assert "except type_registry.RegistryError as exc:" in source
+        batch = tmp_path / "batch.yaml"
+        batch.write_text("- prompt: a\n")
+
+        def boom(*args, **kwargs):
+            raise type_registry.RegistryError("registry says no")
+
+        monkeypatch.setattr(next_rfe_id.type_registry, "resolve", boom)
+        with pytest.raises(SystemExit) as exc_info:
+            next_rfe_id.load_batch(str(batch))
+        assert exc_info.value.code == 2
+        out, err = capsys.readouterr()
+        assert out == ""
+        assert err.strip() == "registry says no"
 
     @pytest.mark.parametrize("env", [{}, {"CI": "true"}, {"RFE_CREATOR_HEADLESS": "1"}])
     def test_string_items_are_counted_not_read_as_ids(self, tmp_path, env):
