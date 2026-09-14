@@ -65,6 +65,8 @@ When the user doesn't specify, use these defaults:
   priority: Major
 ```
 
+The file may also be a mapping with the keys `type` and `items` — `type: initiative` for this skill, the same list of entries under `items`. The validator then takes the type from the file: `--type` may be omitted and, when given, must agree with `type:` (the `--type initiative` below does). A per-item `type` key is rejected in either form because a run is single-typed — split such a batch by type and run each part separately. When the type did not come from the default, the validator prints `TYPE RESOLVED: <type> (...)` on stderr; stdout stays the `ERROR:`/`WARNING:` protocol.
+
 Validate the batch file before spending any agent budget on it. Use `--strict` so unknown fields and duplicate prompts block the run:
 
 ```bash

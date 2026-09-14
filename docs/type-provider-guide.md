@@ -57,7 +57,9 @@ Rules that are easy to trip:
 - **Schemas need every schema fact.** `artifact_utils.SCHEMAS` derives `<type>-task` /
   `<type>-review` from `identity.{tracker,id_field,local_id_pattern}`,
   `conventions.parent_key_patterns`, `schema.task.priority.enum` and `schema.review.score_fields`
-  (plus the optional `schema.{task,review}.extra_fields`). Gate 1 does not require all of them,
+  (plus the optional `schema.{task,review}.extra_fields`). `conventions.parent_key_patterns` governs
+  both the task schema and the batch validator (`Descriptor.parent_key_pattern` is the one join;
+  `batch.extra_fields` decides whether a batch entry may carry `parent_key` at all). Gate 1 does not require all of them,
   so a drop-in that omits one is registered but gets no schemas (and no `frontmatter.py` path
   entry): every read / write / validate against it fails with "Unknown schema type" instead of
   the import failing. That tolerance is for drop-in roots only — a type under `types/` itself is
@@ -139,7 +141,12 @@ through `candidates()` over effective bindings, with the Jira key grammar as a p
 rung) > the legacy `rfe` default. An unknown type, a `--type` disagreeing with the batch `type:`
 (D1), a per-item `type` key (D2) and conflicting deterministic signals exit 1 with an `ERROR:`
 line; an ambiguous run exits 3 (`TYPE AMBIGUOUS: rfe, initiative - pass --type` interactively, an
-`ERROR:` line when headless). Headless is `is_headless(env, flag)`: `RFE_CREATOR_HEADLESS` (the
+`ERROR:` line when headless). A batch file is either the legacy bare list (the type is `--type`, else
+`rfe`) or `{type: <t>, items: [...]}`; `validate_batch_input.py` and `next_rfe_id.py --from-batch`
+accept both through `type_registry.read_batch` — read once, then `resolve(..., batch_items=,
+items_are_ids=False, binding=False)`: string items are entries, not ids, and the binding is not
+evaluated — and print the resolve line on stderr only for a non-default rung (`types/README.md`
+"Batch input forms"). Headless is `is_headless(env, flag)`: `RFE_CREATOR_HEADLESS` (the
 headless pipeline exports it), `CI` or `GITHUB_ACTIONS`, or `--headless` — which also gates the
 `RFE_CREATOR_EXTRA_TYPES` seam and the workspace file for that run (`load(headless=True)`). A drop-in type takes part
 in every rung automatically: its `local_id_pattern`, `key_prefixes`, `local_prefix` and `dirs` are
