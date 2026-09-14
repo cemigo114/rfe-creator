@@ -531,7 +531,6 @@ class TestRegistryShape:
             ("scripts/fetch_issue.py", "--type"),  # new in PR-2c (row 65): no literal list ever
             ("scripts/submit.py", "--type"),  # PR-2d (row 25; :365-370 at c1df503)
             ("scripts/split_submit.py", "--type"),  # PR-2d (row 46; :853-858 at c1df503)
-            ("scripts/pipeline_state.py", "--type"),  # PR-3a (row 124; cmd_init :848 at 8636075)
         ],
     )
     def test_migrated_argparse_choices_read_the_registry(self, rel, flag):
@@ -540,6 +539,14 @@ class TestRegistryShape:
         # test_frontmatter_schema_choices_are_the_schema_keys pins "list(SCHEMAS.keys())") so a
         # re-introduced literal list is a visible change.
         assert choices(rel, flag) == ["_TYPES.choices()"], rel
+
+    def test_pipeline_state_init_choices_are_the_registry_names_with_a_phase_table(self):
+        # PR-3a (row 124; cmd_init :848 at 8636075): the registry names filtered to the
+        # PIPELINE_TYPES keys — a drop-in type without a phase table is refused at init, before
+        # any state is written. The source form is pinned like the other migrated choices.
+        assert choices("scripts/pipeline_state.py", "--type") == [
+            "[n for n in _TYPES.choices() if n in PIPELINE_TYPES]"
+        ]
 
     def test_pipeline_types_and_state_validation_share_the_choices(self):
         # scripts/pipeline_state.py:507-509 — type binds at init (design §5)

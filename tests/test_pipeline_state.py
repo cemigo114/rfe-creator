@@ -2667,17 +2667,19 @@ class TestHeadlessMarker:
         ps._load_state()
         assert ps.HEADLESS_MARKER_ENV not in os.environ
 
-    def test_existing_value_is_left_alone(self, tmp_dir, monkeypatch):
-        """setdefault semantics: the launcher's explicit value wins, even a false one."""
+    def test_a_stale_false_value_is_overridden_for_a_headless_state(self, tmp_dir, monkeypatch):
+        """The state file is authoritative (D4): a ``0`` the environment already carried would
+        make a child resolve interactively and stall the headless run, so it is overwritten."""
         import io
         from contextlib import redirect_stdout
 
         monkeypatch.setenv(ps.HEADLESS_MARKER_ENV, "0")
         with redirect_stdout(io.StringIO()):
             ps.cmd_init(["--headless"])
-        assert os.environ[ps.HEADLESS_MARKER_ENV] == "0"
+        assert os.environ[ps.HEADLESS_MARKER_ENV] == "1"
+        monkeypatch.setenv(ps.HEADLESS_MARKER_ENV, "0")
         ps._load_state()
-        assert os.environ[ps.HEADLESS_MARKER_ENV] == "0"
+        assert os.environ[ps.HEADLESS_MARKER_ENV] == "1"
 
     def test_helper_never_unsets_or_touches_non_headless_state(self, monkeypatch):
         monkeypatch.delenv(ps.HEADLESS_MARKER_ENV, raising=False)
@@ -2687,8 +2689,34 @@ class TestHeadlessMarker:
         assert ps.HEADLESS_MARKER_ENV not in os.environ
         monkeypatch.setenv(ps.HEADLESS_MARKER_ENV, "yes")
         ps._export_headless_marker({"headless": False})
-        ps._export_headless_marker({"headless": True})
         assert os.environ[ps.HEADLESS_MARKER_ENV] == "yes"
+        ps._export_headless_marker({"headless": True})
+        assert os.environ[ps.HEADLESS_MARKER_ENV] == "1"
+
+
+class TestInitRefusesTypesWithoutAPhaseTable:
+    def test_a_registered_type_without_a_phase_table_is_refused_at_init(self, tmp_dir, monkeypatch):
+        """A drop-in type (RFE_CREATOR_EXTRA_TYPES) is registered but PIPELINE_TYPES is still a
+        literal table: init refuses it with argparse's exit 2 before any state is written,
+        instead of _validate_state_values refusing the run later."""
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+
+        class _Registry:
+            def choices(self):
+                return ["rfe", "initiative", "memo"]
+
+        monkeypatch.setattr(ps, "_TYPES", _Registry())
+        err = io.StringIO()
+        with redirect_stderr(err), pytest.raises(SystemExit) as exc_info:
+            ps.cmd_init(["--type", "memo"])
+        assert exc_info.value.code == 2
+        assert "invalid choice: 'memo'" in err.getvalue()
+        assert not os.path.exists(ps.STATE_FILE)
+        # the two shipped types are still accepted, in the registry's order
+        with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+            ps.cmd_init(["--type", "initiative"])
+        assert ps._load_state()["type"] == "initiative"
 
     def test_children_inherit_the_marker(self, tmp_dir, monkeypatch):
         """The point of the export: a subprocess launched after init --headless sees it."""

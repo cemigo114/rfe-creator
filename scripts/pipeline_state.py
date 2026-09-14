@@ -462,12 +462,13 @@ def _export_headless_marker(state):
     Every subprocess the pipeline launches inherits ``os.environ``, so a headless run marks
     itself here — at ``init --headless`` and on every state load — and the registry's
     ``is_headless`` predicate agrees with the pipeline's own flag in every child (design §3.5,
-    PR-3 D4: one headless predicate). ``setdefault`` semantics: a value the launcher already
-    exported wins, whatever it is (an explicit ``0`` stays ``0``); the marker is never unset or
-    overridden here, and a non-headless state exports nothing.
+    PR-3 D4: one headless predicate). The state file is authoritative: ``init --headless``
+    wrote it, so the marker is set to ``1`` even over a stale or false value the environment
+    already carried — a child that saw ``0`` would treat the run as interactive and could
+    stall a headless pipeline. A non-headless state exports nothing and never unsets a value.
     """
     if isinstance(state, dict) and state.get("headless"):
-        os.environ.setdefault(HEADLESS_MARKER_ENV, "1")
+        os.environ[HEADLESS_MARKER_ENV] = "1"
 
 
 def _load_state():
@@ -871,9 +872,14 @@ def advance(state, dry_run=False):
 
 def cmd_init(args):
     parser = argparse.ArgumentParser(prog="pipeline_state.py init")
-    # Registered type names (rfe first): an unknown --type fails with the registered list
-    # (design §5 rung 1); PIPELINE_TYPES keeps its literal table, pinned equal to these names.
-    parser.add_argument("--type", choices=_TYPES.choices(), default="rfe")
+    # Registered type names (rfe first) that this script has a phase table for: an unknown
+    # --type fails with that list (design §5 rung 1), and a drop-in type without a
+    # PIPELINE_TYPES entry is refused HERE, before any state is written, rather than by
+    # _validate_state_values later. PIPELINE_TYPES keeps its literal table, pinned equal to
+    # the registry names.
+    parser.add_argument(
+        "--type", choices=[n for n in _TYPES.choices() if n in PIPELINE_TYPES], default="rfe"
+    )
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--announce-complete", action="store_true")

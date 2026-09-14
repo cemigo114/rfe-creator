@@ -41,8 +41,15 @@ def main():
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(exc.exit_code)
 
-    # Validated above; a registered name that is not in this literal table would be a pin
-    # failure (tests/test_type_registry_pins.py), never a CLI error.
+    if pipeline_type not in _TYPE_CONFIG:
+        # Registered (a drop-in via RFE_CREATOR_EXTRA_TYPES) but this table is still literal:
+        # refuse through the same usage-error path rather than an uncaught KeyError.
+        print(
+            f"ERROR: --type {pipeline_type!r} is registered but has no entry in this script's "
+            f"table yet; supported: {', '.join(_TYPE_CONFIG)}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     tc = _TYPE_CONFIG[pipeline_type]
 
     ids_file = tc["ids_file"]

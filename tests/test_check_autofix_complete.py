@@ -100,3 +100,15 @@ class TestTypeArg:
         assert code == 2
         assert out == ""
         assert err == TRAILING
+
+
+def test_a_registered_type_without_a_table_entry_exits_2(monkeypatch, capsys):
+    """A drop-in type is registered but _TYPE_CONFIG is still literal: the usage-error path,
+    not a KeyError."""
+    monkeypatch.setattr(cac, "_TYPE_CONFIG", {"rfe": cac._TYPE_CONFIG["rfe"]})
+    code, out, err = _main(monkeypatch, capsys, "--type", "initiative")
+    assert (code, out) == (2, "")
+    assert err == (
+        "ERROR: --type 'initiative' is registered but has no entry in this script's table yet; "
+        "supported: rfe\n"
+    )
