@@ -24,7 +24,6 @@ Grandfathered projections (explicit — never "compare literally"):
     split_type_arg / the report commands' --type as "omitted for rfe, the type name otherwise"
     (an argv convention with no descriptor field) — both pinned as residues so lifting either
     grandfather is a visible change;
-  * validate_batch_input.PARENT_KEY_PATTERN omits INIT- (Q14: known divergence until PR-3);
   * the four rfe rubric-path sites in skill bodies are STALE (design §10 PR-5) and are pinned as
     such so the PR-5 fix is a visible pin change;
   * bootstrap_snapshot._run_dir_has_snapshots probes the rfe snapshot.prefix for every --type
@@ -240,18 +239,29 @@ MIGRATED = [
     (
         (67,),
         "next_rfe_id.DEFAULT_PREFIX / DEFAULT_DIR",
-        "PR-2a: rfe local_prefix (dash-less) / dirs.tasks",
+        "PR-2a: rfe local_prefix (dash-less) / dirs.tasks; PR-3b: type_defaults(desc) — the "
+        "batch mapping form takes both from its type's descriptor, the legacy list keeps the "
+        "rfe defaults; both batch-root consumers read the file through type_registry.read_batch "
+        "and decide the type through resolve (source form pinned in TestSmallRegistries)",
+    ),
+    (
+        (68,),
+        "validate_batch_input.PARENT_KEY_PATTERN",
+        "PR-3b: Descriptor.parent_key_pattern per type — the join artifact_utils' task schema "
+        "uses (PR-1 checklist Q14 reconciled: INIT- parents accepted for initiative batches); "
+        "the three-way agreement stays pinned in TestSmallRegistries as an invariant",
     ),
     (
         (69,),
         "validate_batch_input.ALLOWED_PRIORITIES",
-        "PR-2a: rfe schema.task.priority.enum for both types; the task schemas derive the same "
-        "enum per type since PR-2b (row 170)",
+        "PR-2a: rfe schema.task.priority.enum for both types; PR-3b: per resolved type "
+        "(ALLOWED_PRIORITIES[t]; the lists are identical today and pinned equal to the task "
+        "schemas, row 170)",
     ),
     (
         (70,),
-        "validate_batch_input.{RFE,INITIATIVE}_KNOWN_FIELDS",
-        "PR-2a: base set ∪ batch.extra_fields",
+        "validate_batch_input.KNOWN_FIELDS",
+        "PR-2a: base set ∪ batch.extra_fields per type",
     ),
     (
         tuple(range(71, 82)),
@@ -435,6 +445,26 @@ def choices(rel, flag="--type"):
                 except ValueError:
                     found.append(ast.unparse(kw.value))
     return found
+
+
+_NO_DEFAULT = object()
+
+
+def argument_default(rel, flag):
+    """argparse ``default=`` of the ``add_argument(flag, ...)`` call in a script (AST);
+    ``_NO_DEFAULT`` when the call carries no ``default`` keyword."""
+    for node in ast.walk(ast.parse(read(rel))):
+        if not (isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "add_argument"):
+            continue
+        if not (
+            node.args and isinstance(node.args[0], ast.Constant) and node.args[0].value == flag
+        ):
+            continue
+        for kw in node.keywords:
+            if kw.arg == "default":
+                return ast.literal_eval(kw.value)
+        return _NO_DEFAULT
+    raise AssertionError(f"{rel}: no add_argument({flag!r}) call found")
 
 
 def fstring_suffixes(source, head):
@@ -1050,8 +1080,8 @@ class TestJqlAndJiraUtils:
 
 
 class TestSmallRegistries:
-    # rows: 66 (residue), 68, 107, 154, 155, 157-161 (residues) — 65, 66, 67, 69, 70, 105,
-    # 148-157, 170 MIGRATED as listed above
+    # rows: 66 (residue), 68 (reconciliation invariant), 107, 154, 155, 157-161 (residues) —
+    # 65, 66, 67, 68, 69, 70, 105, 148-157, 170 MIGRATED as listed above
 
     def test_fetch_issue_fetch_all_is_type_aware(self):
         # rows: 65 (MIGRATED) — fetch_issue.py:59-60,:98,:122 carried the rfe literals and :224
@@ -1088,20 +1118,91 @@ class TestSmallRegistries:
         assert "scan_fn" not in check_conflicts._TYPE_CONFIG[ctx.t]
         assert 'item_id.startswith(tc["jira_prefix"])' in read("scripts/check_conflicts.py")
 
-    def test_batch_parent_key_pattern_known_divergence(self):
-        # rows: 68 — Q14: validate_batch_input.py:36 omits INIT- while the initiative task schema
-        # (derived from conventions.parent_key_patterns since PR-2b, row 169 MIGRATED) accepts
-        # it; reconciled in PR-3
-        init = _ctx("initiative")
-        registry_pattern = "^(" + "|".join(init.conv["parent_key_patterns"]) + ")$"
-        assert validate_batch_input.PARENT_KEY_PATTERN.pattern == r"^(RHAISTRAT-\d+|RHOAIENG-\d+)$"
-        assert validate_batch_input.PARENT_KEY_PATTERN.pattern != registry_pattern
-        local_parent = f"{init.lp}001"
-        assert validate_batch_input.PARENT_KEY_PATTERN.match(local_parent) is None
-        assert re.match(registry_pattern, local_parent)
-        assert re.match(
-            artifact_utils.SCHEMAS["initiative-task"]["parent_key"]["pattern"], local_parent
+    def test_batch_parent_key_pattern_is_reconciled(self, ctx):
+        # rows: 68 — Q14 closed in PR-3b: the batch validator, the <type>-task schema and the
+        # registry share ONE join of conventions.parent_key_patterns
+        # (Descriptor.parent_key_pattern), so validate_batch_input and artifact_utils cannot
+        # diverge again; an initiative batch newly accepts INIT-\d+ parents, as the task schema
+        # (row 169 MIGRATED) always did
+        registry_pattern = "^(" + "|".join(ctx.conv["parent_key_patterns"]) + ")$"
+        for where, live in (
+            ("type_registry.Descriptor.parent_key_pattern", ctx.desc.parent_key_pattern),
+            (
+                "validate_batch_input.PARENT_KEY_PATTERN",
+                validate_batch_input.PARENT_KEY_PATTERN[ctx.t],
+            ),
+            (
+                f'artifact_utils.SCHEMAS["{ctx.task_schema}"]["parent_key"]["pattern"]',
+                artifact_utils.SCHEMAS[ctx.task_schema]["parent_key"]["pattern"],
+            ),
+        ):
+            pin("conventions.parent_key_patterns", where, registry_pattern, live)
+        pin(
+            "conventions.parent_key_patterns",
+            "validate_batch_input.PARENT_KEY_PATTERNS (the error-text alternatives)",
+            list(ctx.conv["parent_key_patterns"]),
+            validate_batch_input.PARENT_KEY_PATTERNS[ctx.t],
         )
+        if "parent_key" in ctx.d["batch"]["extra_fields"]:
+            local_parent = f"{ctx.lp}001"
+            assert re.match(registry_pattern, local_parent)
+            errors, warnings = validate_batch_input.validate_entries(
+                [{"prompt": "x", "parent_key": local_parent}], entry_type=ctx.t
+            )
+            assert (errors, warnings) == ([], [])
+
+    def test_batch_priorities_and_known_fields_are_per_resolved_type(self, ctx):
+        # rows: 69, 70 (MIGRATED) — PR-3b: the resolved type's schema.task.priority.enum (the
+        # same list for both shipped types, so the error text is type-invariant today) and
+        # base ∪ batch.extra_fields
+        pin(
+            "schema.task.priority.enum",
+            "validate_batch_input.ALLOWED_PRIORITIES",
+            ctx.schema["task"]["priority"]["enum"],
+            validate_batch_input.ALLOWED_PRIORITIES[ctx.t],
+        )
+        pin(
+            "schema.task.priority.enum",
+            f'artifact_utils.SCHEMAS["{ctx.task_schema}"]["priority"]["enum"]',
+            validate_batch_input.ALLOWED_PRIORITIES[ctx.t],
+            artifact_utils.SCHEMAS[ctx.task_schema]["priority"]["enum"],
+        )
+        pin(
+            "batch.extra_fields",
+            "validate_batch_input.KNOWN_FIELDS",
+            set(validate_batch_input.BASE_KNOWN_FIELDS) | set(ctx.d["batch"]["extra_fields"]),
+            validate_batch_input.KNOWN_FIELDS[ctx.t],
+        )
+
+    def test_batch_root_consumers_use_the_one_parser_and_ladder(self):
+        # rows: 67, 68 — PR-3b: both batch-root consumers read the file through
+        # type_registry.read_batch and decide the type through type_registry.resolve (no private
+        # YAML parsing); the validator's --type default is None (rung 1 vs rung 2 must be
+        # distinguishable) while its help text and the allocator's --prefix/--dir help keep
+        # rendering the rfe defaults of the legacy list form; the resolve line goes to stderr and
+        # only for a non-default rung (D3)
+        validator_rel, allocator_rel = "scripts/validate_batch_input.py", "scripts/next_rfe_id.py"
+        validator, allocator = read(validator_rel), read(allocator_rel)
+        for source in (validator, allocator):
+            assert "type_registry.read_batch(" in source
+            assert "type_registry.resolve(" in source
+            assert "yaml.safe_load" not in source and "import yaml" not in source
+            # read once (a pipe cannot be re-read), string items are entries not ids, and only
+            # the type verdict is taken (no binding override is read or validated)
+            assert source.count("type_registry.read_batch(") == 1
+            assert "batch_items=(" in source
+            assert "items_are_ids=False" in source
+            assert "binding=False" in source
+        assert argument_default(validator_rel, "--type") is None
+        assert 'help="Entry type to validate (default: rfe)"' in validator
+        assert "if resolution.rung != type_registry.LEGACY_DEFAULT_RUNG:" in validator
+        assert "print(resolution.line(), file=sys.stderr)" in validator
+        assert argument_default(allocator_rel, "--prefix") is None
+        assert argument_default(allocator_rel, "--dir") is None
+        assert 'help=f"ID prefix (default: {DEFAULT_PREFIX})"' in allocator
+        assert 'help=f"Tasks directory (default: {DEFAULT_DIR})"' in allocator
+        assert "if batch_type is not None:" in allocator
+        assert "print(resolution.line(), file=sys.stderr)" in allocator
 
     def test_batch_summary_literals(self, ctx):
         # rows: 107 — batch_summary.py:87,:97-111 literals (row 105's dirs dict is MIGRATED)
@@ -1975,15 +2076,22 @@ class TestSkillLayer:
 
     def test_type_flag_pass_through(self, ctx):
         # rows: 222 — every '--type X' literal in the type's skills names this type; rfe twins omit
-        # the flag
+        # the flag (the grandfathered "no --type for rfe" convention) with ONE residue lifted in
+        # PR-3b: the speedrun's batch validator passes --type rfe so a mapping type: of another
+        # type is D1-rejected before any id is allocated (the initiative body always passed its
+        # type there); every other rfe call keeps the default
         texts = "\n".join(skill(ctx.t, st) for st in ctx.pipe["stages"]) + skill(
             ctx.t, "split", "prompts/split-agent.md"
         )
         flags = re.findall(r"--type ([a-z]+)", texts)
+        assert flags and set(flags) == {ctx.d["type"]}
         if ctx.t == "rfe":
-            assert flags == []
-        else:
-            assert flags and set(flags) == {ctx.d["type"]}
+            commands = [
+                ln for ln in texts.splitlines() if ln.startswith("python3 ") and "--type rfe" in ln
+            ]
+            assert commands == [
+                "python3 scripts/validate_batch_input.py <input_file> --type rfe --strict"
+            ]
 
     def test_run_report_filename_literals(self, ctx):
         # rows: 224 — rfe.speedrun:215-217; initiative-speedrun:213; eval.yaml:130,:135;
@@ -2071,17 +2179,26 @@ class TestSkillLayer:
         ]("X")
 
     def test_speedrun_batch_format_and_barrier(self, ctx):
-        # rows: 232 — rfe.speedrun/SKILL.md:48-106; initiative-speedrun/SKILL.md:49-91
+        # rows: 232 — rfe.speedrun/SKILL.md:48-106; initiative-speedrun/SKILL.md:49-91; PR-3b:
+        # the example stays the legacy bare list (the eval harness feeds that form) and the
+        # {type, items} mapping form is described in the prose right after it
         text = skill(ctx.t, "speedrun")
         block = re.search(r"\*\*Mode A \(Batch YAML\)\*\*.*?```yaml\n(.*?)```", text, re.S).group(1)
+        entries = yaml.safe_load(block)
+        assert isinstance(entries, list)
         known = {"prompt", "priority", "labels", "clarifying_context"} | set(
             ctx.d["batch"]["extra_fields"]
         )
-        used = {k for entry in yaml.safe_load(block) for k in entry}
+        used = {k for entry in entries for k in entry}
         assert used <= known, used - known
         assert set(ctx.d["batch"]["extra_fields"]) <= used
-        flag = " --type initiative" if ctx.t == "initiative" else ""
-        assert f"validate_batch_input.py <input_file>{flag} --strict" in text
+        assert "mapping with the keys `type` and `items`" in text
+        assert f"`type: {ctx.t}`" in text
+        assert "single-typed" in text and "TYPE RESOLVED" in text
+        # both bodies declare their type to the validator, so a mapping whose type: is the
+        # other type is D1-rejected before any id is allocated (the allocator's rfe call keeps
+        # the flag-less form: the validator runs first and the body stops on its nonzero exit)
+        assert f"validate_batch_input.py <input_file> --type {ctx.t} --strict" in text
         assert ("--phase create" in text) is (
             "create" in check_review_progress.PHASE_CHECKS and ctx.t == "rfe"
         )
