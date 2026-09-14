@@ -13,10 +13,15 @@ Usage:
     python3 scripts/pipeline_state.py run-phase
     python3 scripts/pipeline_state.py advance [--dry-run]
     python3 scripts/pipeline_state.py set-wave <IDs>
+    python3 scripts/pipeline_state.py next-action
+    python3 scripts/pipeline_state.py wait-for-wave   # exit 0 done, 3 re-run; stall guard:
+                                                      # PIPELINE_WAVE_STALL_SECS (900, 0 = off),
+                                                      # PIPELINE_WAVE_RETRY_CAP (2)
     python3 scripts/pipeline_state.py set key=value ...
     python3 scripts/pipeline_state.py get <key>
     python3 scripts/pipeline_state.py status
     python3 scripts/pipeline_state.py diagnose
+    python3 scripts/pipeline_state.py dispatch-context
 """
 
 import argparse
@@ -27,6 +32,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 
 import yaml
@@ -41,6 +47,57 @@ WAVE_IDS_FILE = "tmp/pipeline-wave-ids.txt"
 DISPATCH_MARKER = "tmp/.dispatch-marker"
 
 MAX_NEXT_ACTION_ITERATIONS = 50
+
+# ---------- Wave stall guard (docs/wave-stall-guard.md) ----------
+#
+# A subagent that dies silently never writes its output, so its (poll phase, id) slot stays
+# pending and wait-for-wave would be re-run until the CI job timeout. The guard tracks the
+# number of terminal slots across invocations (reset-on-progress) and, once a wave has made
+# no progress for a full window, either re-dispatches the stuck ids or escalates them through
+# the same post-barrier contract a verify_phase failure uses. Both files live under tmp/ and
+# are wiped by `state.py clean`.
+WAVE_PROGRESS_FILE = "tmp/pipeline-wave-progress.yaml"
+STALL_RETRIES_FILE = "tmp/pipeline-stall-retries.yaml"
+
+# No-progress window (seconds) for a retry-eligible wave. Env PIPELINE_WAVE_STALL_SECS; 0 (or a
+# negative value) disables the guard and restores the unbounded wait.
+DEFAULT_WAVE_STALL_SECS = 900
+# Escalate-only waves wait this many windows: escalation is a degradation, and a legitimately
+# slow single split or revise agent must not be cut off.
+ESCALATE_ONLY_WINDOW_FACTOR = 2
+# Re-dispatch budget per (pipeline phase, id) before a stuck id is escalated instead. Env
+# PIPELINE_WAVE_RETRY_CAP; 0 escalates on the first stall.
+DEFAULT_WAVE_RETRY_CAP = 2
+
+RETRY = "retry"
+ESCALATE = "escalate"
+
+# Stall policy per PIPELINE PHASE (not per poll phase). Every agent phase in the phase table
+# must be classified here (pinned by tests/test_pipeline_state.py::TestWaveStallPolicy).
+#
+# retry    — the wave's agents each write ONE output file from inputs they do not modify, so a
+#            second dispatch (possibly concurrent with a hung first attempt) rewrites that file
+#            and has no other side effect. Stuck ids are left pending, their counter is bumped
+#            and wait-for-wave exits 0 so next-action re-derives a wave from the pending ids.
+# escalate — the wave's agents mutate or mint artifacts, so a second concurrent agent would
+#            double-edit the task file (and its removed-context companion) or mint duplicate
+#            children. Never re-dispatched: escalated after ESCALATE_ONLY_WINDOW_FACTOR windows.
+WAVE_STALL_POLICY = {
+    "FETCH": RETRY,  # fetch-agent: <tasks>/<id>.md (+ companions) from Jira; a re-fetch overwrites
+    "ASSESS": RETRY,  # scorer: tmp/rfe-assess/single/<id>.result.md; each dimension: one file
+    "REVIEW": RETRY,  # review-agent: <reviews>/<id>-review.md from the assess + dimension files
+    "REVISE": ESCALATE,  # revise-agent edits the task file in place and writes removed-context
+    "REASSESS_ASSESS": RETRY,  # same scorer, over the revised task file
+    "REASSESS_REVIEW": RETRY,  # same review-agent
+    "REASSESS_REVISE": ESCALATE,  # same revise-agent
+    "SPLIT": ESCALATE,  # split-agent mints child task files and archives the parent (also the
+    #                     correction pass: SPLIT_CORRECTION_CHECK routes back to this phase)
+    "SPLIT_ASSESS": RETRY,  # split children through the same scorer + dimensions
+    "SPLIT_REVIEW": RETRY,  # same review-agent
+    "SPLIT_REVISE": ESCALATE,  # same revise-agent
+    "SPLIT_REASSESS": RETRY,  # same scorer
+    "SPLIT_RE_REVIEW": RETRY,  # same review-agent
+}
 
 # The explicit headless marker the type registry reads (type_registry.HEADLESS_MARKER_VARS;
 # design §3.5, PR-3 D4). A headless pipeline exports it once, at init and on every state load,
@@ -998,6 +1055,7 @@ def cmd_set_wave(args):
         print("Usage: set-wave ID1 ID2 ...", file=sys.stderr)
         sys.exit(1)
     _write_ids(WAVE_IDS_FILE, args)
+    _clear_wave_progress()  # a new wave starts a fresh stall window (see cmd_next_action)
     print(f"Wave: {len(args)} IDs")
 
 
@@ -1127,8 +1185,14 @@ def cmd_next_action(args):
                     cmd = config["pre_script"].replace("{ID}", rfe_id)
                     _run_script(cmd)
 
-            # Write wave IDs
+            # Write wave IDs. Writing a wave also drops the stall guard's progress tracker:
+            # the previous barrier may never have observed exit 0 (an orchestrator that ran
+            # next-action instead of re-running wait-for-wave leaves the tracker behind), and
+            # a later wave over the same phase and ids — the retry batch, the next reassess
+            # cycle — would otherwise inherit its deadline and be declared stalled on its
+            # first poll.
             _write_ids(WAVE_IDS_FILE, wave_ids)
+            _clear_wave_progress()
 
             # Build agent entries
             agents = []
@@ -1183,12 +1247,316 @@ def cmd_next_action(args):
     sys.exit(1)
 
 
+# ---------- Wave stall guard ----------
+
+
+def _now():
+    """Wall clock (the tracker persists across processes, so monotonic time cannot be used)."""
+    return time.time()
+
+
+def _env_int(var, default):
+    raw = os.environ.get(var)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(
+            f"wait-for-wave: ignoring {var}={raw!r} (not an integer), using {default}",
+            file=sys.stderr,
+        )
+        return default
+
+
+def _wave_stall_secs():
+    return max(0, _env_int("PIPELINE_WAVE_STALL_SECS", DEFAULT_WAVE_STALL_SECS))
+
+
+def _wave_retry_cap():
+    return max(0, _env_int("PIPELINE_WAVE_RETRY_CAP", DEFAULT_WAVE_RETRY_CAP))
+
+
+def _stall_window(policy):
+    """No-progress window in seconds for a wave under ``policy``; 0 when the guard is off."""
+    secs = _wave_stall_secs()
+    if secs <= 0:
+        return 0
+    return secs if policy == RETRY else secs * ESCALATE_ONLY_WINDOW_FACTOR
+
+
+def _wave_poll_phases(config):
+    """The poll phases a wave barrier watches: the phase's own plus its parallel agents'."""
+    phases = [config["poll_phase"]] if config.get("poll_phase") else []
+    for p in config.get("parallel", []) or []:
+        if p.get("poll_phase"):
+            phases.append(p["poll_phase"])
+    return phases
+
+
+def _terminal_slots(poll_phases, ids):
+    """Number of (poll phase, id) slots no longer pending — the wave's progress metric."""
+    from check_review_progress import check_id
+
+    return sum(1 for ph in poll_phases for rid in ids if check_id(ph, rid) != "pending")
+
+
+def _stuck_ids(poll_phases, ids):
+    """id -> its still-pending poll phases, in wave order, for the ids that have any."""
+    from check_review_progress import check_id
+
+    stuck = {}
+    for rid in ids:
+        pending = [ph for ph in poll_phases if check_id(ph, rid) == "pending"]
+        if pending:
+            stuck[rid] = pending
+    return stuck
+
+
+def _read_yaml_file(path):
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return yaml.safe_load(f)
+    except Exception:
+        return None
+
+
+def _write_yaml_file(path, data, **dump_kwargs):
+    os.makedirs(os.path.dirname(path) or "tmp", exist_ok=True)
+    with open(path, "w") as f:
+        yaml.dump(data, f, default_flow_style=False, **dump_kwargs)
+
+
+def _read_wave_progress():
+    prog = _read_yaml_file(WAVE_PROGRESS_FILE)
+    return prog if isinstance(prog, dict) else None
+
+
+def _write_wave_progress(prog):
+    _write_yaml_file(WAVE_PROGRESS_FILE, prog, sort_keys=False)
+
+
+def _clear_wave_progress():
+    try:
+        os.remove(WAVE_PROGRESS_FILE)
+    except OSError:
+        pass
+
+
+def _read_stall_retries():
+    counts = _read_yaml_file(STALL_RETRIES_FILE)
+    return counts if isinstance(counts, dict) else {}
+
+
+def _write_stall_retries(counts):
+    _write_yaml_file(STALL_RETRIES_FILE, counts, sort_keys=True)
+
+
+def _track_wave_progress(sig, phase, done_now):
+    """Record the wave's terminal-slot count and when it last grew (reset-on-progress).
+
+    Keyed by a signature of the wave so a new wave starts a fresh window; the deadline resets
+    whenever the count of terminal slots increases, never on a poll that merely returned.
+    """
+    prog = _read_wave_progress()
+    now = _now()
+    if not prog or prog.get("sig") != sig:
+        prog = {"sig": sig, "phase": phase, "last_progress_ts": now, "done": done_now}
+    elif done_now > prog.get("done", 0):
+        prog["last_progress_ts"], prog["done"] = now, done_now
+    _write_wave_progress(prog)
+    return prog
+
+
+def _stall_reason(phase, idle, window):
+    return (
+        f"wave stalled in {phase}: no agent reached a terminal state for {int(idle)}s"
+        f" (window {window}s); the subagent produced no output"
+    )
+
+
+def _mark_review_or_stub(rid, updates, pipeline_type, base, error):
+    """Merge ``updates`` into ``rid``'s review, or write the registry error stub carrying ``error``.
+
+    The stub is the fallback when there is no review to update or the review is one the
+    schema rejects (a hand-written or half-written file). Escalation must never raise: it
+    runs before the wave and ids files are rewritten, so an exception here would turn the
+    bounded barrier into a crash loop in which every re-run repeats the 90s poll and the same
+    traceback. The stub writer is best-effort by contract, so the worst case is a review that
+    could not be written, never a slot that cannot be released.
+    """
+    import verify_phase
+    from artifact_utils import update_frontmatter
+
+    review_path = f"{_TYPES.get(pipeline_type).dirs()['reviews']}/{rid}-review.md"
+    if os.path.exists(review_path):
+        try:
+            update_frontmatter(review_path, updates, f"{pipeline_type}-review")
+            return
+        except Exception as exc:
+            detail = " ".join(str(exc).split())
+            print(
+                f"wait-for-wave: could not mark {rid}'s review ({detail}); replacing it with"
+                f" the {base} error stub (error={error})",
+                file=sys.stderr,
+            )
+    verify_phase.write_error_stubs(base, [rid], pipeline_type, error=error)
+
+
+def _mark_revise_stalled(ids, pipeline_type):
+    """Revise escalation: the review keeps its real score and recommendation and gains the
+    retryable ``revise_stalled`` error; ``auto_revised`` is left as it is (no revision is
+    claimed). error_collect restores the task file from its original before the retry, which
+    also undoes anything a half-finished revise agent may have written."""
+    error = "revise_stalled"
+    updates = {
+        "error": error,
+        "needs_attention": True,
+        "needs_attention_reason": f"Agent failed: {error}",
+    }
+    for rid in ids:
+        _mark_review_or_stub(rid, updates, pipeline_type, "revise", error)
+    return error
+
+
+def _mark_split_not_attempted(ids, pipeline_type, reason):
+    """Split escalation: the non-retryable ``split_not_attempted:`` class submit.py already
+    records for parents a split pass skipped (error_collect keeps it out of the retry batch,
+    generate_run_report counts it failed, not split), plus the ``no-split`` status file that
+    makes the split slot terminal and routes the parent to the safe R8 branch of
+    split_collect if anything reads it. ``needs_attention`` is set because, unlike
+    submit.py's own not-attempted path (which exits before Phase 2), a parent escalated here
+    is still ``status: Ready`` with no children and reaches Phase 2 as a regular item: the
+    flag is what gets it the needs-attention label and comment instead of a silent
+    label-only disposal. Nothing else is created or cleaned up: the agent may still be
+    alive, so a cleanup here would race it."""
+    error = f"split_not_attempted: {reason}"
+    updates = {
+        "error": error,
+        "needs_attention": True,
+        "needs_attention_reason": f"Agent failed: {error}",
+    }
+    reviews_dir = _TYPES.get(pipeline_type).dirs()["reviews"]
+    for rid in ids:
+        # The status file first: it does not go through the review schema, so the split slot
+        # is terminal even if the review cannot be marked at all.
+        _write_yaml_file(
+            f"{reviews_dir}/{rid}-split-status.yaml",
+            {"status": "failed", "action": "no-split", "reason": error},
+            sort_keys=False,
+        )
+        _mark_review_or_stub(rid, updates, pipeline_type, "split", error)
+    return "split_not_attempted"
+
+
+def _escalate_stuck(state, phase, config, wave_ids, stuck, idle, window):
+    """Escalate ``stuck`` ids through the post-barrier failure contract and release their slots.
+
+    fetch / assess / review-class waves get the registry error-stub review (the exact shape a
+    verify_phase failure writes, with ``<phase base>_stalled`` naming the agent that died: the
+    stuck poll phase minus the type's ``poll_prefix``, so ``assess_stalled`` for ``assess`` and
+    ``initiative-assess`` alike); revise and split waves get the truthful terminal marking their
+    consumers already handle.
+    The ids are then removed from the wave file and from the phase's ids file, exactly as
+    verify_phase drops a failed id: the barrier releases, next-action does not re-dispatch
+    them, post_verify runs on the remaining ids and ERROR_COLLECT picks the error up at
+    BATCH_DONE. No assess result, dimension file or fetch output is ever fabricated.
+    Returns a short description of the marker for the operator line.
+    """
+    import verify_phase
+
+    pipeline_type = state.get("type", "rfe")
+    prefix = PIPELINE_TYPES[pipeline_type]["poll_prefix"]
+    base = config["poll_phase"][len(prefix) :]
+    ids = list(stuck)
+    if base == "split":
+        marker = _mark_split_not_attempted(ids, pipeline_type, _stall_reason(phase, idle, window))
+        marker += " error + no-split status file"
+    elif base == "revise":
+        marker = _mark_revise_stalled(ids, pipeline_type) + " error (auto_revised untouched)"
+    else:
+        errors = []
+        for rid in ids:
+            stuck_base = stuck[rid][0][len(prefix) :]  # the first agent that never finished
+            verify_phase.write_error_stubs(stuck_base, [rid], pipeline_type, outcome="stalled")
+            errors.append(f"{stuck_base}_stalled")
+        marker = "+".join(sorted(set(errors))) + " error-stub review"
+    escalated = set(ids)
+    _write_ids(WAVE_IDS_FILE, [i for i in wave_ids if i not in escalated])
+    ids_file = config.get("ids_file")
+    dropped_from = "the wave"
+    if ids_file:
+        _write_ids(ids_file, [i for i in _read_ids(ids_file) if i not in escalated])
+        dropped_from += f" and {ids_file}"
+    return f"{marker}, removed from {dropped_from}"
+
+
+def _handle_stall(state, phase, config, poll_phases, wave_ids, policy, window, idle):
+    """A wave made no progress for a full window: re-dispatch or escalate every stuck id.
+
+    Under the retry policy a stuck id below the per (phase, id) cap is left pending with its
+    counter bumped — the caller exits 0, the orchestrator runs next-action, and next-action
+    re-derives a wave from the still-pending ids and launches them again. Ids at the cap, and
+    every stuck id of an escalate-only phase, go through ``_escalate_stuck``. The progress
+    tracker is cleared so the next barrier starts a fresh window. One stderr line reports it.
+    """
+    stuck = _stuck_ids(poll_phases, wave_ids)
+    cap = _wave_retry_cap()
+    counts = _read_stall_retries()
+    retried, escalated = [], {}
+    for rid, pending in stuck.items():
+        key = f"{phase}:{rid}"
+        if policy == RETRY and counts.get(key, 0) < cap:
+            counts[key] = counts.get(key, 0) + 1
+            retried.append((rid, counts[key]))
+        else:
+            escalated[rid] = pending
+    if retried:
+        _write_stall_retries(counts)
+    marker = None
+    if escalated:
+        marker = _escalate_stuck(state, phase, config, wave_ids, escalated, idle, window)
+    _clear_wave_progress()
+
+    parts = []
+    if retried:
+        parts.append(
+            "re-dispatching " + ", ".join(f"{rid} (attempt {n}/{cap})" for rid, n in retried)
+        )
+    if escalated:
+        why = f" (retry cap {cap} reached)" if policy == RETRY else ""
+        parts.append(f"escalating {', '.join(escalated)}{why} -> {marker}")
+    if not parts:
+        parts.append("nothing pending any more")
+    label = "retry" if policy == RETRY else "escalate-only"
+    print(
+        f"wait-for-wave: STALL in {phase} ({'+'.join(poll_phases)}): no wave slot reached a"
+        f" terminal state for {int(idle)}s (window {window}s, policy {label}); " + "; ".join(parts),
+        file=sys.stderr,
+    )
+
+
 def cmd_wait_for_wave(args):
     """Block until all agents in the current wave complete.
 
     Zero-argument command. Reads phase and wave IDs from state files,
     builds the correct check_review_progress.py flags internally,
     and delegates. Exits 0 (done) or 3 (pending).
+
+    Stall guard (docs/wave-stall-guard.md): each call is one bounded poll, so a
+    subagent that silently dies would otherwise keep the barrier on exit 3 until
+    the job timeout. The number of terminal (poll phase, id) slots is tracked
+    across calls in tmp/pipeline-wave-progress.yaml and re-checked after the poll
+    returns; the deadline resets whenever it grows. Once a wave has made no
+    progress for PIPELINE_WAVE_STALL_SECS (default 900; escalate-only phases use
+    twice that; 0 disables), the stuck ids are re-dispatched (retry-eligible
+    phases, up to PIPELINE_WAVE_RETRY_CAP per phase and id, counted in
+    tmp/pipeline-stall-retries.yaml) or escalated through the post-barrier
+    failure contract (see WAVE_STALL_POLICY and _escalate_stuck), one stderr line
+    says which, and the command exits 0 so the orchestrator runs next-action.
+    Without a stall, the command's files, output and exit codes are unchanged.
     """
     if not os.path.exists(WAVE_IDS_FILE):
         print(
@@ -1215,6 +1583,15 @@ def cmd_wait_for_wave(args):
         print(f"wait-for-wave: phase {phase} has no poll_phase", file=sys.stderr)
         sys.exit(1)
 
+    # Stall tracking. A phase missing from the policy table is treated as escalate-only (the
+    # policy that never launches a second concurrent agent); the pin test keeps the table full.
+    poll_phases = _wave_poll_phases(config)
+    policy = WAVE_STALL_POLICY.get(phase, ESCALATE)
+    window = _stall_window(policy)
+    sig = f"{phase}|{','.join(sorted(wave_ids))}"
+    if window:
+        _track_wave_progress(sig, phase, _terminal_slots(poll_phases, wave_ids))
+
     # Build check_review_progress.py command
     cmd_parts = [
         sys.executable,
@@ -1234,8 +1611,17 @@ def cmd_wait_for_wave(args):
 
     result = subprocess.run(cmd_parts)
     if result.returncode == 0:
+        if window:
+            _clear_wave_progress()
         return
     if result.returncode == 3:
+        if window:
+            # The poll blocked for up to 90s; count again before judging the wave stalled.
+            prog = _track_wave_progress(sig, phase, _terminal_slots(poll_phases, wave_ids))
+            idle = _now() - prog["last_progress_ts"]
+            if idle >= window:
+                _handle_stall(state, phase, config, poll_phases, wave_ids, policy, window, idle)
+                return
         print("Re-run: python3 scripts/pipeline_state.py wait-for-wave")
         sys.exit(3)
     # Unexpected exit code
