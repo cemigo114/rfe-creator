@@ -484,6 +484,23 @@ class TestWriteErrorStubs:
         )
         assert "and replacing the review frontmatter failed too (IsADirectoryError:" in err[0]
 
+    def test_failures_dict_receives_the_writers_reason(self, workdir, capsys):
+        """pipeline_state's stall guard has to report an unwritten stub itself (its ESCALATION
+        FAILED line), so the writer hands the reason back structurally when asked: the same
+        text the stderr line carries, keyed by id, only for the ids it returns."""
+        os.makedirs("artifacts/rfe-reviews/RHAIRFE-3-review.md")
+        failures = {}
+        assert write_error_stubs("review", ["RHAIRFE-1", "RHAIRFE-3"], failures=failures) == [
+            "RHAIRFE-3"
+        ]
+        assert list(failures) == ["RHAIRFE-3"]
+        reason = failures["RHAIRFE-3"]
+        assert reason.startswith("frontmatter.py set failed (")
+        assert "and replacing the review frontmatter failed too (IsADirectoryError:" in reason
+        assert "\n" not in reason
+        err = capsys.readouterr().err.splitlines()
+        assert err == [f"verify_phase: RHAIRFE-3: no review_failed stub written: {reason}"]
+
     def test_verify_stdout_is_unchanged_by_the_fallback(self, workdir, capsys):
         """verify() reaches the fallback on its own (a review without a score is a failed
         review) and its FAILED= contract line is byte-identical; the fallback speaks on stderr

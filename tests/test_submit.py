@@ -511,6 +511,34 @@ ok.
 """
 
 
+def _error_review(rfe_id, error, verdict="feasible", passed=False):
+    """A review carrying an ``error``: the registry error stub shape when ``passed`` is False
+    (``*_failed`` / ``*_stalled`` inherit ``feasibility: feasible`` without any feasibility
+    review having run), or a real passing review a stall marker landed on."""
+    return f"""\
+---
+rfe_id: {rfe_id}
+score: {9 if passed else 0}
+pass: {"true" if passed else "false"}
+recommendation: {"submit" if passed else "revise"}
+feasibility: {verdict}
+auto_revised: false
+needs_attention: true
+needs_attention_reason: "Agent failed: {error}"
+error: "{error}"
+scores:
+  what: 2
+  why: 2
+  open_to_how: 2
+  not_a_task: 2
+  right_sized: 1
+---
+
+## Assessor Feedback
+n/a.
+"""
+
+
 class TestFeasibilityLabelOnSubmit:
     """End-to-end (dry-run) tests for feasibility label wiring."""
 
@@ -619,6 +647,43 @@ class TestFeasibilityLabelOnSubmit:
         assert rc == 0
         assert "no readable review" in stdout
         assert "Would create" not in stdout
+        assert "rfe-creator-feasibility" not in stdout
+
+    @pytest.mark.parametrize("error", ["assess_stalled", "review_failed", "revise_stalled"])
+    def test_error_bearing_review_has_no_feasibility_verdict(self, art_dir, error):
+        """A review carrying an ``error`` is an error stub (or a real review a stall marker
+        landed on): its ``feasibility: feasible`` is the stub shape, not a verdict, so no
+        feasibility label is added. The needs-attention label and the rubric logic are
+        unchanged, and the same review without the error still earns the label."""
+        _write(f"{art_dir}/rfe-tasks/RFE-001.md", self._task("RFE-001"))
+        _write(f"{art_dir}/rfe-reviews/RFE-001-review.md", _error_review("RFE-001", error))
+        stdout, stderr, rc = _run_submit(art_dir)
+        assert rc == 0, stderr
+        assert "Would create" in stdout
+        assert "rfe-creator-feasibility" not in stdout
+        assert "rfe-creator-needs-attention" in stdout
+        assert "rfe-rubric-pass" not in stdout
+
+        review = _error_review("RFE-001", error).replace(f'error: "{error}"\n', "")
+        _write(f"{art_dir}/rfe-reviews/RFE-001-review.md", review)
+        stdout, stderr, rc = _run_submit(art_dir)
+        assert rc == 0, stderr
+        assert "rfe-creator-feasibility-pass" in stdout  # the verdict counts without the error
+
+    def test_error_bearing_review_leaves_existing_feasibility_labels_alone(self, art_dir):
+        """No verdict means no flip either: an existing item's stale feasibility label is
+        neither replaced nor removed (the Label-only path, identical original body)."""
+        task = self._task("RHAIRFE-1234", original_labels=["rfe-creator-feasibility-fail"])
+        _write(f"{art_dir}/rfe-tasks/RHAIRFE-1234.md", task)
+        _write(f"{art_dir}/rfe-originals/RHAIRFE-1234.md", task)
+        _write(
+            f"{art_dir}/rfe-reviews/RHAIRFE-1234-review.md",
+            _error_review("RHAIRFE-1234", "assess_stalled"),
+        )
+        stdout, stderr, rc = _run_submit(art_dir)
+        assert rc == 0, stderr
+        assert "RHAIRFE-1234: Would add labels: rfe-creator-needs-attention\n" in stdout
+        assert "Would remove labels" not in stdout
         assert "rfe-creator-feasibility" not in stdout
 
 
@@ -844,6 +909,28 @@ class TestApprovedTransition:
         assert rc == 0, stderr
         assert "Would transition to Approved" in stdout
 
+    def test_error_bearing_review_no_transition(self, art_dir):
+        """A passing, feasible review that carries an ``error`` (a stall marker landed on a
+        real review, or a stub whose fields were edited) has no verdict: no auto-approve. The
+        same review without the error transitions, so the gate is the error alone."""
+        _write(f"{art_dir}/rfe-tasks/RFE-001.md", TASK_FM.format(rfe_id="RFE-001"))
+        review = _error_review("RFE-001", "review_stalled", passed=True)
+        _write(f"{art_dir}/rfe-reviews/RFE-001-review.md", review)
+        stdout, stderr, rc = _run_submit(art_dir, ["--auto-approve"])
+        assert rc == 0, stderr
+        assert "Would create" in stdout
+        assert "Would transition to Approved" not in stdout
+        assert "rfe-creator-feasibility" not in stdout
+
+        _write(
+            f"{art_dir}/rfe-reviews/RFE-001-review.md",
+            review.replace('error: "review_stalled"\n', ""),
+        )
+        stdout, stderr, rc = _run_submit(art_dir, ["--auto-approve"])
+        assert rc == 0, stderr
+        assert "Would transition to Approved" in stdout
+        assert "rfe-creator-feasibility-pass" in stdout
+
     def test_no_flag_no_transition(self, art_dir):
         """Without --auto-approve → no transition even if review passes."""
         body = "Original.\n"
@@ -1014,6 +1101,169 @@ class TestSplitFailureIsRecorded:
         assert os.path.exists(yaml_path), (
             "the failure took the run report with it — the successes before it are unrecorded"
         )
+
+
+class TestStallEscalatedSplitParentIsSkipped:
+    """Phase 1 does not split-submit a parent the wave stall guard gave up on.
+
+    A split agent escalated as ``split_not_attempted: wave stalled ...`` (docs/wave-stall-guard.md)
+    may have been slow rather than dead: it can still archive the parent and mint children after
+    the marker was written and the parent left the split ids file, so no SPLIT_ASSESS /
+    SPLIT_REVIEW wave ever saw those children. Selecting the parent by ``status: Archived`` plus
+    children alone would split-submit never-reviewed children. Such a parent is skipped with one
+    line, invoked nowhere, and marked processed nowhere (it is in no plan).
+    """
+
+    PARENT_TASK = (
+        "---\nrfe_id: RHAIRFE-1000\ntitle: Parent RFE\n"
+        "priority: Major\nstatus: Archived\n---\n\nParent content.\n"
+    )
+    CHILD_TASK = (
+        "---\nrfe_id: RFE-001\ntitle: Child RFE\n"
+        "priority: Major\nstatus: Ready\nparent_key: RHAIRFE-1000\n---\n\nChild content.\n"
+    )
+    STALLED = (
+        "split_not_attempted: wave stalled in SPLIT: no agent reached a terminal state for"
+        " 1800s (window 1800s); the subagent produced no output"
+    )
+
+    def _parent_review(self, error=None):
+        fm = (
+            "rfe_id: RHAIRFE-1000\nscore: 6\npass: false\nrecommendation: split\n"
+            "feasibility: feasible\nauto_revised: false\nneeds_attention: false\n"
+        )
+        if error:
+            fm += f'needs_attention: true\nneeds_attention_reason: "Agent failed: {error}"\n'
+            fm += f'error: "{error}"\n'
+        fm += "scores:\n  what: 2\n  why: 2\n  open_to_how: 1\n  not_a_task: 1\n  right_sized: 0\n"
+        return f"---\n{fm}---\n\nToo big.\n"
+
+    def _batch(self, art_dir, review, with_regular=True):
+        _write(f"{art_dir}/rfe-tasks/RHAIRFE-1000.md", self.PARENT_TASK)
+        _write(f"{art_dir}/rfe-reviews/RHAIRFE-1000-review.md", review)
+        _write(f"{art_dir}/rfe-tasks/RFE-001.md", self.CHILD_TASK)  # never reviewed
+        if with_regular:
+            _write(f"{art_dir}/rfe-tasks/RFE-099.md", TASK_FM.format(rfe_id="RFE-099"))
+            _write(
+                f"{art_dir}/rfe-reviews/RFE-099-review.md",
+                REVIEW_FM.format(rfe_id="RFE-099", auto_revised="false"),
+            )
+
+    def _run(self, art_dir, tmp_path, extra_flags=None):
+        """submit.py --dry-run with split_submit.py replaced by a stub that logs its argv (the
+        RFE_SPLIT_SUBMIT_SCRIPT seam, honored under pytest only). Returns (stdout, stderr, rc,
+        the stub's invocations)."""
+        log = tmp_path / "split-stub.log"
+        stub = tmp_path / "split_submit_stub.py"
+        stub.write_text(
+            "import os, sys\n"
+            "with open(os.environ['SPLIT_STUB_LOG'], 'a') as f:\n"
+            "    f.write(' '.join(sys.argv[1:]) + '\\n')\n"
+            "sys.exit(0)\n"
+        )
+        env = _clean_env(**FAKE_CREDS, RFE_SPLIT_SUBMIT_SCRIPT=str(stub), SPLIT_STUB_LOG=str(log))
+        cmd = ["python3", SCRIPT, "--dry-run", "--artifacts-dir", art_dir] + (extra_flags or [])
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        calls = log.read_text().splitlines() if log.exists() else []
+        return result.stdout, result.stderr, result.returncode, calls
+
+    def _plan_ids(self, stdout):
+        lines = stdout.splitlines()
+        start = next(i for i, ln in enumerate(lines) if ln.startswith("Submission plan:"))
+        rows = []
+        for ln in lines[start + 3 :]:
+            if not ln.strip():
+                break
+            if not ln.startswith(" "):
+                rows.append(ln.split()[0])
+        return rows
+
+    def test_split_not_attempted_parent_is_skipped(self, art_dir, tmp_path):
+        self._batch(art_dir, self._parent_review(self.STALLED))
+        stdout, stderr, rc, calls = self._run(art_dir, tmp_path)
+        assert rc == 0, stderr
+        assert calls == []  # split_submit never invoked
+        assert (
+            f"  RHAIRFE-1000: SKIP split-submit - review error {self.STALLED}; children were"
+            " not reviewed, left for an operator\n"
+        ) in stdout
+        assert "Phase 1: Submitting" not in stdout
+        # In no plan: the parent is neither disposed of nor marked processed (mark_processed_ids
+        # is built from plan entries only), and the unreviewed child (a Jira ancestor) is not
+        # a regular item either. The regular RFE is submitted as usual.
+        assert self._plan_ids(stdout) == ["RFE-099"]
+        assert "Would create RHAIRFE Feature Request: Test RFE" in stdout
+        assert "RHAIRFE-1000: Skipping" not in stdout
+        assert "RFE-001" not in stdout
+
+    def test_stalled_stub_parent_is_skipped(self, art_dir, tmp_path):
+        self._batch(art_dir, self._parent_review("split_stalled"))
+        stdout, stderr, rc, calls = self._run(art_dir, tmp_path)
+        assert rc == 0, stderr
+        assert calls == []
+        assert (
+            "  RHAIRFE-1000: SKIP split-submit - review error split_stalled; children were not"
+            " reviewed, left for an operator\n"
+        ) in stdout
+        assert self._plan_ids(stdout) == ["RFE-099"]
+
+    def test_parent_without_error_is_split_submitted_as_before(self, art_dir, tmp_path):
+        self._batch(art_dir, self._parent_review())
+        stdout, stderr, rc, calls = self._run(art_dir, tmp_path)
+        assert rc == 0, stderr
+        assert calls == [f"RHAIRFE-1000 --artifacts-dir {art_dir} --dry-run"]
+        assert "Phase 1: Submitting 1 split parent(s)" in stdout
+        assert "SKIP split-submit" not in stdout
+        assert self._plan_ids(stdout) == ["RFE-099"]
+
+    def test_split_submit_failed_parent_is_split_submitted_as_before(self, art_dir, tmp_path):
+        """A previous run's split_submit_failed: is a different class (quarantined in Jira,
+        re-attempt is the operator's call after removing the label): not this skip."""
+        self._batch(art_dir, self._parent_review("split_submit_failed: exit 4"))
+        stdout, stderr, rc, calls = self._run(art_dir, tmp_path)
+        assert rc == 0, stderr
+        assert calls == [f"RHAIRFE-1000 --artifacts-dir {art_dir} --dry-run"]
+        assert "SKIP split-submit" not in stdout
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            "split_not_attempted: Jira preflight failed",
+            "split_not_attempted: split phase aborted before this parent",
+        ],
+    )
+    def test_this_scripts_own_not_attempted_markers_are_still_attempted(
+        self, art_dir, tmp_path, error
+    ):
+        """submit.py's own not-attempted markers mean "not attempted yet": the manual submit
+        jobs re-run over the same artifacts after a preflight failure and must still try the
+        split. Only the stall guard's ``wave stalled`` reason is the skip."""
+        self._batch(art_dir, self._parent_review(error))
+        stdout, stderr, rc, calls = self._run(art_dir, tmp_path)
+        assert rc == 0, stderr
+        assert calls == [f"RHAIRFE-1000 --artifacts-dir {art_dir} --dry-run"]
+        assert "SKIP split-submit" not in stdout
+
+    def test_unreadable_parent_review_is_treated_as_no_error(self, art_dir, tmp_path):
+        self._batch(art_dir, "---\n: not yaml [\n---\n")
+        stdout, stderr, rc, calls = self._run(art_dir, tmp_path)
+        assert rc == 0, stderr
+        assert calls == [f"RHAIRFE-1000 --artifacts-dir {art_dir} --dry-run"]
+        assert "SKIP split-submit" not in stdout
+
+    def test_skipped_split_only_batch_still_finishes_and_reports(self, art_dir, tmp_path):
+        """A batch whose only input is a skipped parent is not "No submittable RFEs" (exit 1,
+        no report): it finishes like any split-only batch and writes the run report, where the
+        parent keeps counting as failed, not split."""
+        self._batch(art_dir, self._parent_review(self.STALLED), with_regular=False)
+        stdout, stderr, rc, calls = self._run(
+            art_dir, tmp_path, ["--generate-report", "--report-timestamp", "20260818-120000"]
+        )
+        assert rc == 0, stdout + stderr
+        assert calls == []
+        assert "SKIP split-submit" in stdout
+        assert "No submittable" not in stderr
+        assert os.path.exists(f"{art_dir}/auto-fix-runs/20260818-120000.yaml")
 
 
 class TestRecordSplitFailureResilience:

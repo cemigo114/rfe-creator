@@ -14,7 +14,8 @@ Usage:
     python3 scripts/pipeline_state.py advance [--dry-run]
     python3 scripts/pipeline_state.py set-wave <IDs>
     python3 scripts/pipeline_state.py next-action
-    python3 scripts/pipeline_state.py wait-for-wave   # exit 0 done, 3 re-run; stall guard:
+    python3 scripts/pipeline_state.py wait-for-wave   # exit 0 done, 3 re-run, 1 escalation
+                                                      # failed; stall guard knobs:
                                                       # PIPELINE_WAVE_STALL_SECS (900, 0 = off),
                                                       # PIPELINE_WAVE_RETRY_CAP (2)
     python3 scripts/pipeline_state.py set key=value ...
@@ -1354,18 +1355,29 @@ def _write_stall_retries(counts):
     _write_yaml_file(STALL_RETRIES_FILE, counts, sort_keys=True)
 
 
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def _track_wave_progress(sig, phase, done_now):
     """Record the wave's terminal-slot count and when it last grew (reset-on-progress).
 
     Keyed by a signature of the wave so a new wave starts a fresh window; the deadline resets
     whenever the count of terminal slots increases, never on a poll that merely returned.
+    A record for the current wave without a usable ``last_progress_ts`` (key missing, null, or
+    not a number: a hand-edited or truncated file) is treated as absent and replaced by a
+    fresh record, so the caller never reads a timestamp that is not there; a ``done`` that is
+    not an integer is normalized to 0, which at worst resets the deadline once.
     """
     prog = _read_wave_progress()
     now = _now()
-    if not prog or prog.get("sig") != sig:
+    if not prog or prog.get("sig") != sig or not _is_number(prog.get("last_progress_ts")):
         prog = {"sig": sig, "phase": phase, "last_progress_ts": now, "done": done_now}
-    elif done_now > prog.get("done", 0):
-        prog["last_progress_ts"], prog["done"] = now, done_now
+    else:
+        done = prog.get("done")
+        prog["done"] = done if isinstance(done, int) and not isinstance(done, bool) else 0
+        if done_now > prog["done"]:
+            prog["last_progress_ts"], prog["done"] = now, done_now
     _write_wave_progress(prog)
     return prog
 
@@ -1377,15 +1389,18 @@ def _stall_reason(phase, idle, window):
     )
 
 
-def _mark_review_or_stub(rid, updates, pipeline_type, base, error):
+def _mark_review_or_stub(rid, updates, pipeline_type, base, error, failures=None):
     """Merge ``updates`` into ``rid``'s review, or write the registry error stub carrying ``error``.
 
     The stub is the fallback when there is no review to update or the review is one the
     schema rejects (a hand-written or half-written file). Escalation must never raise: it
     runs before the wave and ids files are rewritten, so an exception here would turn the
     bounded barrier into a crash loop in which every re-run repeats the 90s poll and the same
-    traceback. The stub writer is best-effort by contract, so the worst case is a review that
-    could not be written, never a slot that cannot be released.
+    traceback. Returns True when a marker is on disk (the merge succeeded, or the stub writer
+    reported no unwritten id) and False when neither writer could produce one; in that case
+    the writer's reason, when it gave one, is recorded in ``failures[rid]``. The caller must
+    not retire an id this returns False for: with no marker, error_collect would never
+    retry it and the run report would show it failed for no reason.
     """
     import verify_phase
     from artifact_utils import update_frontmatter
@@ -1394,7 +1409,7 @@ def _mark_review_or_stub(rid, updates, pipeline_type, base, error):
     if os.path.exists(review_path):
         try:
             update_frontmatter(review_path, updates, f"{pipeline_type}-review")
-            return
+            return True
         except Exception as exc:
             detail = " ".join(str(exc).split())
             print(
@@ -1402,23 +1417,30 @@ def _mark_review_or_stub(rid, updates, pipeline_type, base, error):
                 f" the {base} error stub (error={error})",
                 file=sys.stderr,
             )
-    verify_phase.write_error_stubs(base, [rid], pipeline_type, error=error)
+    unwritten = verify_phase.write_error_stubs(
+        base, [rid], pipeline_type, error=error, failures=failures
+    )
+    return rid not in (unwritten or [])
 
 
 def _mark_revise_stalled(ids, pipeline_type):
     """Revise escalation: the review keeps its real score and recommendation and gains the
     retryable ``revise_stalled`` error; ``auto_revised`` is left as it is (no revision is
     claimed). error_collect restores the task file from its original before the retry, which
-    also undoes anything a half-finished revise agent may have written."""
+    also undoes anything a half-finished revise agent may have written.
+    Returns ``(error, failures)``: the marker's name for the operator line and ``id ->
+    reason`` (reason may be None) for the ids no marker could be written for."""
     error = "revise_stalled"
     updates = {
         "error": error,
         "needs_attention": True,
         "needs_attention_reason": f"Agent failed: {error}",
     }
+    failures = {}
     for rid in ids:
-        _mark_review_or_stub(rid, updates, pipeline_type, "revise", error)
-    return error
+        if not _mark_review_or_stub(rid, updates, pipeline_type, "revise", error, failures):
+            failures.setdefault(rid, None)
+    return error, failures
 
 
 def _mark_split_not_attempted(ids, pipeline_type, reason):
@@ -1431,7 +1453,11 @@ def _mark_split_not_attempted(ids, pipeline_type, reason):
     is still ``status: Ready`` with no children and reaches Phase 2 as a regular item: the
     flag is what gets it the needs-attention label and comment instead of a silent
     label-only disposal. Nothing else is created or cleaned up: the agent may still be
-    alive, so a cleanup here would race it."""
+    alive, so a cleanup here would race it.
+    The review marker comes first and the status file only once it is on disk: a parent no
+    marker could be written for stays in the wave (see _escalate_stuck), and a status file
+    would make its slot terminal and let the next poll release it with no error recorded.
+    Returns ``("split_not_attempted", failures)`` like _mark_revise_stalled."""
     error = f"split_not_attempted: {reason}"
     updates = {
         "error": error,
@@ -1439,16 +1465,26 @@ def _mark_split_not_attempted(ids, pipeline_type, reason):
         "needs_attention_reason": f"Agent failed: {error}",
     }
     reviews_dir = _TYPES.get(pipeline_type).dirs()["reviews"]
+    failures = {}
     for rid in ids:
-        # The status file first: it does not go through the review schema, so the split slot
-        # is terminal even if the review cannot be marked at all.
-        _write_yaml_file(
-            f"{reviews_dir}/{rid}-split-status.yaml",
-            {"status": "failed", "action": "no-split", "reason": error},
-            sort_keys=False,
-        )
-        _mark_review_or_stub(rid, updates, pipeline_type, "split", error)
-    return "split_not_attempted"
+        if not _mark_review_or_stub(rid, updates, pipeline_type, "split", error, failures):
+            failures.setdefault(rid, None)
+            continue
+        try:
+            _write_yaml_file(
+                f"{reviews_dir}/{rid}-split-status.yaml",
+                {"status": "failed", "action": "no-split", "reason": error},
+                sort_keys=False,
+            )
+        except OSError as exc:
+            # The review marker is the record; the status file only serves a consumer that
+            # re-reads the parent, so its loss is reported, not treated as an escalation failure.
+            print(
+                f"wait-for-wave: could not write {rid}'s no-split status file"
+                f" ({type(exc).__name__}: {exc}); the review marker stands",
+                file=sys.stderr,
+            )
+    return "split_not_attempted", failures
 
 
 def _escalate_stuck(state, phase, config, wave_ids, stuck, idle, window):
@@ -1459,11 +1495,15 @@ def _escalate_stuck(state, phase, config, wave_ids, stuck, idle, window):
     stuck poll phase minus the type's ``poll_prefix``, so ``assess_stalled`` for ``assess`` and
     ``initiative-assess`` alike); revise and split waves get the truthful terminal marking their
     consumers already handle.
-    The ids are then removed from the wave file and from the phase's ids file, exactly as
-    verify_phase drops a failed id: the barrier releases, next-action does not re-dispatch
-    them, post_verify runs on the remaining ids and ERROR_COLLECT picks the error up at
-    BATCH_DONE. No assess result, dimension file or fetch output is ever fabricated.
-    Returns a short description of the marker for the operator line.
+    The ids whose marker is on disk are then removed from the wave file and from the phase's
+    ids file, exactly as verify_phase drops a failed id: the barrier releases, next-action
+    does not re-dispatch them, post_verify runs on the remaining ids and ERROR_COLLECT picks
+    the error up at BATCH_DONE. An id no marker could be written for is left in both files:
+    retiring it would make it vanish from every consumer (collect_recommendations --errors,
+    error_collect, the run report) with no trace, so the caller reports it and exits 1
+    instead. No assess result, dimension file or fetch output is ever fabricated.
+    Returns ``(marker, unrecorded)``: a short description of the marker for the operator
+    line, and ``id -> reason`` (reason may be None) for the ids left in place.
     """
     import verify_phase
 
@@ -1472,25 +1512,33 @@ def _escalate_stuck(state, phase, config, wave_ids, stuck, idle, window):
     base = config["poll_phase"][len(prefix) :]
     ids = list(stuck)
     if base == "split":
-        marker = _mark_split_not_attempted(ids, pipeline_type, _stall_reason(phase, idle, window))
+        marker, unrecorded = _mark_split_not_attempted(
+            ids, pipeline_type, _stall_reason(phase, idle, window)
+        )
         marker += " error + no-split status file"
     elif base == "revise":
-        marker = _mark_revise_stalled(ids, pipeline_type) + " error (auto_revised untouched)"
+        marker, unrecorded = _mark_revise_stalled(ids, pipeline_type)
+        marker += " error (auto_revised untouched)"
     else:
-        errors = []
+        errors, unrecorded = [], {}
         for rid in ids:
             stuck_base = stuck[rid][0][len(prefix) :]  # the first agent that never finished
-            verify_phase.write_error_stubs(stuck_base, [rid], pipeline_type, outcome="stalled")
-            errors.append(f"{stuck_base}_stalled")
+            unwritten = verify_phase.write_error_stubs(
+                stuck_base, [rid], pipeline_type, outcome="stalled", failures=unrecorded
+            )
+            if rid in (unwritten or []):
+                unrecorded.setdefault(rid, None)
+            else:
+                errors.append(f"{stuck_base}_stalled")
         marker = "+".join(sorted(set(errors))) + " error-stub review"
-    escalated = set(ids)
-    _write_ids(WAVE_IDS_FILE, [i for i in wave_ids if i not in escalated])
+    recorded = {i for i in ids if i not in unrecorded}
+    _write_ids(WAVE_IDS_FILE, [i for i in wave_ids if i not in recorded])
     ids_file = config.get("ids_file")
     dropped_from = "the wave"
     if ids_file:
-        _write_ids(ids_file, [i for i in _read_ids(ids_file) if i not in escalated])
+        _write_ids(ids_file, [i for i in _read_ids(ids_file) if i not in recorded])
         dropped_from += f" and {ids_file}"
-    return f"{marker}, removed from {dropped_from}"
+    return f"{marker}, removed from {dropped_from}", unrecorded
 
 
 def _handle_stall(state, phase, config, poll_phases, wave_ids, policy, window, idle):
@@ -1515,9 +1563,11 @@ def _handle_stall(state, phase, config, poll_phases, wave_ids, policy, window, i
             escalated[rid] = pending
     if retried:
         _write_stall_retries(counts)
-    marker = None
+    marker, unrecorded = None, {}
     if escalated:
-        marker = _escalate_stuck(state, phase, config, wave_ids, escalated, idle, window)
+        marker, unrecorded = _escalate_stuck(
+            state, phase, config, wave_ids, escalated, idle, window
+        )
     _clear_wave_progress()
 
     parts = []
@@ -1527,7 +1577,11 @@ def _handle_stall(state, phase, config, poll_phases, wave_ids, policy, window, i
         )
     if escalated:
         why = f" (retry cap {cap} reached)" if policy == RETRY else ""
-        parts.append(f"escalating {', '.join(escalated)}{why} -> {marker}")
+        recorded = [rid for rid in escalated if rid not in unrecorded]
+        if recorded:
+            parts.append(f"escalating {', '.join(recorded)}{why} -> {marker}")
+        if unrecorded:
+            parts.append(f"escalation FAILED for {', '.join(unrecorded)}{why} (see next line)")
     if not parts:
         parts.append("nothing pending any more")
     label = "retry" if policy == RETRY else "escalate-only"
@@ -1536,6 +1590,20 @@ def _handle_stall(state, phase, config, poll_phases, wave_ids, policy, window, i
         f" terminal state for {int(idle)}s (window {window}s, policy {label}); " + "; ".join(parts),
         file=sys.stderr,
     )
+    if unrecorded:
+        # Loud, not silent: the id is still in the wave and its ids file (the files for the
+        # recorded ids are already written and the tracker cleared), so nothing downstream
+        # can mistake it for done or retired. Exit 1 stops the orchestrator's re-run loop.
+        reasons = "; ".join(f"{rid}: {why}" for rid, why in unrecorded.items() if why)
+        detail = f" ({reasons})" if reasons else ""
+        left_in = "the wave" + (f" and {config['ids_file']}" if config.get("ids_file") else "")
+        print(
+            f"wait-for-wave: ESCALATION FAILED for {', '.join(unrecorded)}: no error marker"
+            f" could be written{detail}; left in {left_in} - fix the reviews directory and"
+            " re-run",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def cmd_wait_for_wave(args):
@@ -1556,7 +1624,10 @@ def cmd_wait_for_wave(args):
     tmp/pipeline-stall-retries.yaml) or escalated through the post-barrier
     failure contract (see WAVE_STALL_POLICY and _escalate_stuck), one stderr line
     says which, and the command exits 0 so the orchestrator runs next-action.
-    Without a stall, the command's files, output and exit codes are unchanged.
+    When no error marker could be written for an escalated id, that id is left
+    in the wave and its ids file, a ``wait-for-wave: ESCALATION FAILED`` line
+    names it, and the command exits 1. Without a stall, the command's files,
+    output and exit codes are unchanged.
     """
     if not os.path.exists(WAVE_IDS_FILE):
         print(

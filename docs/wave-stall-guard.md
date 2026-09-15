@@ -79,7 +79,7 @@ phase kind:
 |---|---|---|
 | fetch / assess / review-class | The registry error-stub review (`verify_phase.write_error_stubs`, the same shape `validate_types.build_error_stub` checks), with `error: <phase base>_stalled` naming the agent that never finished: the stuck poll phase with the type's `pipeline.poll_prefix` stripped, so `assess_stalled` for `assess` and `initiative-assess` alike (`fetch_stalled`, `assess_stalled`, `feasibility_stalled`, `alignment_stalled`, `review_stalled`). When the stub cannot be merged into a half-written review (a `scores` member the schema does not know), the review's frontmatter is replaced with the stub and one `verify_phase: <id>: ...` stderr line says why. | Retryable: `error_collect.py` cleans the stub and queues the id. |
 | revise | `error: revise_stalled`, `needs_attention: true` on the real review; score and recommendation kept, `auto_revised` untouched (no revision is claimed). `check_id`'s revise row keys on `auto_revised`, so the slot is released by the id leaving the ids file, not by the marker. | Retryable: `error_collect.py`'s revise path restores the task file from its original (undoing a half-finished edit) and deletes the removed-context companion before the retry. `collect_recommendations --reassess` does not reassess it. |
-| split | `error: split_not_attempted: wave stalled ...` (the non-retryable class `submit.py` records for parents a split pass skipped) and `needs_attention: true` on the real review, plus `<reviews>/<id>-split-status.yaml` with `status: failed`, `action: no-split`, which makes the split slot terminal and routes the parent to `split_collect`'s R8 no-split branch if anything reads it. Nothing is cleaned up: the agent may still be alive. | Non-retryable: `error_collect.py` excludes it from the retry batch; `generate_run_report.py` counts it failed, not split. The parent is still `status: Ready` with no children, so `submit.py` does not see it as a Phase 1 split parent: it reaches Phase 2 as a regular item and is disposed there — needs-attention label and comment (that is what the flag buys), then `processed: true` in the snapshot — so it is **not** re-selected until its Jira content changes. This differs from `submit.py`'s own `split_not_attempted:` path, which exits before Phase 2 and leaves the parent unprocessed; teaching Phase 2 to leave `split_not_attempted:` / `*_stalled` reviews unprocessed is a follow-up in `submit.py`. |
+| split | `error: split_not_attempted: wave stalled ...` (the non-retryable class `submit.py` records for parents a split pass skipped) and `needs_attention: true` on the real review, plus `<reviews>/<id>-split-status.yaml` with `status: failed`, `action: no-split`, which makes the split slot terminal and routes the parent to `split_collect`'s R8 no-split branch if anything reads it. Nothing is cleaned up: the agent may still be alive. | Non-retryable: `error_collect.py` excludes it from the retry batch; `generate_run_report.py` counts it failed, not split. The parent is still `status: Ready` with no children, so `submit.py` does not see it as a Phase 1 split parent: it reaches Phase 2 as a regular item and is disposed there — needs-attention label and comment (that is what the flag buys), then `processed: true` in the snapshot — so it is **not** re-selected until its Jira content changes. It gets no feasibility label and is never auto-approved: a review carrying an `error` has no verdict (see [What submit.py does with the markers](#what-submitpy-does-with-the-markers)). This differs from `submit.py`'s own `split_not_attempted:` path, which exits before Phase 2 and leaves the parent unprocessed; teaching Phase 2 to leave `split_not_attempted:` / `*_stalled` reviews unprocessed is a follow-up in `submit.py`. If the agent was slow rather than dead and archives the parent and mints children later in the job, Phase 1 skips the split-submit (same section). |
 
 The revise and split markers update the review in place. When that is
 impossible — there is no review, or the schema rejects the one there is (a
@@ -89,6 +89,45 @@ the same `error` value, so the escalation never raises. This matters because
 escalation runs before the wave and ids files are rewritten: an exception
 there would turn the bounded barrier into a crash loop in which every re-run
 repeats the poll and the same traceback.
+
+When neither writer can produce a marker (the review path is not a writable
+file), the id is **not** retired. Retiring it with no marker on disk would make
+it vanish from `collect_recommendations --errors`, `error_collect.py` and the
+run report without a trace, so instead: the ids whose marker landed are
+released as usual, the unrecorded id stays in the wave file and the phase's
+ids file, the tracker is cleared, and the command exits 1 with a
+`wait-for-wave: ESCALATION FAILED` line (see below). For a split parent the
+`no-split` status file is written only once the review marker is on disk, so
+an unrecorded parent's slot stays pending instead of releasing on the next
+poll with nothing recorded. After the reviews directory is fixed, re-running
+`wait-for-wave` starts a fresh window and escalates the id for real.
+
+## What submit.py does with the markers
+
+- **Phase 1 skips a parent the guard gave up on.** A split agent escalated as
+  `split_not_attempted:` that was slow rather than dead can still archive the
+  parent and mint its children after the marker was written and after the
+  parent left `tmp/pipeline-split-ids.txt`, so `SPLIT_COLLECT` never picks the
+  children up and no `SPLIT_ASSESS` / `SPLIT_REVIEW` wave sees them. Phase 1
+  used to select such a parent by task `status: Archived` plus children
+  carrying its `parent_key` and split-submit children nobody reviewed. It now
+  reads the parent's review first: a review whose `error` starts with
+  `split_not_attempted:` or ends with `_stalled` excludes the parent from the
+  split-submit loop with one line —
+  `  <key>: SKIP split-submit - review error <error>; children were not reviewed, left for an operator`
+  — and the parent is in no plan, so it is neither split-submitted nor marked
+  processed; its children stay local. An unreadable review counts as no error.
+  `split_refused:` and `split_submit_failed:` parents behave as before.
+- **A review carrying an `error` has no feasibility verdict.** Every
+  `*_failed` / `*_stalled` stub inherits the stub shape (`feasibility:
+  feasible`, `recommendation: revise`, `pass: false`, `score: 0`) although no
+  feasibility review ran, and a stall marker on a real review no longer
+  describes the item. Phase 2 therefore passes no verdict to the feasibility
+  label logic for an error-bearing review — no feasibility label is added and
+  none is removed — and never auto-approves it, whatever its `pass` and
+  `feasibility` fields say. The needs-attention label and comment and the
+  rubric logic are unchanged. (This also means today's `*_failed` stubs no
+  longer receive `feasibility-pass`.)
 
 ## What the operator sees
 
@@ -113,6 +152,16 @@ wait-for-wave: STALL in ASSESS (assess+feasibility): no wave slot reached a term
 wait-for-wave: STALL in SPLIT (split): no wave slot reached a terminal state for 1800s (window 1800s, policy escalate-only); escalating RHAIRFE-1001 -> split_not_attempted error + no-split status file, removed from the wave and tmp/pipeline-split-ids.txt
 ```
 
+If an escalated id could not be marked at all (see above), the STALL line
+lists it as `escalation FAILED for <id> (see next line)` instead of
+`escalating ...`, one more line follows, and the command exits **1** rather
+than 0 — the orchestrator's re-run loop stops there until the reviews directory
+is fixed:
+
+```
+wait-for-wave: ESCALATION FAILED for <ids>: no error marker could be written (<id>: <reason from the stub writer, when it gave one>); left in the wave and <ids file> - fix the reviews directory and re-run
+```
+
 `tmp/pipeline-retry-errors.yaml` (written by `error_collect.py` at
 `BATCH_DONE`) carries the `*_stalled` values, so a stall is distinguishable
 there from an agent that finished without output (`*_failed`). The run report
@@ -134,30 +183,9 @@ failed: split_not_attempted: wave stalled ...`. After the run, the review's
   treat the item as done; the retry path (revise) restores the original, and
   a stalled split is flagged for the operator in Jira (needs-attention label
   and comment) but not re-selected automatically until its Jira content
-  changes. The double window exists to make this rare.
-- **Follow-up (`submit.py`): a late split after `split_not_attempted:`.**
-  A split agent escalated as `split_not_attempted:` that was slow rather than
-  dead, and finishes later in the same job, archives the parent and mints its
-  children after the marker was written and after the parent left
-  `tmp/pipeline-split-ids.txt` — so `SPLIT_COLLECT` never picks the children
-  up and the `SPLIT_ASSESS` / `SPLIT_REVIEW` waves run without them.
-  `submit.py` Phase 1 then selects the parent by task `status: Archived` plus
-  children carrying its `parent_key`, without reading the review's `error`,
-  and split-submits children that were never assessed or reviewed
-  (`split_submit.py` treats a missing child review as "proceed without review
-  data"). The fix belongs in `submit.py`: skip, or quarantine, a Phase 1
-  parent whose review carries `split_not_attempted:`.
-- **Follow-up (`submit.py`): a `*_stalled` stub reads as a feasibility
-  verdict.** Every `*_stalled` stub inherits the R2 stub shape
-  (`feasibility: feasible`, `recommendation: revise`, `pass: false`,
-  `score: 0`). When the id's retry also fails — or the stall is in the retry
-  batch, where an id at its cap is escalated on the first stall — that stub is
-  what `submit.py` Phase 2 reads, and the item is disposed as feasibility-pass
-  plus needs-attention (`rfe-creator-feasibility-pass` and
-  `rfe-creator-needs-attention`, plus the needs-attention comment; verified
-  with `submit.py --dry-run` on an `assess_stalled` stub) although no
-  feasibility review ever ran. The fix belongs in `submit.py`: treat the
-  `feasibility` of a review carrying an `error` as no verdict.
+  changes, and children a late split agent minted are left local, never
+  split-submitted (`submit.py` Phase 1 skips the parent). The double window
+  exists to make this rare.
 - The guard bounds the barrier; it does not diagnose why the agent died.
   Look at the subagent transcript for that.
 
@@ -165,4 +193,8 @@ Tests: `tests/test_pipeline_state.py::TestWaveStallPolicy`,
 `::TestWaveStall` (bounded barrier and the post_verify leg after it,
 reset-on-progress before and during a poll, split and revise paths, both
 shipped types, disable, no-stall neutrality, the stub fallback on an
-unmergeable review) and `tests/test_verify_phase.py::TestWriteErrorStubs`.
+unmergeable review, tracker normalization, the ESCALATION FAILED path),
+`tests/test_verify_phase.py::TestWriteErrorStubs` and, for `submit.py`,
+`tests/test_submit.py::TestStallEscalatedSplitParentIsSkipped`,
+`::TestFeasibilityLabelOnSubmit` and `::TestApprovedTransition` (the
+error-bearing-review cases).

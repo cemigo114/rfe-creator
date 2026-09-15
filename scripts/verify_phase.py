@@ -62,7 +62,7 @@ _TYPE_CONFIG = {
 }
 
 
-def write_error_stubs(phase, ids, pipeline_type="rfe", outcome="failed", error=None):
+def write_error_stubs(phase, ids, pipeline_type="rfe", outcome="failed", error=None, failures=None):
     """Write the error-stub review for each id whose ``phase`` agent produced no output.
 
     One ``python3 scripts/frontmatter.py set`` per id, field for field the stub
@@ -86,7 +86,9 @@ def write_error_stubs(phase, ids, pipeline_type="rfe", outcome="failed", error=N
     the stub (``artifact_utils.write_frontmatter``, which keeps the body it can read) and
     one stderr line names the id and frontmatter.py's reason. One bad id still cannot
     take the caller down: the ids for which even the replacement failed are reported on
-    stderr and returned (an empty list when every stub is on disk).
+    stderr and returned (an empty list when every stub is on disk). ``failures``, when a
+    dict is given, additionally receives ``id -> reason`` for those ids (the same reason
+    the stderr line carries), for a caller that has to report them itself.
     """
     tc = _TYPE_CONFIG[pipeline_type]
     error_msg = error or f"{phase}_{outcome}"
@@ -122,10 +124,14 @@ def write_error_stubs(phase, ids, pipeline_type="rfe", outcome="failed", error=N
         except Exception as exc:
             unwritten.append(rfe_id)
             detail = " ".join(str(exc).split())
+            why = (
+                f"frontmatter.py set failed ({reason}) and replacing the review frontmatter"
+                f" failed too ({type(exc).__name__}: {detail})"
+            )
+            if failures is not None:
+                failures[rfe_id] = why
             print(
-                f"verify_phase: {rfe_id}: no {error_msg} stub written: frontmatter.py set failed"
-                f" ({reason}) and replacing the review frontmatter failed too"
-                f" ({type(exc).__name__}: {detail})",
+                f"verify_phase: {rfe_id}: no {error_msg} stub written: {why}",
                 file=sys.stderr,
             )
             continue

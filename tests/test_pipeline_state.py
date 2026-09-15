@@ -3585,7 +3585,7 @@ class TestWaveStall:
         _write_task(parent, original_labels=["rfe-rubric-pass"])
         _write_review(parent, recommendation="split", score=6)
         reason = "wave stalled in SPLIT: test"
-        assert ps._mark_split_not_attempted([parent], "rfe", reason) == "split_not_attempted"
+        assert ps._mark_split_not_attempted([parent], "rfe", reason) == ("split_not_attempted", {})
         from artifact_utils import read_frontmatter
 
         data, _ = read_frontmatter(f"artifacts/rfe-reviews/{parent}-review.md")
@@ -3613,5 +3613,282 @@ class TestWaveStall:
         assert result.returncode == 0, result.stderr
         plan_row = next(ln for ln in result.stdout.splitlines() if ln.startswith(parent))
         assert "Label only" in plan_row  # disposed in Phase 2, not re-selected
-        assert f"{parent}: Would add labels: rfe-creator-needs-attention" in result.stdout
+        assert f"{parent}: Would add labels: rfe-creator-needs-attention\n" in result.stdout
         assert f"{parent}: Would post needs-attention comment" in result.stdout
+        # A review carrying an error has no feasibility verdict: the marker's inherited
+        # feasibility: feasible earns no feasibility-pass label (submit.py, finding R2-4).
+        assert "rfe-creator-feasibility" not in result.stdout
+
+    # ----- the tracker record is normalized, never trusted -----
+
+    @pytest.mark.parametrize("bad_ts", ["missing", None, "not-a-number", True])
+    def test_tracker_without_a_usable_timestamp_starts_a_fresh_record(
+        self, stall_dir, monkeypatch, capsys, bad_ts
+    ):
+        """A tracker for the current wave whose last_progress_ts is missing, null or not a
+        number (a hand-edited or truncated file) used to survive _track_wave_progress and
+        make every wait-for-wave call die with KeyError / TypeError on the idle computation:
+        a crash loop instead of a bounded barrier. It is treated as absent: a fresh record,
+        a fresh window, exit 3 as on any first poll."""
+        rid = "RHAIRFE-1002"
+        self._assess([rid])
+        clock, pending = _Clock(), {rid}
+        _arm(monkeypatch, clock, pending)
+        record = {"sig": f"ASSESS|{rid}", "phase": "ASSESS", "done": 0}
+        if bad_ts != "missing":
+            record["last_progress_ts"] = bad_ts
+        ps._write_wave_progress(record)
+
+        with pytest.raises(SystemExit) as exc:
+            ps.cmd_wait_for_wave([])
+        assert exc.value.code == 3
+        out, lines = _stall_lines(capsys)
+        assert lines == [] and out == "Re-run: python3 scripts/pipeline_state.py wait-for-wave\n"
+        prog = ps._read_wave_progress()
+        assert prog == {
+            "sig": f"ASSESS|{rid}",
+            "phase": "ASSESS",
+            "last_progress_ts": clock.now() - POLL_SECS,  # the pre-poll clock: a fresh record
+            "done": 0,
+        }
+        assert not os.path.exists(f"artifacts/rfe-reviews/{rid}-review.md")
+
+    @pytest.mark.parametrize("bad_done", ["3", None, 2.5, False])
+    def test_tracker_done_is_coerced_to_an_int(self, stall_dir, monkeypatch, capsys, bad_done):
+        """A ``done`` that is not an int is read as 0, so the comparison never raises and the
+        worst case is one extra deadline reset (progress is counted from zero again)."""
+        rid = "RHAIRFE-1002"
+        self._assess([rid])
+        clock, pending = _Clock(), {rid}
+        _arm(monkeypatch, clock, pending)
+        stale_ts = clock.now() - 100
+        ps._write_wave_progress(
+            {
+                "sig": f"ASSESS|{rid}",
+                "phase": "ASSESS",
+                "last_progress_ts": stale_ts,
+                "done": bad_done,
+            }
+        )
+        with pytest.raises(SystemExit) as exc:
+            ps.cmd_wait_for_wave([])
+        assert exc.value.code == 3
+        prog = ps._read_wave_progress()
+        assert prog["done"] == 0 and isinstance(prog["done"], int)
+        assert prog["last_progress_ts"] == stale_ts  # no progress (0 -> 0): the deadline stands
+        assert prog["sig"] == f"ASSESS|{rid}"
+
+    # ----- an id no marker could be written for is never retired silently -----
+
+    def _drive_to_failure(self, max_calls=100):
+        """Re-run wait-for-wave on exit 3 until it exits with another code; return that code."""
+        for _ in range(max_calls):
+            try:
+                ps.cmd_wait_for_wave([])
+            except SystemExit as exc:
+                if exc.code == 3:
+                    continue
+                return exc.code
+            pytest.fail("wait-for-wave returned 0 although an escalation failed")
+        pytest.fail(f"wait-for-wave did not terminate within {max_calls} calls")
+
+    def test_review_class_escalation_failure_is_loud_and_leaves_the_id_in_place(
+        self, stall_dir, monkeypatch, capsys
+    ):
+        """The stub writer reports it could not write RHAIRFE-1003's stub. Before: the id was
+        removed from the wave and the ids file anyway, so with no marker on disk it vanished
+        from collect_recommendations --errors, error_collect and the report. Now: the sibling
+        whose stub landed is retired as before, the unrecorded id stays in both files, one
+        ESCALATION FAILED line names it and the command exits 1 instead of 0."""
+        import verify_phase
+
+        ids = ["RHAIRFE-1002", "RHAIRFE-1003"]
+        self._assess(ids)
+        monkeypatch.setenv("PIPELINE_WAVE_RETRY_CAP", "0")
+        clock, pending = _Clock(), set(ids)
+        _arm(monkeypatch, clock, pending)
+        real_writer, calls = verify_phase.write_error_stubs, []
+
+        def failing_writer(phase, ids, pipeline_type="rfe", **kw):
+            calls.append((phase, list(ids), kw.get("outcome")))
+            if "RHAIRFE-1003" in ids:
+                return list(ids)  # nothing written, no reason given
+            return real_writer(phase, ids, pipeline_type, **kw)
+
+        monkeypatch.setattr(verify_phase, "write_error_stubs", failing_writer)
+
+        assert self._drive_to_failure() == 1
+        err = capsys.readouterr().err.splitlines()
+        assert err == [
+            "wait-for-wave: STALL in ASSESS (assess+feasibility): no wave slot reached a"
+            " terminal state for 900s (window 900s, policy retry); escalating RHAIRFE-1002"
+            " (retry cap 0 reached) -> assess_stalled error-stub review, removed from the wave"
+            " and tmp/pipeline-active-ids.txt; escalation FAILED for RHAIRFE-1003 (retry cap 0"
+            " reached) (see next line)",
+            "wait-for-wave: ESCALATION FAILED for RHAIRFE-1003: no error marker could be"
+            " written; left in the wave and tmp/pipeline-active-ids.txt - fix the reviews"
+            " directory and re-run",
+        ]
+        assert calls == [
+            ("assess", ["RHAIRFE-1002"], "stalled"),
+            ("assess", ["RHAIRFE-1003"], "stalled"),
+        ]
+        from artifact_utils import read_frontmatter
+
+        data, _ = read_frontmatter("artifacts/rfe-reviews/RHAIRFE-1002-review.md")
+        assert data == _expected_stub("rfe", "RHAIRFE-1002", "assess_stalled")  # sibling marked
+        assert not os.path.exists("artifacts/rfe-reviews/RHAIRFE-1003-review.md")
+        assert read_ids(ps.WAVE_IDS_FILE) == ["RHAIRFE-1003"]  # left in the wave...
+        assert read_ids("tmp/pipeline-active-ids.txt") == ["RHAIRFE-1003"]  # ...and the ids file
+        assert not os.path.exists(ps.WAVE_PROGRESS_FILE)  # tracker cleared all the same
+        assert not os.path.exists("tmp/rfe-assess/single/RHAIRFE-1003.result.md")
+
+        # After the operator fixes the reviews directory, the re-run escalates it for real.
+        monkeypatch.setattr(verify_phase, "write_error_stubs", real_writer)
+        assert _drive() == 900 // POLL_SECS  # a fresh window, not an instant stall
+        _, lines = _stall_lines(capsys)
+        assert "escalating RHAIRFE-1003 (retry cap 0 reached) -> assess_stalled" in lines[0]
+        data, _ = read_frontmatter("artifacts/rfe-reviews/RHAIRFE-1003-review.md")
+        assert data == _expected_stub("rfe", "RHAIRFE-1003", "assess_stalled")
+        assert read_ids(ps.WAVE_IDS_FILE) == [] and read_ids("tmp/pipeline-active-ids.txt") == []
+
+    def test_revise_escalation_failure_carries_the_writers_reason(
+        self, stall_dir, monkeypatch, capsys
+    ):
+        """Both writers fail for real (the review path is a directory): update_frontmatter
+        raises, then frontmatter.py set and the replace both fail, and the ESCALATION FAILED
+        line carries the writer's reason. The marked sibling is retired; the other stays in
+        the wave and tmp/pipeline-revise-ids.txt and still shows up as an error nowhere, which
+        is exactly why the exit code is 1."""
+        ids = ["RHAIRFE-1001", "RHAIRFE-1002"]
+        ps._save_state(make_state(phase="REVISE", type="rfe", batch=1))
+        write_ids("tmp/pipeline-revise-ids.txt", ids)
+        write_ids("tmp/pipeline-active-ids.txt", ids)
+        write_ids("tmp/pipeline-all-ids.txt", ids)
+        write_ids(ps.WAVE_IDS_FILE, ids)
+        _write_review("RHAIRFE-1001")
+        os.makedirs("artifacts/rfe-reviews/RHAIRFE-1002-review.md")  # neither writer can win
+        clock, pending = _Clock(), set(ids)
+        _arm(monkeypatch, clock, pending)
+
+        assert self._drive_to_failure() == 1
+        err = capsys.readouterr().err.splitlines()
+        assert err[0].startswith("wait-for-wave: could not mark RHAIRFE-1002's review (")
+        assert err[0].endswith("replacing it with the revise error stub (error=revise_stalled)")
+        assert err[1].startswith(
+            "verify_phase: RHAIRFE-1002: no revise_stalled stub written: frontmatter.py set"
+            " failed ("
+        )
+        assert err[2] == (
+            "wait-for-wave: STALL in REVISE (revise): no wave slot reached a terminal state for"
+            " 1800s (window 1800s, policy escalate-only); escalating RHAIRFE-1001 ->"
+            " revise_stalled error (auto_revised untouched), removed from the wave and"
+            " tmp/pipeline-revise-ids.txt; escalation FAILED for RHAIRFE-1002 (see next line)"
+        )
+        assert err[3].startswith(
+            "wait-for-wave: ESCALATION FAILED for RHAIRFE-1002: no error marker could be"
+            " written (RHAIRFE-1002: frontmatter.py set failed ("
+        )
+        assert "and replacing the review frontmatter failed too (IsADirectoryError:" in err[3]
+        assert err[3].endswith(
+            "); left in the wave and tmp/pipeline-revise-ids.txt - fix the reviews directory"
+            " and re-run"
+        )
+        assert len(err) == 4
+        from artifact_utils import read_frontmatter
+
+        data, _ = read_frontmatter("artifacts/rfe-reviews/RHAIRFE-1001-review.md")
+        assert data["error"] == "revise_stalled" and data["score"] == 5  # sibling marked
+        assert read_ids(ps.WAVE_IDS_FILE) == ["RHAIRFE-1002"]
+        assert read_ids("tmp/pipeline-revise-ids.txt") == ["RHAIRFE-1002"]
+        assert read_ids("tmp/pipeline-active-ids.txt") == ids
+        assert not os.path.exists(ps.WAVE_PROGRESS_FILE)
+        assert os.path.isdir("artifacts/rfe-reviews/RHAIRFE-1002-review.md")  # untouched
+        # The barrier is NOT released for the phase: the id is still in the ids file.
+        config = ps._get_config(ps._load_state())["REVISE"]
+        assert not ps._check_agent_phase_complete(config)
+
+    def test_split_escalation_failure_writes_no_status_file_for_the_unrecorded_parent(
+        self, stall_dir, monkeypatch, capsys
+    ):
+        """Split path with the writers stubbed as the finding describes: update_frontmatter
+        raises for one parent and the stub writer returns it as failed. That parent gets no
+        no-split status file either (a status file would make its slot terminal and let the
+        next poll release it with no error recorded), stays in the wave and
+        tmp/pipeline-split-ids.txt, and the command exits 1. The sibling gets marker and
+        status file and is retired."""
+        import artifact_utils
+        import verify_phase
+
+        parents = ["RHAIRFE-1001", "RHAIRFE-1002"]
+        ps._save_state(make_state(phase="SPLIT", type="rfe", batch=1))
+        write_ids("tmp/pipeline-split-ids.txt", parents)
+        write_ids("tmp/pipeline-all-ids.txt", parents)
+        write_ids(ps.WAVE_IDS_FILE, parents)
+        for parent in parents:
+            _write_review(parent, recommendation="split")
+        clock, pending = _Clock(), set(parents)
+        _, real_check_id = _arm(monkeypatch, clock, pending)
+        real_update = artifact_utils.update_frontmatter
+
+        def update(path, updates, schema):
+            if "RHAIRFE-1002" in path:
+                raise OSError("read-only reviews directory")
+            return real_update(path, updates, schema)
+
+        def writer(phase, ids, pipeline_type="rfe", **kw):
+            failures = kw.get("failures")
+            if failures is not None:
+                for rid in ids:
+                    failures[rid] = "frontmatter.py set failed (read-only reviews directory)"
+            return list(ids)
+
+        monkeypatch.setattr(artifact_utils, "update_frontmatter", update)
+        monkeypatch.setattr(verify_phase, "write_error_stubs", writer)
+
+        assert self._drive_to_failure() == 1
+        err = capsys.readouterr().err.splitlines()
+        assert err == [
+            "wait-for-wave: could not mark RHAIRFE-1002's review (read-only reviews directory);"
+            " replacing it with the split error stub (error=split_not_attempted: wave stalled in"
+            " SPLIT: no agent reached a terminal state for 1800s (window 1800s); the subagent"
+            " produced no output)",
+            "wait-for-wave: STALL in SPLIT (split): no wave slot reached a terminal state for"
+            " 1800s (window 1800s, policy escalate-only); escalating RHAIRFE-1001 ->"
+            " split_not_attempted error + no-split status file, removed from the wave and"
+            " tmp/pipeline-split-ids.txt; escalation FAILED for RHAIRFE-1002 (see next line)",
+            "wait-for-wave: ESCALATION FAILED for RHAIRFE-1002: no error marker could be"
+            " written (RHAIRFE-1002: frontmatter.py set failed (read-only reviews directory));"
+            " left in the wave and tmp/pipeline-split-ids.txt - fix the reviews directory and"
+            " re-run",
+        ]
+        from artifact_utils import read_frontmatter
+
+        data, _ = read_frontmatter("artifacts/rfe-reviews/RHAIRFE-1001-review.md")
+        assert data["error"].startswith("split_not_attempted: wave stalled in SPLIT")
+        assert os.path.exists("artifacts/rfe-reviews/RHAIRFE-1001-split-status.yaml")
+        assert real_check_id("split", "RHAIRFE-1001") == "completed"
+        data, _ = read_frontmatter("artifacts/rfe-reviews/RHAIRFE-1002-review.md")
+        assert data.get("error") is None  # untouched: no marker, no claim
+        assert not os.path.exists("artifacts/rfe-reviews/RHAIRFE-1002-split-status.yaml")
+        assert real_check_id("split", "RHAIRFE-1002") == "pending"  # the slot stays pending
+        assert read_ids(ps.WAVE_IDS_FILE) == ["RHAIRFE-1002"]
+        assert read_ids("tmp/pipeline-split-ids.txt") == ["RHAIRFE-1002"]
+        assert not os.path.exists(ps.WAVE_PROGRESS_FILE)
+        assert not os.listdir("artifacts/rfe-tasks")
+
+    def test_split_marker_return_shape_names_the_unrecorded_parents(self, stall_dir, monkeypatch):
+        """Unit view of the contract _escalate_stuck relies on: both markers return their
+        label and ``id -> reason`` for the ids they could not mark; a writer that gives no
+        reason yields None."""
+        import verify_phase
+
+        monkeypatch.setattr(
+            verify_phase, "write_error_stubs", lambda phase, ids, *a, **kw: list(ids)
+        )
+        _write_review("RHAIRFE-1001")
+        label, failures = ps._mark_revise_stalled(["RHAIRFE-1001", "RHAIRFE-1002"], "rfe")
+        assert label == "revise_stalled" and failures == {"RHAIRFE-1002": None}
+        label, failures = ps._mark_split_not_attempted(["RHAIRFE-1003"], "rfe", "test")
+        assert label == "split_not_attempted" and failures == {"RHAIRFE-1003": None}
+        assert not os.path.exists("artifacts/rfe-reviews/RHAIRFE-1003-split-status.yaml")
