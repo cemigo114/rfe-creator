@@ -5,6 +5,8 @@ import copy
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
 import generate_review_pdf
@@ -442,6 +444,7 @@ def test_report_config_escapes_descriptor_display_strings():
         id_field = "x_id"
         write_prefix = "X-"
         local_prefix = "LX-"
+        key_prefixes = ["X-"]
 
         def dirs(self, form="artifacts"):
             return {"reviews": "x-reviews", "tasks": "x-tasks", "originals": "x-originals"}
@@ -469,3 +472,234 @@ def test_report_config_escapes_descriptor_display_strings():
     # Shipped values are unchanged by escaping.
     for name in ("rfe", "initiative"):
         assert grp.REPORT_CONFIG[name]["entity_name"] in ("RFE", "Initiative")
+
+
+# ── id classification (PR-3c): descriptor predicates, tracker_ref from the artifact ──────────
+
+
+def _union_rfe_config():
+    """REPORT_CONFIG entry for an rfe descriptor whose tracker declares a read prefix too."""
+    registry = type_registry.load(extra_roots=[], env={})
+    data = copy.deepcopy(registry.get("rfe").data)
+    data["identity"]["jira"]["key_prefixes"] = ["RHAIRFE-", "RHAIOLD-"]
+    return generate_review_pdf._report_config(type_registry.Descriptor("rfe", data))
+
+
+class TestIdPredicates:
+    @pytest.mark.parametrize(
+        "type_name, tracker, local, foreign",
+        [
+            ("rfe", "RHAIRFE-1595", "RFE-001", "RHOAIENG-1"),
+            ("initiative", "RHOAIENG-12345", "INIT-001", "RHAIRFE-1"),
+        ],
+    )
+    def test_shipped_types(self, type_name, tracker, local, foreign):
+        cfg = REPORT_CONFIG[type_name]
+        assert generate_review_pdf._is_tracker_key(tracker, cfg)
+        assert not generate_review_pdf._is_tracker_key(local, cfg)
+        assert not generate_review_pdf._is_tracker_key(foreign, cfg)
+        # Same-family (a split parent_key): the descriptor's own ladder — local ids included.
+        assert cfg["desc"].owns(tracker) and cfg["desc"].owns(local)
+        assert not cfg["desc"].owns(foreign)
+        # The strategy rollup an initiative's parent_key may carry is neither.
+        assert not generate_review_pdf._is_tracker_key("RHAISTRAT-42", cfg)
+        assert not cfg["desc"].owns("RHAISTRAT-42")
+
+    def test_local_id_parity_rung(self):
+        """A malformed local id stays with its type (Descriptor.owns' parity rung), so a
+        split child whose parent_key is malformed still files under its parent."""
+        assert REPORT_CONFIG["initiative"]["desc"].owns("INIT-x")
+        assert REPORT_CONFIG["rfe"]["desc"].owns("RFE-x")
+
+    @pytest.mark.parametrize("value", ["", None])
+    def test_empty_matches_nothing(self, value):
+        cfg = REPORT_CONFIG["rfe"]
+        assert not generate_review_pdf._is_tracker_key(value, cfg)
+        assert not cfg["desc"].owns(value)
+
+    def test_tracker_key_is_the_prefix_union(self):
+        cfg = _union_rfe_config()
+        assert cfg["key_prefixes"] == ("RHAIRFE-", "RHAIOLD-")
+        assert cfg["jira_prefix"] == "RHAIRFE-"  # the pinned write-prefix key stays
+        assert generate_review_pdf._is_tracker_key("RHAIOLD-7", cfg)
+        assert cfg["desc"].owns("RHAIOLD-7")
+        assert not generate_review_pdf._is_tracker_key("RHAIOLD-7", REPORT_CONFIG["rfe"])
+
+    def test_config_projection_carries_the_identity_inputs(self):
+        registry = type_registry.load(extra_roots=[], env={})
+        for name, cfg in REPORT_CONFIG.items():
+            desc = registry.get(name)
+            assert cfg["key_prefixes"] == tuple(desc.key_prefixes)
+            assert isinstance(cfg["desc"], type_registry.Descriptor)
+            assert (cfg["desc"].name, cfg["desc"].path) == (name, desc.path)
+
+
+class TestTrackerRefOfAnItem:
+    def test_frontmatter_value_wins(self):
+        item = {"rfe_id": "RFE-002", "tracker_ref": "RHAIRFE-2002", "_config": REPORT_CONFIG["rfe"]}
+        assert generate_review_pdf._tracker_ref(item) == "RHAIRFE-2002"
+
+    def test_legacy_tracker_key_links_to_itself(self):
+        item = {"rfe_id": "RHAIRFE-1595", "tracker_ref": None, "_config": REPORT_CONFIG["rfe"]}
+        assert generate_review_pdf._tracker_ref(item) == "RHAIRFE-1595"
+
+    def test_legacy_local_id_has_nothing_to_link(self):
+        item = {"rfe_id": "RFE-001", "tracker_ref": None, "_config": REPORT_CONFIG["rfe"]}
+        assert generate_review_pdf._tracker_ref(item) is None
+
+    def test_read_prefix_key_links_under_the_union(self):
+        item = {"rfe_id": "RHAIOLD-7", "tracker_ref": None, "_config": _union_rfe_config()}
+        assert generate_review_pdf._tracker_ref(item) == "RHAIOLD-7"
+
+    @pytest.mark.parametrize("bad", [["RHAIRFE-1"], 5, "", 0, {"k": "v"}, True])
+    def test_a_non_string_or_empty_value_is_not_a_reference(self, bad):
+        # The task frontmatter is read unvalidated: only a non-empty str is a reference;
+        # anything else falls through to the id rule instead of being put into a URL.
+        key = {"rfe_id": "RHAIRFE-1595", "tracker_ref": bad, "_config": REPORT_CONFIG["rfe"]}
+        assert generate_review_pdf._tracker_ref(key) == "RHAIRFE-1595"
+        local = {"rfe_id": "RFE-001", "tracker_ref": bad, "_config": REPORT_CONFIG["rfe"]}
+        assert generate_review_pdf._tracker_ref(local) is None
+
+
+def _task(root, type_name, item_id, title="T", status="Ready", extra=""):
+    dirs = REPORT_CONFIG[type_name]
+    path = root / dirs["tasks_dir"] / f"{item_id}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"---\n{dirs['id_field']}: {item_id}\ntitle: {title}\npriority: Major\n"
+        f"status: {status}\n{extra}---\n\nBody.\n",
+        encoding="utf-8",
+    )
+
+
+def _review(root, type_name, item_id, recommendation="submit"):
+    dirs = REPORT_CONFIG[type_name]
+    path = root / dirs["reviews_dir"] / f"{item_id}-review.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    scores = "".join(f"  {k}: 2\n" for k in dirs["criterion_keys"])
+    path.write_text(
+        f"---\n{dirs['id_field']}: {item_id}\nscore: 10\npass: true\n"
+        f"recommendation: {recommendation}\nfeasibility: feasible\nauto_revised: false\n"
+        f"needs_attention: false\nscores:\n{scores}---\n\nFeedback.\n",
+        encoding="utf-8",
+    )
+
+
+def _render(tmp_path, monkeypatch, type_name):
+    root = tmp_path / "artifacts"
+    (root / REPORT_CONFIG[type_name]["originals_dir"]).mkdir(parents=True, exist_ok=True)
+    out = tmp_path / "report.html"
+    monkeypatch.setenv("JIRA_SERVER", "https://jira.example/")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "generate_review_pdf.py",
+            "--artifacts-dir",
+            str(root),
+            "--output",
+            str(out),
+            "--type",
+            type_name,
+        ],
+    )
+    generate_review_pdf.main()
+    return out.read_text(encoding="utf-8")
+
+
+def _link(ref, text):
+    return (
+        f'<a href="https://jira.example/browse/{ref}" target="_blank" class="jira-link" '
+        f'title="Open in Jira">{text} &#x1F517;</a>'
+    )
+
+
+class TestReportLinksAndSplitClassification:
+    """End to end through main(): legacy and stamped fixtures, both types."""
+
+    def test_rfe_legacy_and_stamped(self, tmp_path, monkeypatch):
+        root = tmp_path / "artifacts"
+        # Legacy Jira key: links to itself. Legacy local id: no link.
+        _task(root, "rfe", "RHAIRFE-1595", status="Archived")
+        _review(root, "rfe", "RHAIRFE-1595", recommendation="split")
+        _task(root, "rfe", "RFE-001")
+        _review(root, "rfe", "RFE-001")
+        # Stamped local id carrying tracker_ref: the link goes to the ticket, the text is the id.
+        _task(root, "rfe", "RFE-002", extra="type: rfe\ntracker_ref: RHAIRFE-2002\n")
+        _review(root, "rfe", "RFE-002")
+        # Stamped Jira key: links to its own tracker_ref.
+        _task(root, "rfe", "RHAIRFE-3003", extra="type: rfe\ntracker_ref: RHAIRFE-3003\n")
+        _review(root, "rfe", "RHAIRFE-3003")
+        # Split child of the legacy parent (same-family parent_key -> split child).
+        _task(root, "rfe", "RFE-003", extra="parent_key: RHAIRFE-1595\n")
+        _review(root, "rfe", "RFE-003")
+
+        html = _render(tmp_path, monkeypatch, "rfe")
+
+        assert _link("RHAIRFE-1595", "RHAIRFE-1595") in html
+        assert _link("RHAIRFE-2002", "RFE-002") in html
+        assert _link("RHAIRFE-3003", "RHAIRFE-3003") in html
+        assert "browse/RFE-001" not in html
+        assert "browse/RFE-002" not in html
+        assert "browse/RFE-003" not in html
+        assert "New RFEs from Splits (1)" in html
+
+    def test_a_non_string_tracker_ref_falls_back_to_the_id_rule(self, tmp_path, monkeypatch):
+        """A hand-edited task file may carry `tracker_ref: [x]` or `tracker_ref: 5`; the
+        report neither raises on it nor links to it — the id rule decides, as for an
+        artifact without the field (a tracker key links to itself, a local id has no link)."""
+        root = tmp_path / "artifacts"
+        _task(root, "rfe", "RHAIRFE-4004", extra="type: rfe\ntracker_ref: [x]\n")
+        _review(root, "rfe", "RHAIRFE-4004")
+        _task(root, "rfe", "RFE-005", extra="type: rfe\ntracker_ref: 5\n")
+        _review(root, "rfe", "RFE-005")
+        _task(root, "rfe", "RFE-006", extra="tracker_ref: [x]\n")
+        _review(root, "rfe", "RFE-006")
+        _task(root, "rfe", "RHAIRFE-7007", extra="tracker_ref: 7\n")
+        _review(root, "rfe", "RHAIRFE-7007")
+
+        html = _render(tmp_path, monkeypatch, "rfe")
+
+        assert _link("RHAIRFE-4004", "RHAIRFE-4004") in html
+        assert _link("RHAIRFE-7007", "RHAIRFE-7007") in html
+        assert "browse/RFE-005" not in html and "browse/RFE-006" not in html
+        for junk in ("browse/5", "browse/7", "browse/[", "browse/x"):
+            assert junk not in html, junk
+
+    def test_initiative_rollup_is_not_a_split(self, tmp_path, monkeypatch):
+        root = tmp_path / "artifacts"
+        # The RHAISTRAT Outcome rollup is not a split parent: no split section.
+        _task(root, "initiative", "INIT-001", extra="parent_key: RHAISTRAT-42\n")
+        _review(root, "initiative", "INIT-001")
+        # A stamped initiative links to its tracker_ref; a legacy key links to itself.
+        _task(
+            root,
+            "initiative",
+            "INIT-002",
+            extra="type: initiative\ntracker_ref: RHOAIENG-777\n",
+        )
+        _review(root, "initiative", "INIT-002")
+        _task(root, "initiative", "RHOAIENG-12345")
+        _review(root, "initiative", "RHOAIENG-12345")
+
+        html = _render(tmp_path, monkeypatch, "initiative")
+
+        assert "from Splits" not in html
+        assert _link("RHOAIENG-777", "INIT-002") in html
+        assert _link("RHOAIENG-12345", "RHOAIENG-12345") in html
+        assert "browse/INIT-001" not in html
+        assert "browse/RHAISTRAT-42" not in html
+
+    def test_initiative_same_family_parent_is_a_split(self, tmp_path, monkeypatch):
+        root = tmp_path / "artifacts"
+        _task(root, "initiative", "RHOAIENG-100", status="Archived")
+        _review(root, "initiative", "RHOAIENG-100", recommendation="split")
+        _task(root, "initiative", "INIT-003", extra="parent_key: RHOAIENG-100\n")
+        _review(root, "initiative", "INIT-003")
+        _task(root, "initiative", "INIT-004", extra="parent_key: INIT-003\n")
+        _review(root, "initiative", "INIT-004")
+
+        html = _render(tmp_path, monkeypatch, "initiative")
+
+        assert "New Initiatives from Splits (1)" in html
+        assert "Re-split Intermediaries (1)" in html

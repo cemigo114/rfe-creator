@@ -73,7 +73,7 @@ itself is fine — `resolve()` follows the link).
 
 | Script | Registry it read from the descriptor | Status |
 |---|---|---|
-| `artifact_utils.py` | `SCHEMAS` (`<type>-task` / `<type>-review` per type), `scan_tasks` / `scan_reviews` / `rename_to_tracker_key` / `parse_child` generics over a `Descriptor` (the per-type names are wrappers), `detect()` in `find_review_file` / `find_removed_context_yaml` | PR-2b; name-keyed until PR-3: the rename error label, rfe's slug-tolerant review lookup and `parse_child`'s rfe markdown fallbacks; the `rfes.md` index contract stays literal (`index.enabled`) |
+| `artifact_utils.py` | `SCHEMAS` (`<type>-task` / `<type>-review` per type), `scan_tasks` / `scan_reviews` / `rename_to_tracker_key` / `parse_child` generics over a `Descriptor` (the per-type names are wrappers); the id-only routers `find_review_file` / `find_removed_context_yaml` go through `_type_for`, which uses `candidates()` — one non-provisional candidate wins, an ambiguous or provisional id probes `dirs.tasks/<id>.md` for the `type:` it declares, else `detect()`-or-rfe; `find_task_file_including_archived` has a descriptor form (`desc=`) whose ownership test is `owns()` | PR-2b; PR-3c (1/3): `type` / `tracker_ref` on every base schema, `rename_to_tracker_key` stamps them on the files it rewrites and the readers above ("Self-describing artifacts" below); the id-only routers keep the rfe fallback in interactive and headless runs alike for now; name-keyed until the rest of PR-3: the rename error label, rfe's slug-tolerant review lookup and `parse_child`'s rfe markdown fallbacks; the `rfes.md` index contract stays literal (`index.enabled`) |
 | `batch_summary.py` | `_TYPE_CONFIG` (dirs view of `generate_run_report.TYPE_CONFIG`), `--type` choices | PR-2a |
 | `bootstrap_snapshot.py` | `BOOTSTRAP_CONFIG` (`snapshot.report_prefix`, `reporting.item_key`), `--type` choices | PR-2c; the `issue-snapshot-` run-dir probe (`_run_dir_has_snapshots`) reads the rfe descriptor's `snapshot.prefix` and stays rfe-only for every `--type` (grandfathered; the per-type probe is a deliberate follow-up, design §10 PR-10) |
 | `check_conflicts.py` | `_TYPE_CONFIG`, `--type` choices; task scan via `artifact_utils.scan_tasks(desc)` | PR-2a, PR-2b; `startswith(jira_prefix)` → prefix-union pending |
@@ -83,11 +83,11 @@ itself is fine — `resolve()` follows the link).
 | `collect_children.py` | `id_field`, `--type` choices; task scan via `artifact_utils.scan_tasks(desc)` | PR-2a, PR-2b |
 | `collect_recommendations.py` | `_review_dir`, `--type` choices | PR-2a |
 | `error_collect.py` | `_TYPE_CONFIG`, `--type` choices | PR-2a |
-| `fetch_issue.py` | `--fetch-all` layout (`dirs.{tasks,originals}`, `identity.id_field`, the comments companion and its request gated on `companions.comments`), new `--type` (registry choices, default `rfe`; the no-`--type` invocation is byte-identical) | PR-2c; `status=Ready` and the `Major` priority fallback stay literal (shared pipeline vocabulary, not type facts) |
+| `fetch_issue.py` | `--fetch-all` layout (`dirs.{tasks,originals}`, `identity.id_field`, the comments companion and its request gated on `companions.comments`), new `--type` (registry choices, default `rfe`; the no-`--type` invocation is byte-identical) | PR-2c; PR-3c (1/3): `--fetch-all` appends `type:` and `tracker_ref:` to the task file it writes; `status=Ready` and the `Major` priority fallback stay literal (shared pipeline vocabulary, not type facts) |
 | `filter_for_revision.py` | prefix sniff → `detect()` | PR-2a |
-| `frontmatter.py` | `_detect_schema_type` path table (`_SCHEMA_BY_DIR`), `schema` / `--schema-type` choices through `SCHEMAS` | PR-2b |
-| `generate_review_pdf.py` | `REPORT_CONFIG`, `--type` choices | PR-2a |
-| `generate_run_report.py` | `TYPE_CONFIG` (`scan_tasks` bound to `artifact_utils.scan_tasks(desc)`), `--type` choices | PR-2a, PR-2b; the `tracker_ref`/role predicates pending (PR-3) |
+| `frontmatter.py` | `_detect_schema_type` path table (`_SCHEMA_BY_DIR`), `schema` / `--schema-type` choices through `SCHEMAS`; frontmatter `type:` chooses the schema when present, the path table is the fallback; `set` refuses an explicit `--schema-type` (or `type=`) that contradicts a known directory's type | PR-2b; PR-3c (1/3) |
+| `generate_review_pdf.py` | `REPORT_CONFIG`, `--type` choices; the Jira link target is the task's `tracker_ref:` (key-prefix-union fallback for pre-migration artifacts) and the split-child predicate is `Descriptor.owns` | PR-2a; PR-3c (1/3) |
+| `generate_run_report.py` | `TYPE_CONFIG` (`scan_tasks` bound to `artifact_utils.scan_tasks(desc)`), `--type` choices | PR-2a, PR-2b; PR-3c (1/3): `tracker_ref`/`role` projected from frontmatter, prefix-union fallback for pre-migration artifacts; the `binding:` key pending (later PR-3c) |
 | `jql_query.py` | default exclusion wrapper, `--project` choices | PR-2a |
 | `next_rfe_id.py` | `DEFAULT_PREFIX` / `DEFAULT_DIR` (`type_defaults(desc)`); `--from-batch` reads the file through `type_registry.read_batch` and decides the type through `resolve` — the `{type, items}` mapping form takes prefix and directory from its type's descriptor, the legacy list keeps the rfe defaults | PR-2a; PR-3b (batch forms) |
 | `prep_assess.py` | prefix sniff → `detect()` | PR-2a |
@@ -98,13 +98,13 @@ itself is fine — `resolve()` follows the link).
 | `split_submit.py` | `SPLIT_CONFIG` (descriptor projection over `names()`: `identity.jira.{project,issue_type}`, `conventions.{comment_prefix,label_prefix}`, `display.{entity,entity_plural}`, `id_field`, `dirs`, `index.enabled`, alignment labels; `scan_fn` / `rename_fn` / `parse_child_fn` bound to the `artifact_utils` generics, `find_review_fn` = `find_review_file`), the split link type and the close-superseded transition / resolution from `identity.jira.{split_link_type,state_map.close_superseded}`, `--type` choices | PR-2d; the feasibility set, the split-child marker and every phase label are still composed from `conventions.label_prefix`; the durable-store comment grammar and the `<PROJECT>-DRY` sentinel are composition, pinned by source form |
 | `submit.py` | `TYPE_CONFIGS` (descriptor projection over `names()`), `--type` choices, task scan / rename via `artifact_utils.scan_tasks` / `rename_to_tracker_key(desc)`, approve target from `identity.jira.state_map.approved` | PR-2d; grandfathered: the rfe `snapshot_prefix` `''` sentinel and the `split_type_arg` / report `--type` argv convention (no `--type` for rfe); the `auto-created` / `auto-revised` / `needs-attention` / `split-quarantine` labels are still composed from `conventions.label_prefix` |
 | `validate_batch_input.py` | `ALLOWED_PRIORITIES` / `KNOWN_FIELDS` / `PARENT_KEY_PATTERN` per type (`schema.task.priority.enum`, base ∪ `batch.extra_fields`, `Descriptor.parent_key_pattern` — the task schema's join, Q14 reconciled), `--type` choices; the batch root through `type_registry.read_batch`, the type through `resolve` | PR-2a; PR-3b (batch forms, per-type rules) |
-| `verify_phase.py` | phase tables, `_TYPE_CONFIG`, error-stub score tail, `--type` choices | PR-2a |
+| `verify_phase.py` | phase tables, `_TYPE_CONFIG`, error-stub score tail, `--type` choices; the error stub carries `type=<t>` and review files are stamped `type:` after the review barrier (D8) as one appended line (`artifact_utils.append_frontmatter_field`, never a `frontmatter.py set` re-dump) | PR-2a; PR-3c (1/3) |
 | `check_autofix_complete.py` | `--type` validated through `type_registry.parse_type_arg` (unknown → exit 2 with the registered list); `_TYPE_CONFIG` literal, pinned | PR-3a (validation); table pending |
 | `check_content_preservation.py` | inline dir branch | pending |
 | `cleanup_partial_split.py` | inline dir branch | pending |
 | `compare_review_outputs.py` | `_TYPE_CONFIG` | pending |
 | `jira_utils.py` | `strip_metadata` prefix regex | pending |
-| `pipeline_state.py` | `init --type` choices = `_TYPES.choices()` (unknown → argparse exit 2 with the registered list); `PIPELINE_TYPES` literal, pinned (prompt/skill entries move in PR-5) | PR-3a (choices); table pending |
+| `pipeline_state.py` | `init --type` choices = `_TYPES.choices()` (unknown → argparse exit 2 with the registered list); `PIPELINE_TYPES` literal, pinned (prompt/skill entries move in PR-5) | PR-3a (choices); table pending — the dispatch entries are untouched by PR-3c |
 
 ## Adding a type
 
@@ -302,6 +302,49 @@ The rules are `resolve`'s, so the two scripts cannot drift from the ladder:
 
 The speedrun bodies keep the list-form example (the eval harness feeds that form) and describe the
 mapping form in prose right after it.
+
+### Self-describing artifacts (PR-3c)
+
+New artifacts name their type. Every writer that mints a **task** file appends `type: <t>` (the
+descriptor's `type`) after the writer's explicit fields: the two create skills, the two split agents
+(children only; the archived parent is rewritten with `status: Archived` alone), `fetch_issue.py
+--fetch-all` and the two MCP fetch fallbacks in the fetch-agent prompts — which also append
+`tracker_ref: <KEY>`, the canonical remote reference — and the error stubs (`verify_phase.py`'s and
+the orchestrator-written twins in the review and split skill bodies, which carry the same
+`type=<t>`). "Appended" is the writer's argument order, not a promise about the last line on disk:
+on a freshly created file the schema defaults the CLI materializes (`local_id`, `parent_key`,
+`original_labels`, `size`) follow it, and a fetch appends `tracker_ref:` after it; the D8 review
+stamp and the rename stamp on an existing file are the ones that land truly last.
+`artifact_utils.rename_to_tracker_key` stamps `tracker_ref:` (and `type:` when absent) on the task
+and review files it already rewrites at submit time, and refuses the whole rename — before any
+file is touched — when either of them declares another type. **Review** files are stamped `type:`
+by `verify_phase.py` after the review barrier, deterministically (D8) — not by the review-agent or
+revise-agent prompts, so an interactive review stays unstamped and every reader tolerates that.
+That stamp is a pure append (`artifact_utils.append_frontmatter_field`: the one `type: <t>` line
+is inserted before the closing `---`, every other byte kept) rather than a `frontmatter.py set`,
+whose re-dump would also materialize defaults, rename `revised` and re-wrap long strings on a
+review of an older schema vintage; a review the schema rejects in another field is left unstamped,
+and an id whose review path would resolve outside the reviews directory is failed, never stamped.
+Rules (D7): new artifacts only — there is no back-fill pass; fields are appended in the writer's
+order and never reordered; a pre-migration artifact stays byte-identical until a writer rewrites it
+anyway, and `frontmatter.py set` / the `artifact_utils` writers add neither field to a file that
+lacks them unless the caller sets them. Readers that use the fields fall back to today's behaviour
+when they are absent: `frontmatter.py` takes the schema from `type:` when present (a type that
+disagrees with the artifact's directory is loud, and `set` refuses to write one — under a known
+directory an explicit `--schema-type`, or the `type=` it admits, must name the directory's type)
+and from the path table otherwise; the id-only routers (`artifact_utils.find_review_file` /
+`find_removed_context_yaml`, through `_type_for`) decide by `TypeRegistry.candidates()` — one
+non-provisional candidate wins without touching the disk, an ambiguous or provisional id probes
+each candidate's `dirs.tasks/<id>.md` for the `type:` it declares (an unparseable or unreadable
+file is no signal), else `detect()`-or-rfe — and `find_task_file_including_archived` has a
+descriptor form whose ownership test is `owns()`; `tracker_ref` is read from frontmatter, never
+re-derived from an id prefix, with key-prefix-union membership as the fallback for pre-migration
+artifacts (`generate_run_report.py`'s `tracker_ref`/`role`, the review PDF's predicates). The
+id-only routers keep the rfe fallback in both interactive and headless runs for now: the
+headless-fails-loudly rule of D5 lives in `resolve()`, and wiring `resolve` into the writers is
+PR-3c-iii. Post-fetch `(project, issue_type)` verification, the initiative fetch
+agent's switch to `fetch_issue.py`, the `is_existing := tracker_ref` redefinition, the writers'
+effective binding and the run report's `binding:` key are the later PR-3c PRs.
 
 ## Lint gates (§3.3)
 

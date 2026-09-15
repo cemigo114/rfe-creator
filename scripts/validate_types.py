@@ -377,8 +377,12 @@ def build_error_stub(desc, phase=ERROR_STUB_PHASE):
     Field for field: `<id_field>=<id>`, `error=<phase>_failed`, `score=0`,
     `pass=false`, `recommendation=revise`, `feasibility=feasible`,
     `auto_revised=false`, `needs_attention=true`,
-    `needs_attention_reason=Agent failed: <phase>_failed`, then one
-    `scores.<f>=0` per score field (verify_phase.py:46-52 / :59-65).
+    `needs_attention_reason=Agent failed: <phase>_failed`, one
+    `scores.<f>=0` per score field (verify_phase.py:46-52 / :59-65), then
+    `type=<type name>` — the self-describing field every new artifact carries
+    (PR-3c), appended after the writer's explicit fields (on disk the schema
+    defaults the CLI materializes follow it; tests/test_validate_types.py pins
+    this dict to verify_phase._stub_record field for field, in order).
     """
     id_field = _opt(desc, "identity.id_field")
     local_prefix = _opt(desc, "identity.local_prefix") or ""
@@ -388,6 +392,7 @@ def build_error_stub(desc, phase=ERROR_STUB_PHASE):
     stub.update(ERROR_STUB_CONSTANTS)
     stub["needs_attention_reason"] = f"Agent failed: {error_msg}"
     stub["scores"] = {f: 0 for f in score_fields}
+    stub["type"] = desc.name
     return stub
 
 

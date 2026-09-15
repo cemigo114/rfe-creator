@@ -705,6 +705,12 @@ class TestPerTypeGate:
             assert stub[key] == value
         assert [f"scores.{f}=0" for f in desc.score_fields] == tc["score_fields"]
         assert stub["scores"] == {f: 0 for f in desc.score_fields}
+        # PR-3c: the self-describing `type` is the last stub field (D7: appended, never
+        # reordered), and the validator's stub equals verify_phase's replace-path record
+        # field for field, in order — the two writers and gate 1 describe one stub.
+        assert stub["type"] == name and list(stub)[-1] == "type"
+        record = verify_phase._stub_record(stub[tc["id_field"]], "assess_failed", name)
+        assert record == stub and list(record) == list(stub)
         assert tc["review_schema"] == f"{name}-review"
         assert tc["reviews_dir"] == desc.dirs()["reviews"]
         assert tc["id_field"] == desc.id_field

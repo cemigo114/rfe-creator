@@ -109,7 +109,8 @@ python3 scripts/frontmatter.py set artifacts/initiatives/<child_filename>.md \
     title="<child_title>" \
     priority=<priority> \
     status=Draft \
-    parent_key={ID}
+    parent_key={ID} \
+    type=initiative
 ```
 
 7. Archive the original:

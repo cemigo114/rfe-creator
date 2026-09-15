@@ -5,10 +5,12 @@ design-proposals/work-item-types-unified.md §10 item 2 ("fetch_issue.py --fetch
 type-aware"): the task and original directories (``dirs.tasks`` / ``dirs.originals``), the
 frontmatter id field (``identity.id_field``) and whether a ``<KEY>-comments.md`` companion is
 produced (``companions.comments``) are read from the selected type's descriptor. ``--type`` is
-additive: the rfe invocation every skill issues today (no ``--type``) is byte-identical to the
-pre-registry script — the golden bytes below were captured on main c1df503 and are literals on
-purpose. The priority fallback ``Major`` and ``status=Ready`` are shared pipeline conventions,
-not type facts, and stay literal in the script.
+additive: the rfe invocation every skill issues today (no ``--type``) writes the pre-registry
+bytes captured on main c1df503 (literals on purpose) plus, since PR-3c (design §5
+self-describing artifacts), the two appended frontmatter lines ``type: <type>`` and
+``tracker_ref: <KEY>`` — a fetched task is a NEW artifact, and D7 appends, never reorders.
+The priority fallback ``Major`` and ``status=Ready`` are shared pipeline conventions, not type
+facts, and stay literal in the script.
 
 Unit tests monkeypatch the two Jira reads; the last class drives the script as a subprocess
 against the jira-emulator (``jira`` fixture, tests/conftest.py).
@@ -112,10 +114,17 @@ COMMENTS = [
 ]
 
 # Captured on main c1df503 by running _fetch_all over ISSUE/COMMENTS (no --type existed).
+# PR-3c (design §5 self-describing artifacts, D7): the fetched task is a NEW artifact, so the
+# golden gains exactly two lines, `type: rfe` and `tracker_ref: RHAIRFE-1595`, appended after
+# the pre-3c fields (the schema defaults still trail them); nothing else moved.
+STAMP_LINES = b"type: rfe\ntracker_ref: RHAIRFE-1595\n"
 GOLDEN_TASK = (
     b"---\nrfe_id: RHAIRFE-1595\ntitle: Add model registry export to S3-compatible storage\n"
     b"priority: Major\nstatus: Ready\noriginal_labels:\n- rfe-creator-autofix-rubric-pass\n"
-    b"- customer-request\nlocal_id: null\nsize: null\nparent_key: null\n---\n" + DESC_MD.encode()
+    b"- customer-request\n"
+    + STAMP_LINES
+    + b"local_id: null\nsize: null\nparent_key: null\n---\n"
+    + DESC_MD.encode()
 )
 GOLDEN_ORIGINAL = DESC_MD.encode()
 GOLDEN_COMMENTS = (
@@ -261,6 +270,7 @@ class TestInitiativeLayout:
         assert data["priority"] == "Major"  # fallback: the issue carries no priority
         assert data["status"] == "Ready"
         assert data["original_labels"] is None  # no labels -> null, as for rfe
+        assert (data["type"], data["tracker_ref"]) == ("initiative", "RHOAIENG-12345")
         assert body == DESC_MD
         assert original.read_bytes() == GOLDEN_ORIGINAL
 
@@ -272,8 +282,9 @@ class TestInitiativeLayout:
         assert (tmp_path / "initiatives" / "RHOAIENG-12345.md").read_bytes() == (
             b"---\ninitiative_id: RHOAIENG-12345\n"
             b"title: Add model registry export to S3-compatible storage\n"
-            b"priority: Major\nstatus: Ready\noriginal_labels: null\nlocal_id: null\n"
-            b"parent_key: null\n---\n" + DESC_MD.encode()
+            b"priority: Major\nstatus: Ready\noriginal_labels: null\n"
+            b"type: initiative\ntracker_ref: RHOAIENG-12345\n"
+            b"local_id: null\nparent_key: null\n---\n" + DESC_MD.encode()
         )
 
     def test_cli_type_initiative(self, tmp_path, monkeypatch, fake_jira):
@@ -320,6 +331,11 @@ class TestLayoutIsTheDescriptorProjection:
         data, _ = read_frontmatter(str(task))
         assert list(data)[0] == desc.id_field
         assert data[desc.id_field] == key
+        # The self-describing pair follows the pre-3c fields directly (before the schema
+        # defaults frontmatter.py appends): type name, then the key the task was fetched from.
+        keys = list(data)
+        assert keys[keys.index("original_labels") + 1 :][:2] == ["type", "tracker_ref"]
+        assert (data["type"], data["tracker_ref"]) == (type_name, key)
         assert (fake_jira["comments"] == [key]) is bool(desc.get("companions.comments"))
 
 
@@ -376,6 +392,7 @@ class TestDropInType:
         }
         data, _ = read_frontmatter(str(artifacts / "doc-tasks" / "DOCS-7.md"))
         assert data["doc_id"] == "DOCS-7"
+        assert (data["type"], data["tracker_ref"]) == ("docs", "DOCS-7")
         assert (artifacts / "doc-tasks" / "DOCS-7-comments.md").read_bytes() == (
             GOLDEN_COMMENTS.replace(b"RHAIRFE-1595", b"DOCS-7")
         )
@@ -516,6 +533,8 @@ class TestFetchAllAgainstTheEmulator:
         assert data["priority"] == "Critical"
         assert data["status"] == "Ready"
         assert data["original_labels"] == ["customer-request"]
+        assert (data["type"], data["tracker_ref"]) == ("rfe", "RHAIRFE-1")
+        assert list(data)[5:7] == ["type", "tracker_ref"]
         assert body == "Body text.\n"
         assert original.read_text(encoding="utf-8") == "Body text.\n"
         text = comments.read_text(encoding="utf-8")
@@ -541,5 +560,6 @@ class TestFetchAllAgainstTheEmulator:
         assert data["priority"] == "Major"  # the emulator leaves priority unset
         assert data["status"] == "Ready"
         assert data["original_labels"] is None
+        assert (data["type"], data["tracker_ref"]) == ("initiative", "RHOAIENG-1")
         assert body == "Init body.\n"
         assert original.read_text(encoding="utf-8") == "Init body.\n"

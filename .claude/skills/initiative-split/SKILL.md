@@ -51,7 +51,7 @@ Sleep for the `NEXT_POLL` seconds reported by the script before polling again. O
 After all agents complete, check split-status files for each ID. If the file is missing, write error to review frontmatter:
 
 ```bash
-python3 scripts/frontmatter.py set artifacts/initiative-reviews/<ID>-review.md error="split_failed: agent did not write split-status file"
+python3 scripts/frontmatter.py set artifacts/initiative-reviews/<ID>-review.md error="split_failed: agent did not write split-status file" type=initiative
 ```
 
 ## Split Step 2: Collect Children and Review

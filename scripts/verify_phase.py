@@ -19,7 +19,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import type_registry
-from artifact_utils import read_frontmatter, write_frontmatter
+from artifact_utils import append_frontmatter_field, read_frontmatter, write_frontmatter
 
 _TYPES = type_registry.load()
 
@@ -68,7 +68,10 @@ def write_error_stubs(phase, ids, pipeline_type="rfe", outcome="failed", error=N
     One ``python3 scripts/frontmatter.py set`` per id, field for field the stub
     ``validate_types.build_error_stub`` mirrors (gate 1 checks the shape against the
     type's review schema): ``<id_field>=<id>``, ``error=<phase>_<outcome>``, the fixed
-    stub vocabulary, then one ``scores.<f>=0`` per registry score field. ``outcome`` is
+    stub vocabulary, one ``scores.<f>=0`` per registry score field, then
+    ``type=<pipeline_type>`` — the self-describing field every new artifact carries
+    (design §5, PR-3c), appended after the pre-3c fields so they keep their order (on disk
+    the schema defaults ``frontmatter.py set`` materializes follow it). ``outcome`` is
     ``failed`` for the post-barrier verifier (the agent finished without its output)
     and ``stalled`` for pipeline_state's wave stall guard (the agent never finished);
     both classify as retryable in error_collect.py. ``error`` replaces the derived
@@ -105,21 +108,25 @@ def write_error_stubs(phase, ids, pipeline_type="rfe", outcome="failed", error=N
                 failures[rfe_id] = why
             print(f"verify_phase: {rfe_id}: no {error_msg} stub written: {why}", file=sys.stderr)
             continue
-        cmd = [
-            "python3",
-            "scripts/frontmatter.py",
-            "set",
-            review_path,
-            f"{tc['id_field']}={rfe_id}",
-            f"error={error_msg}",
-            "score=0",
-            "pass=false",
-            "recommendation=revise",
-            "feasibility=feasible",
-            "auto_revised=false",
-            "needs_attention=true",
-            f"needs_attention_reason=Agent failed: {error_msg}",
-        ] + tc["score_fields"]
+        cmd = (
+            [
+                "python3",
+                "scripts/frontmatter.py",
+                "set",
+                review_path,
+                f"{tc['id_field']}={rfe_id}",
+                f"error={error_msg}",
+                "score=0",
+                "pass=false",
+                "recommendation=revise",
+                "feasibility=feasible",
+                "auto_revised=false",
+                "needs_attention=true",
+                f"needs_attention_reason=Agent failed: {error_msg}",
+            ]
+            + tc["score_fields"]
+            + [f"type={pipeline_type}"]
+        )
         try:
             subprocess.run(cmd, check=True, capture_output=True, text=True)
             continue
@@ -169,7 +176,8 @@ def _outside_reviews_dir(reviews_dir, review_path, rfe_id):
 
 def _stub_record(rfe_id, error_msg, pipeline_type):
     """The stub as a record for the replace path: the same fields, in the same order, as the
-    ``frontmatter.py set`` argv above (tests/test_verify_phase.py pins the two paths equal)."""
+    ``frontmatter.py set`` argv above (tests/test_verify_phase.py pins the two paths equal,
+    and tests/test_validate_types.py pins both to ``validate_types.build_error_stub``)."""
     tc = _TYPE_CONFIG[pipeline_type]
     return {
         tc["id_field"]: rfe_id,
@@ -182,7 +190,50 @@ def _stub_record(rfe_id, error_msg, pipeline_type):
         "needs_attention": True,
         "needs_attention_reason": f"Agent failed: {error_msg}",
         "scores": {field: 0 for field in _TYPES.get(pipeline_type).score_fields},
+        "type": pipeline_type,
     }
+
+
+def stamp_review_type(review_path, pipeline_type):
+    """Stamp ``type: <pipeline_type>`` on a review the review agents wrote (design plan D8).
+
+    Reviews are not stamped by prompt edits: after the review barrier the verifier appends
+    the self-describing field deterministically, one file at a time, through
+    ``artifact_utils.append_frontmatter_field`` — the one ``type: <t>`` line is inserted
+    before the closing ``---`` and every other byte stays as the agent wrote it. It is
+    deliberately not a ``frontmatter.py set``: that re-dumps the merged record, so on a
+    review that predates the current schema (a workspace re-run over an older results tree)
+    it would also materialize ``local_id: null`` and the other defaults, rename ``revised``
+    and re-wrap long strings — more than the single appended field D7 allows on an artifact
+    this writer did not produce. On a review the agents wrote in-run the bytes are the same
+    either way. The caller invokes this only for a review that exists with a usable score,
+    declares no ``type`` yet and whose path stays inside the reviews directory (an id that
+    would resolve outside it is failed, never stamped — ``_outside_reviews_dir``, the guard
+    ``write_error_stubs`` applies), so the stamp is idempotent across re-runs (the reassess
+    pass verifies the same ``review`` phase and goes through here too) and a review that
+    already carries ``type`` is never rewritten — one that declares the pipeline's type is
+    left alone silently, one that declares anything else (another type, an empty string) is
+    not this writer's to overwrite: verify() reports it once on stderr and leaves it
+    byte-identical. Returns True when the stamp is on disk. A
+    failure — the merged record is validated exactly as ``frontmatter.py set`` validates it,
+    so a review the schema rejects in some other field cannot take the stamp — is reported
+    once on stderr and leaves the review exactly as it was: the stamp never changes the
+    verdict (``FAILED=`` is computed from the score alone) and readers tolerate an unstamped
+    review.
+    """
+    try:
+        append_frontmatter_field(
+            review_path, "type", pipeline_type, _TYPE_CONFIG[pipeline_type]["review_schema"]
+        )
+        return True
+    except Exception as exc:
+        reason = " ".join(f"{type(exc).__name__}: {exc}".split())
+    print(
+        f"verify_phase: {review_path}: type={pipeline_type} not stamped ({reason}); the review"
+        f" is left as written",
+        file=sys.stderr,
+    )
+    return False
 
 
 def verify(phase, ids_file, pipeline_type="rfe"):
@@ -216,6 +267,29 @@ def verify(phase, ids_file, pipeline_type="rfe"):
                     exists = False
             except Exception:
                 exists = False
+            # D8: a usable review the agents wrote gets its self-describing `type:` here,
+            # after the barrier. One that already declares the pipeline's type is left
+            # alone; one that declares anything else (another type, an empty string) is not
+            # stamped over — reported once, left byte-identical. Stamping never changes the
+            # verdict below — except that a stamp candidate whose id would place the review
+            # outside the reviews directory (CWE-22, the same guard write_error_stubs
+            # applies) is never written to: the id is failed instead, so it reaches
+            # write_error_stubs, which refuses the same path and reports it unwritten.
+            if exists:
+                declared = data.get("type")
+                if declared is None:
+                    why = _outside_reviews_dir(tc["reviews_dir"], path, rfe_id)
+                    if why:
+                        print(f"verify_phase: {rfe_id}: review not stamped: {why}", file=sys.stderr)
+                        exists = False
+                    else:
+                        stamp_review_type(path, pipeline_type)
+                elif declared != pipeline_type:
+                    print(
+                        f"verify_phase: {path}: review declares type={declared!r}, expected "
+                        f"{pipeline_type}; not stamped",
+                        file=sys.stderr,
+                    )
 
         if not exists:
             failed.append(rfe_id)

@@ -948,6 +948,7 @@ class TestTypeConfigIsRegistryDerived:
             assert cfg["id_field"] == desc.id_field
             assert cfg["child_parent_prefixes"] == (desc.local_prefix, *desc.key_prefixes)
             assert cfg["tracker_prefix"] == desc.write_prefix
+            assert cfg["key_prefixes"] == tuple(desc.key_prefixes)
             assert cfg["local_prefix"] == desc.local_prefix
             # The generic scan bound to the descriptor, not a per-type function.
             assert cfg["scan_tasks"].func is artifact_utils.scan_tasks
@@ -982,6 +983,7 @@ class TestTypeConfigIsRegistryDerived:
         # local prefix + tracker key prefixes; never conventions.parent_key_patterns
         assert cfg["child_parent_prefixes"] == ("RHAISTRAT-", "RHAI-")
         assert cfg["tracker_prefix"] == "RHAI-"
+        assert cfg["key_prefixes"] == ("RHAI-",)
         assert cfg["local_prefix"] == "RHAISTRAT-"
         # The scan is the generic bound to this descriptor: a third type gets a scanner over
         # its own dirs.tasks without a code change.
@@ -996,3 +998,163 @@ class TestTypeConfigIsRegistryDerived:
         cfg["score_fields"].append("mutated")
         assert "mutated" not in desc.get("reporting.run_report.extra_entry_fields")
         assert "mutated" not in desc.score_fields
+
+
+class TestTrackerRefFromFrontmatter:
+    """PR-3c: tracker_ref and role are read from the task artifact when it carries
+    tracker_ref; a pre-migration artifact (no field) keeps the id derivation, which now
+    tests membership in the type's key_prefixes union rather than the write prefix alone."""
+
+    def _task(self, art_dir, rfe_id, status="Ready", extra_fm=""):
+        _write(
+            f"{art_dir}/rfe-tasks/{rfe_id}.md",
+            f"---\nrfe_id: {rfe_id}\ntitle: T\npriority: Major\nstatus: {status}\n"
+            f"{extra_fm}---\n\nBody.\n",
+        )
+
+    def _review(self, art_dir, rfe_id):
+        _write(
+            f"{art_dir}/rfe-reviews/{rfe_id}-review.md",
+            f"---\nrfe_id: {rfe_id}\nscore: 9\npass: true\nrecommendation: submit\n"
+            "feasibility: feasible\nauto_revised: false\nneeds_attention: false\n"
+            "scores:\n  what: 2\n  why: 2\n  open_to_how: 2\n  not_a_task: 2\n  right_sized: 2\n"
+            "---\n\nok.\n",
+        )
+
+    def test_stamped_artifact_supplies_tracker_ref(self, art_dir):
+        self._task(
+            art_dir,
+            "RHAIRFE-3082",
+            status="Submitted",
+            extra_fm="local_id: RFE-001\ntype: rfe\ntracker_ref: RHAIRFE-3082\n",
+        )
+        self._review(art_dir, "RHAIRFE-3082")
+        entry = build_report(["RHAIRFE-3082"], "2026-09-15T12:00:00Z")["per_rfe"][0]
+        assert entry["tracker_ref"] == "RHAIRFE-3082"
+        assert entry["role"] == "leaf"
+
+    def test_frontmatter_wins_over_the_id_prefix(self, art_dir):
+        """A local-id artifact that carries tracker_ref is a ticket: the field is read, never
+        re-derived from the id — and an Archived ticket is a leaf, not an intermediary."""
+        self._task(
+            art_dir, "RFE-009", status="Archived", extra_fm="type: rfe\ntracker_ref: RHAIRFE-77\n"
+        )
+        self._review(art_dir, "RFE-009")
+        entry = build_report(["RFE-009"], "2026-09-15T12:00:00Z")["per_rfe"][0]
+        assert entry["tracker_ref"] == "RHAIRFE-77"
+        assert entry["role"] == "leaf"
+
+    def test_stamped_but_unsubmitted_artifact_is_local(self, art_dir):
+        """`type:` without tracker_ref: no ticket — null tracker_ref, and Archived means a
+        re-split stepping stone exactly as for a legacy local id."""
+        self._task(art_dir, "RFE-004", status="Archived", extra_fm="type: rfe\n")
+        self._review(art_dir, "RFE-004")
+        self._task(art_dir, "RFE-005", status="Draft", extra_fm="type: rfe\n")
+        self._review(art_dir, "RFE-005")
+        by_id = {
+            e["id"]: e
+            for e in build_report(["RFE-004", "RFE-005"], "2026-09-15T12:00:00Z")["per_rfe"]
+        }
+        assert (by_id["RFE-004"]["tracker_ref"], by_id["RFE-004"]["role"]) == (None, "intermediary")
+        assert (by_id["RFE-005"]["tracker_ref"], by_id["RFE-005"]["role"]) == (None, "leaf")
+
+    def test_legacy_artifacts_keep_the_derivation(self, art_dir):
+        self._task(art_dir, "RHAIRFE-1000", status="Archived")
+        self._review(art_dir, "RHAIRFE-1000")
+        self._task(art_dir, "RFE-001", status="Archived", extra_fm="parent_key: RHAIRFE-1000\n")
+        self._review(art_dir, "RFE-001")
+        by_id = {
+            e["id"]: e for e in build_report(["RHAIRFE-1000"], "2026-09-15T12:00:00Z")["per_rfe"]
+        }
+        assert (by_id["RHAIRFE-1000"]["tracker_ref"], by_id["RHAIRFE-1000"]["role"]) == (
+            "RHAIRFE-1000",
+            "leaf",
+        )
+        assert (by_id["RFE-001"]["tracker_ref"], by_id["RFE-001"]["role"]) == (None, "intermediary")
+
+    def test_error_entries_keep_the_derivation(self, art_dir):
+        """No review file: the row is an error entry and its tracker_ref is the id-derived
+        value even when the task carries the field (the contract for error rows: derivable
+        from the id alone)."""
+        self._task(art_dir, "RFE-010", extra_fm="type: rfe\ntracker_ref: RHAIRFE-88\n")
+        self._task(art_dir, "RHAIRFE-11", extra_fm="type: rfe\ntracker_ref: RHAIRFE-11\n")
+        by_id = {
+            e["id"]: e
+            for e in build_report(["RFE-010", "RHAIRFE-11"], "2026-09-15T12:00:00Z")["per_rfe"]
+        }
+        assert by_id["RFE-010"]["error"] == "review file not found"
+        assert by_id["RFE-010"]["tracker_ref"] is None
+        assert by_id["RHAIRFE-11"]["tracker_ref"] == "RHAIRFE-11"
+
+    def test_entry_key_order_is_unchanged(self, art_dir):
+        """Only the value source changes: a stamped artifact's entry has exactly the keys, in
+        exactly the order, of the same artifact before the stamp."""
+        self._task(art_dir, "RHAIRFE-3082", status="Submitted", extra_fm="local_id: RFE-001\n")
+        self._review(art_dir, "RHAIRFE-3082")
+        legacy = build_report(["RHAIRFE-3082"], "2026-09-15T12:00:00Z")["per_rfe"][0]
+        self._task(
+            art_dir,
+            "RHAIRFE-3082",
+            status="Submitted",
+            extra_fm="local_id: RFE-001\ntype: rfe\ntracker_ref: RHAIRFE-3082\n",
+        )
+        stamped = build_report(["RHAIRFE-3082"], "2026-09-15T12:00:00Z")["per_rfe"][0]
+        assert list(stamped) == list(legacy)
+        assert list(stamped)[:3] == ["id", "tracker_ref", "role"]
+        assert stamped == legacy
+
+
+def _union_config():
+    """A TYPE_CONFIG entry for an rfe descriptor whose tracker declares a read prefix too."""
+    import copy
+
+    registry = type_registry.load(extra_roots=[], env={})
+    data = copy.deepcopy(registry.get("rfe").data)
+    data["identity"]["jira"]["key_prefixes"] = ["RHAIRFE-", "RHAIOLD-"]
+    return generate_run_report._type_config(type_registry.Descriptor("rfe", data))
+
+
+class TestKeyPrefixUnionFallback:
+    """The pre-migration derivation tests the key_prefixes union: a read prefix counts."""
+
+    def _review(self, art_dir, rfe_id):
+        _write(
+            f"{art_dir}/rfe-reviews/{rfe_id}-review.md",
+            f"---\nrfe_id: {rfe_id}\nscore: 9\npass: true\nrecommendation: submit\n"
+            "feasibility: feasible\nauto_revised: false\nneeds_attention: false\n"
+            "scores:\n  what: 2\n  why: 2\n  open_to_how: 2\n  not_a_task: 2\n  right_sized: 2\n"
+            "---\n\nok.\n",
+        )
+
+    def test_config_carries_the_union(self):
+        assert TYPE_CONFIG["rfe"]["key_prefixes"] == ("RHAIRFE-",)
+        assert TYPE_CONFIG["initiative"]["key_prefixes"] == ("RHOAIENG-",)
+        assert _union_config()["key_prefixes"] == ("RHAIRFE-", "RHAIOLD-")
+        assert _union_config()["tracker_prefix"] == "RHAIRFE-"
+
+    def test_is_tracker_key_is_union_membership(self):
+        cfg = _union_config()
+        assert generate_run_report._is_tracker_key("RHAIRFE-1", cfg)
+        assert generate_run_report._is_tracker_key("RHAIOLD-7", cfg)
+        assert not generate_run_report._is_tracker_key("RFE-001", cfg)
+        assert not generate_run_report._is_tracker_key("RHAIOLD-7", TYPE_CONFIG["rfe"])
+
+    def test_read_prefix_id_gets_a_tracker_ref(self, art_dir, monkeypatch):
+        self._review(art_dir, "RHAIOLD-7")
+        monkeypatch.setitem(TYPE_CONFIG, "rfe", _union_config())
+        entry = build_report(["RHAIOLD-7"], "2026-09-15T12:00:00Z")["per_rfe"][0]
+        assert entry["tracker_ref"] == "RHAIOLD-7"
+        assert "error" not in entry
+
+    def test_write_prefix_only_config_would_not(self, art_dir):
+        self._review(art_dir, "RHAIOLD-7")
+        entry = build_report(["RHAIOLD-7"], "2026-09-15T12:00:00Z")["per_rfe"][0]
+        assert entry["tracker_ref"] is None
+
+    def test_torn_read_prefix_task_still_surfaces(self, art_dir, monkeypatch):
+        _write(f"{art_dir}/rfe-tasks/RHAIOLD-9.md", "---\nrfe_id: RHAIOLD-9\ntitle: torn")
+        monkeypatch.setitem(TYPE_CONFIG, "rfe", _union_config())
+        assert generate_run_report._ids_from_filenames(art_dir, TYPE_CONFIG["rfe"]) == ["RHAIOLD-9"]
+        by_id = {e["id"]: e for e in build_report([], "2026-09-15T12:00:00Z")["per_rfe"]}
+        assert by_id["RHAIOLD-9"]["tracker_ref"] == "RHAIOLD-9"
+        assert by_id["RHAIOLD-9"]["error"] == "review file not found"

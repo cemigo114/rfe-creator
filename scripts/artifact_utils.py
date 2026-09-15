@@ -164,8 +164,12 @@ def _id_fields(desc):
         # type's tracker binding owns. tracker_ref is read from frontmatter, never
         # re-derived from an id prefix. Both are declared WITHOUT a `default` key on
         # purpose (PR-1 decision Q4): apply_defaults writes only fields that carry
-        # `default`, so existing artifacts stay byte-identical until a writer sets
-        # them (PR-3 writes `type:`). No writer sets them yet.
+        # `default`, so a pre-migration artifact stays byte-identical until a writer
+        # sets them (PR-3c D7: new artifacts only, no back-fill, fields appended). The
+        # writers: fetch_issue --fetch-all (both), the create / split-agent / fetch
+        # prompt bodies and the error stubs (type), verify_phase's post-barrier review
+        # stamp (type, D8) and rename_to_tracker_key (tracker_ref, plus type when
+        # absent) — tests/test_pr1_transparent_edits.py names them.
         "type": {"type": "string", "required": False},
         "tracker_ref": {"type": "string", "required": False},
     }
@@ -649,6 +653,72 @@ def update_frontmatter(path, updates, schema_type):
         f.write(content)
 
 
+def append_frontmatter_field(path, name, value, schema_type):
+    """Append one top-level field to an existing frontmatter block without re-serializing it.
+
+    The pure-append writer for stamping a field on an artifact another writer produced
+    (design plan D7: fields are appended, never reordered, and the artifact is otherwise
+    left byte-identical): every byte of the file is kept and one ``<name>: <value>`` line
+    is inserted before the closing ``---``. update_frontmatter cannot give that guarantee —
+    it re-dumps the merged record, so on a file that predates the current schema it also
+    materializes defaults (``local_id: null``), renames migrated fields and re-wraps long
+    strings. The line is rendered by the same dumper, so on a file that already carries the
+    current schema's shape the bytes equal update_frontmatter's. The checks are
+    update_frontmatter's too: the merged record (migrated, defaults applied) must pass the
+    schema, and the stamped block must parse back to exactly the old mapping plus the new
+    field. ``value`` is a scalar (the base schemas' ``type`` / ``tracker_ref`` are strings).
+
+    Raises:
+        ValidationError: the file has no parseable mapping frontmatter, already carries
+            ``name`` (whatever its value — appending would duplicate the key), the merged
+            record fails the schema, or the stamped block would not parse back as expected.
+        FileNotFoundError: if the file does not exist.
+    """
+    # newline="" keeps the file's own line endings, so the one line we add can match them
+    # and everything else is written back byte for byte.
+    with open(path, encoding="utf-8", newline="") as f:
+        content = f.read()
+    match = _FRONTMATTER_RE.match(content)
+    if not match:
+        raise ValidationError(f"No frontmatter found in {path}")
+    region = match.group(1)
+    try:
+        data = yaml.safe_load(region)
+    except yaml.YAMLError as exc:
+        raise ValidationError(_yaml_error_message(path, region, exc)) from exc
+    if not isinstance(data, dict):
+        raise ValidationError(f"No frontmatter mapping found in {path}")
+    if name in data:
+        raise ValidationError(f"{path} already carries {name!r}; appending would duplicate it")
+
+    probe = copy.deepcopy(data)
+    probe[name] = value
+    _migrate_fields(probe, schema_type)
+    apply_defaults(probe, schema_type)
+    errors = validate(probe, schema_type)
+    if errors:
+        raise ValidationError(
+            f"Frontmatter validation failed after update in {path}:\n"
+            + "\n".join(f"  - {e}" for e in errors)
+        )
+
+    newline = "\r\n" if match.group(0).split("\n", 1)[0].endswith("\r") else "\n"
+    line = yaml.dump({name: value}, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    line = line.rstrip("\n").replace("\n", newline) + newline
+    stamped_region = region + line
+    try:
+        stamped = yaml.safe_load(stamped_region)
+    except yaml.YAMLError as exc:
+        raise ValidationError(_yaml_error_message(path, stamped_region, exc)) from exc
+    if stamped != {**data, name: value}:
+        raise ValidationError(
+            f"{path}: appending {name}: {value!r} would not parse back as the same record"
+        )
+
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(content[: match.end(1)] + line + content[match.end(1) :])
+
+
 # ─── Artifact File Discovery ───────────────────────────────────────────────────
 
 
@@ -659,17 +729,72 @@ def _is_companion_file(filename):
     )
 
 
-def _type_for(identifier):
-    """The descriptor that owns ``identifier`` (``TypeRegistry.detect``), else rfe — the
-    default branch of the prefix sniffs this replaces (anything that was not INIT-/RHOAIENG-
-    went to the rfe dirs)."""
+def _declared_type(path):
+    """The ``type:`` a task artifact declares in its frontmatter, or None when the file is
+    missing, has no frontmatter, has no ``type`` field, does not parse, or cannot be read as
+    text at all (not UTF-8, unreadable). An unparseable or unreadable file is a repair case
+    for the writers, never a routing signal: the caller's fallback applies."""
+    if not os.path.isfile(path):
+        return None
+    try:
+        data, _ = read_frontmatter(path)
+    except (ValidationError, UnicodeDecodeError, OSError):
+        return None
+    declared = data.get("type")
+    return declared if isinstance(declared, str) and declared else None
+
+
+def _type_for(identifier, artifacts_dir="artifacts"):
+    """The descriptor that owns ``identifier`` for the id-only routers (design §5, D5).
+
+    ``TypeRegistry.candidates`` decides: a single non-provisional candidate wins outright
+    (every RFE-/RHAIRFE-/INIT-/RHOAIENG- id, no disk access). When the candidates are
+    ambiguous (two types matching at the same rung) or provisional (a key that only the
+    tracker's generic grammar admits, e.g. an overridden project's ``KONFLUX-1``), each
+    candidate's ``dirs.tasks/<identifier>.md`` under ``artifacts_dir`` is probed for the
+    ``type:`` its frontmatter declares (PR-3c self-describing artifacts) and a match wins.
+    Otherwise today's rule stands: ``TypeRegistry.detect`` else rfe — the default branch of
+    the prefix sniffs this replaced (anything that was not INIT-/RHOAIENG- went to the rfe
+    dirs), so every pre-migration id routes exactly as before.
+    """
+    found = _TYPES.candidates(identifier)
+    if len(found.matches) == 1 and not found.provisional:
+        return found.matches[0]
+    # An id is about to become a path component: never probe with a separator in it.
+    if found.matches and os.sep not in identifier and "/" not in identifier:
+        for desc in found.matches:
+            tasks_subdir = desc.get("dirs.tasks", None)
+            if not isinstance(tasks_subdir, str):
+                continue
+            task_path = os.path.join(artifacts_dir, desc.dirs("bare")["tasks"], f"{identifier}.md")
+            if _declared_type(task_path) == desc.name:
+                return desc
     return _TYPES.detect(identifier) or _TYPES.get("rfe")
 
 
 def find_task_file_including_archived(
-    artifacts_dir, identifier, tasks_subdir, jira_prefix, local_prefix
+    artifacts_dir, identifier, tasks_subdir=None, jira_prefix=None, local_prefix=None, desc=None
 ):
-    """Find a task file by ID, including archived tasks."""
+    """Find a task file by ID, including archived tasks.
+
+    Two forms. With ``desc`` (a ``type_registry.Descriptor``) ownership is the descriptor's
+    own ladder, ``desc.owns(identifier)``, ``tasks_subdir`` defaults to its ``dirs.tasks``
+    and a tracker key (one of ``desc.key_prefixes``) matches ``<id>.md`` exactly while a local
+    id also matches a slug-suffixed ``<id>-*.md``. Without ``desc`` the legacy form applies
+    unchanged: a ``jira_prefix`` id matches exactly, a ``local_prefix`` id exactly or
+    slug-suffixed, anything else is not found (generate_review_pdf passes the two prefixes).
+    """
+    if desc is not None:
+        if tasks_subdir is None:
+            tasks_subdir = desc.dirs("bare")["tasks"]
+        if not desc.owns(identifier):
+            return None
+        is_tracker_key = any(identifier.startswith(p) for p in desc.key_prefixes if p)
+        is_local_id = not is_tracker_key
+    else:
+        is_tracker_key = identifier.startswith(jira_prefix)
+        is_local_id = identifier.startswith(local_prefix)
+
     tasks_dir = os.path.join(artifacts_dir, tasks_subdir)
     if not os.path.isdir(tasks_dir):
         return None
@@ -680,11 +805,11 @@ def find_task_file_including_archived(
         if _is_companion_file(filename):
             continue
 
-        if identifier.startswith(jira_prefix):
+        if is_tracker_key:
             if filename == f"{identifier}.md":
                 return os.path.join(tasks_dir, filename)
 
-        if identifier.startswith(local_prefix):
+        if is_local_id:
             if filename == f"{identifier}.md" or filename.startswith(identifier + "-"):
                 return os.path.join(tasks_dir, filename)
 
@@ -692,11 +817,9 @@ def find_task_file_including_archived(
 
 
 def find_artifact_file_including_archived(artifacts_dir, identifier):
-    """Find an RFE task file by ID, including archived tasks (rfe-only wrapper)."""
-    rfe = _TYPES.get("rfe")
-    return find_task_file_including_archived(
-        artifacts_dir, identifier, rfe.dirs("bare")["tasks"], rfe.write_prefix, rfe.local_prefix
-    )
+    """Find an RFE task file by ID, including archived tasks (rfe-only wrapper) —
+    ``find_task_file_including_archived`` in its descriptor form for the rfe type."""
+    return find_task_file_including_archived(artifacts_dir, identifier, desc=_TYPES.get("rfe"))
 
 
 def find_removed_context_yaml_in(
@@ -715,7 +838,7 @@ def find_removed_context_yaml_in(
 
 def find_removed_context_yaml(artifacts_dir, identifier):
     """Find the removed-context YAML file for a given RFE/initiative ID or Jira key."""
-    desc = _type_for(identifier)
+    desc = _type_for(identifier, artifacts_dir)
     return find_removed_context_yaml_in(
         artifacts_dir, identifier, desc.dirs("bare")["tasks"], desc.write_prefix, desc.local_prefix
     )
@@ -746,10 +869,13 @@ def render_removed_context_comment(yaml_path, preamble):
 def find_review_file(artifacts_dir, identifier):
     """Find the review file for a given RFE/initiative ID or Jira key.
 
-    Looks in the reviews directory of the type that owns ``identifier`` (rfe when no
-    type does) for {identifier}-review.md.
+    Looks in the reviews directory of the type that owns ``identifier`` (``_type_for``:
+    rfe when no type does; an ambiguous or provisional id is routed by the ``type:`` its
+    task file under ``artifacts_dir`` declares) for {identifier}-review.md.
     """
-    reviews_dir = os.path.join(artifacts_dir, _type_for(identifier).dirs("bare")["reviews"])
+    reviews_dir = os.path.join(
+        artifacts_dir, _type_for(identifier, artifacts_dir).dirs("bare")["reviews"]
+    )
 
     if not os.path.isdir(reviews_dir):
         return None
@@ -865,6 +991,24 @@ def _review_to_rename(reviews_dir, item_id, desc):
     return old_review if os.path.isfile(old_review) else None
 
 
+def _reject_declared_type_conflict(path, desc, label):
+    """Refuse to rename an artifact that says it is not one of ``desc``'s.
+
+    ``rename_to_tracker_key`` calls this for the task file and the review file before it
+    renames or rewrites anything, so a conflict leaves every file exactly where and as it
+    was — the same pre-flight contract as its id guards, hence the same ``ValueError`` with
+    the same label. Only a non-empty declared type that differs from ``desc.name`` is a
+    conflict; a file that is missing, declares no ``type``, declares an empty one or does
+    not parse is left to the rename (``_declared_type`` reads all of those as None, and the
+    stamp then applies).
+    """
+    declared = _declared_type(path)
+    if declared is not None and declared != desc.name:
+        raise ValueError(
+            f"{label}: {path} declares type={declared!r}, expected {desc.name}; nothing renamed"
+        )
+
+
 def rename_to_tracker_key(artifacts_dir, item_id, tracker_key, desc):
     """Rename a submitted item's files from its local id to its tracker key.
 
@@ -872,13 +1016,26 @@ def rename_to_tracker_key(artifacts_dir, item_id, tracker_key, desc):
     task file, its companion files and the review file under the type's ``dirs``. The
     task file's frontmatter becomes ``{<id_field>: tracker_key, status: Submitted,
     local_id: item_id}`` and the review file's ``{<id_field>: tracker_key, local_id:
-    item_id}``.
+    item_id}``; both additionally gain the self-describing fields (PR-3c, D7: this is a
+    writer that rewrites these two files anyway) — ``tracker_ref: tracker_key`` and, when
+    the file carries no ``type`` yet, ``type: <desc.name>`` — appended after the existing
+    fields (``type`` first, then ``tracker_ref``, the schema order). Companion files are
+    renamed only, never rewritten.
+
+    A task or review file that already declares another type is not this type's to rename:
+    the conflict is detected before the first ``os.rename`` and raised as a ``ValueError``
+    naming the file, the type it declares and the one expected, with every file left
+    untouched (no half-renamed item to repair).
 
     Args:
         artifacts_dir: path to artifacts directory
         item_id: e.g. "RFE-001" — must match ``identity.local_id_pattern``
         tracker_key: e.g. "RHAIRFE-1600" — must be the type's write prefix + digits
         desc: a ``type_registry.Descriptor``
+
+    Raises:
+        ValueError: ``item_id`` or ``tracker_key`` is not the documented shape, or the task
+            or review file declares a type other than ``desc.name``.
     """
     # Both ids become path components below. item_id comes from validated
     # frontmatter, but tracker_key arrives from a Jira API response — reject
@@ -898,6 +1055,17 @@ def rename_to_tracker_key(artifacts_dir, item_id, tracker_key, desc):
     tasks_dir = os.path.join(artifacts_dir, dirs["tasks"])
     reviews_dir = os.path.join(artifacts_dir, dirs["reviews"])
     id_field = desc.id_field
+
+    # The two files the rename rewrites are the two it may not claim from another type:
+    # both are checked here, before the first os.rename, so a conflict leaves the item
+    # exactly as it was (the task rename below never touches reviews_dir, so the review
+    # resolved here is the one renamed after it).
+    _reject_declared_type_conflict(os.path.join(tasks_dir, f"{item_id}.md"), desc, label)
+    old_review = (
+        _review_to_rename(reviews_dir, item_id, desc) if os.path.isdir(reviews_dir) else None
+    )
+    if old_review is not None:
+        _reject_declared_type_conflict(old_review, desc, label)
 
     # Rename task file and companions
     if os.path.isdir(tasks_dir):
@@ -931,19 +1099,41 @@ def rename_to_tracker_key(artifacts_dir, item_id, tracker_key, desc):
             if new_name == f"{tracker_key}.md":
                 update_frontmatter(
                     new_path,
-                    {id_field: tracker_key, "status": "Submitted", "local_id": item_id},
+                    _self_describing(
+                        new_path,
+                        {id_field: tracker_key, "status": "Submitted", "local_id": item_id},
+                        tracker_key,
+                        desc,
+                    ),
                     f"{desc.name}-task",
                 )
 
     # Rename review file
-    if os.path.isdir(reviews_dir):
-        old_review = _review_to_rename(reviews_dir, item_id, desc)
-        if old_review is not None:
-            new_review = os.path.join(reviews_dir, f"{tracker_key}-review.md")
-            os.rename(old_review, new_review)
-            update_frontmatter(
-                new_review, {id_field: tracker_key, "local_id": item_id}, f"{desc.name}-review"
-            )
+    if old_review is not None:
+        new_review = os.path.join(reviews_dir, f"{tracker_key}-review.md")
+        os.rename(old_review, new_review)
+        update_frontmatter(
+            new_review,
+            _self_describing(
+                new_review, {id_field: tracker_key, "local_id": item_id}, tracker_key, desc
+            ),
+            f"{desc.name}-review",
+        )
+
+
+def _self_describing(path, updates, tracker_key, desc):
+    """``updates`` extended with the self-describing fields the rename stamps: ``type:
+    <desc.name>`` only when the file at ``path`` declares none yet (a pre-migration draft),
+    then ``tracker_ref: tracker_key`` always. Appended after the caller's fields, so on a
+    file that already has them they are overwritten in place and on one that lacks them they
+    land after every existing field (D7: appended, never reordered). By the time this runs
+    a declared type can only be ``desc.name`` — a different one was rejected by
+    ``_reject_declared_type_conflict`` before the rename began."""
+    stamped = dict(updates)
+    if _declared_type(path) is None:
+        stamped["type"] = desc.name
+    stamped["tracker_ref"] = tracker_key
+    return stamped
 
 
 def rename_to_jira_key(artifacts_dir, rfe_id, jira_key):

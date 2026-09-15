@@ -106,7 +106,10 @@ def _fetch_all(issue_key, artifacts_dir, server, user, token, type_name="rfe"):
     with open(task_path, "w", encoding="utf-8") as f:
         f.write(desc_md + "\n")
 
-    # Set frontmatter via frontmatter.py
+    # Set frontmatter via frontmatter.py. The two self-describing fields (design §5,
+    # PR-3c) come last: `type` names the work-item type the layout belongs to and
+    # `tracker_ref` the issue this artifact was fetched from — appended after the
+    # pre-migration fields, never reordered (D7).
     fm_args = [
         sys.executable,
         "scripts/frontmatter.py",
@@ -117,6 +120,8 @@ def _fetch_all(issue_key, artifacts_dir, server, user, token, type_name="rfe"):
         f"priority={priority}",
         "status=Ready",
         f"original_labels={labels_str}",
+        f"type={desc.name}",
+        f"tracker_ref={issue_key}",
     ]
     result = subprocess.run(fm_args, capture_output=True, text=True)
     if result.returncode != 0:

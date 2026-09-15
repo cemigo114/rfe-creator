@@ -25,7 +25,9 @@ python3 scripts/frontmatter.py set artifacts/initiatives/{KEY}.md \
     title="<summary>" \
     priority=<priority> \
     status=Ready \
-    original_labels=<comma-separated labels or null>
+    original_labels=<comma-separated labels or null> \
+    type=initiative \
+    tracker_ref={KEY}
 ```
 
 4. Write the original description to `artifacts/initiative-originals/{KEY}.md` (baseline for conflict detection).

@@ -117,7 +117,8 @@ python3 scripts/frontmatter.py set artifacts/rfe-tasks/<child_filename>.md \
     priority=<priority> \
     size=<size> \
     status=Draft \
-    parent_key={ID}
+    parent_key={ID} \
+    type=rfe
 ```
 
 7. Archive the original:

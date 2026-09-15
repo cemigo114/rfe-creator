@@ -8,9 +8,15 @@ carries a test proving the observable output is unchanged:
 
   1. artifact_utils.SCHEMAS gains optional `type`/`tracker_ref` WITHOUT a
      default — frontmatter written by every path stays byte-identical (Q4).
+     PR-3c (design §5 self-describing artifacts; plan D7/D8) supersedes the
+     PR-1 "no writer sets them" pin: the writers that stamp NEW artifacts are
+     named exactly below, and every pre-migration artifact stays byte-identical
+     through the API writers and `frontmatter.py set` unless the caller sets
+     the fields (legacy fixture set, TestLegacyArtifactsStayByteIdentical).
   2. `issuetype` joins the fetch field lists — request-only widening; the
-     artifacts fetch_issue writes and the snapshot entries snapshot_fetch
-     persists are unchanged, so no snapshot item is re-marked CHANGED (Q23).
+     snapshot entries snapshot_fetch persists are unchanged, so no snapshot
+     item is re-marked CHANGED (Q23). The fetched task artifact changes only by
+     the two PR-3c stamp lines (`type:`, `tracker_ref:`), appended.
   3. .claude/settings.json drops dead allowlist entries and adds the three
      registry entries in relative form only (Q20 of the checklist).
   4. rfe-creator.update-deps removes everything bootstrap-assess-rfe.sh can
@@ -230,12 +236,186 @@ class TestBaseSchemaAdditions:
         assert not _NEW_FIELD_LINE.search(out)
         assert out == GOLDEN[schema]
 
-    def test_no_production_writer_sets_them_yet(self):
-        """PR-3 writes `type:`; until then no script or skill stamps either field."""
-        hits = []
+
+# ── 1b. PR-3c: exactly these writers stamp the self-describing fields ─────────
+#
+# design §5 "Self-describing artifacts"; plan D7 (new artifacts only, no back-fill, fields
+# appended) and D8 (reviews stamped by verify_phase after the barrier, not by prompts).
+# Supersedes PR-1's "no production writer sets them yet" pin. Each entry names one writer
+# and the field(s) it sets; anything else that starts stamping is a visible pin change.
+
+# scripts/*.py: every `type=` / `tracker_ref=` argv element handed to `frontmatter.py set`
+# (string or f-string literals that are elements of a list), (file, field).
+SCRIPT_ARGV_STAMPS = {
+    ("scripts/fetch_issue.py", "type"),  # --fetch-all: the fetched task
+    ("scripts/fetch_issue.py", "tracker_ref"),  # --fetch-all: the issue it came from
+    ("scripts/verify_phase.py", "type"),  # the error stub (the D8 review stamp is below)
+}
+# scripts/*.py: writers that set the fields through the artifact_utils API instead — the
+# exact source lines, one per (writer, field). No direct update_frontmatter /
+# write_frontmatter call passes either key, and the one append_frontmatter_field call is
+# the D8 review stamp (test below); these build the record.
+SCRIPT_API_STAMPS = {
+    # rename_to_tracker_key -> _self_describing: type when absent, tracker_ref always
+    "scripts/artifact_utils.py": (
+        'stamped["type"] = desc.name',
+        'stamped["tracker_ref"] = tracker_key',
+    ),
+    # _stub_record: the error stub's replace path (mirrors the argv above), and
+    # stamp_review_type: the D8 review stamp — a pure append (one `type: <t>` line inserted
+    # before the closing `---`, every other byte kept), never a `frontmatter.py set`, so a
+    # review of an older schema vintage gains that line and nothing else (D7).
+    "scripts/verify_phase.py": (
+        '"type": pipeline_type,',
+        'review_path, "type", pipeline_type, _TYPE_CONFIG[pipeline_type]["review_schema"]',
+    ),
+    # build_error_stub: gate 1's mirror of the same stub
+    "scripts/validate_types.py": ('stub["type"] = desc.name',),
+}
+# The append_frontmatter_field calls that name one of the fields, (file, field).
+SCRIPT_APPEND_STAMPS = {("scripts/verify_phase.py", "type")}
+# .claude/skills/**/*.md: the `frontmatter.py set` commands that stamp, (file, fields).
+# Bodies are Builder-C territory; tests/test_type_registry_pins.py pins the command tails.
+SKILL_STAMPS = {
+    (".claude/skills/rfe.create/SKILL.md", ("type",)),
+    (".claude/skills/rfe.split/prompts/split-agent.md", ("type",)),
+    (".claude/skills/rfe.review/prompts/fetch-agent.md", ("type", "tracker_ref")),
+    (".claude/skills/rfe.review/SKILL.md", ("type",)),  # orchestrator error stubs
+    (".claude/skills/rfe.split/SKILL.md", ("type",)),  # orchestrator error stub
+    (".claude/skills/initiative-create/SKILL.md", ("type",)),
+    (".claude/skills/initiative-split/prompts/split-agent.md", ("type",)),
+    (".claude/skills/initiative-review/prompts/fetch-agent.md", ("type", "tracker_ref")),
+    (".claude/skills/initiative-review/SKILL.md", ("type",)),
+    (".claude/skills/initiative-split/SKILL.md", ("type",)),
+}
+_STAMP_FIELD = re.compile(r"(?<![\w.\-])(type|tracker_ref)=")
+
+
+def _script_argv_stamps():
+    """(file, field) for every list element string literal starting with `type=` or
+    `tracker_ref=` in scripts/*.py — the frontmatter.py argv form (an f-string's leading
+    segment counts; messages such as `f"type={x} is not..."` are not list elements)."""
+    import ast
+
+    found = set()
+    for name in sorted(os.listdir(os.path.join(REPO_ROOT, "scripts"))):
+        if not name.endswith(".py"):
+            continue
+        rel = f"scripts/{name}"
+        tree = ast.parse(_read(rel))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.List):
+                continue
+            for elt in node.elts:
+                head = elt.values[0] if isinstance(elt, ast.JoinedStr) and elt.values else elt
+                if isinstance(head, ast.Constant) and isinstance(head.value, str):
+                    for field in NEW_FIELDS:
+                        if head.value.startswith(f"{field}="):
+                            found.add((rel, field))
+    return found
+
+
+def _direct_frontmatter_calls_with_the_fields():
+    """(file, field) for every update_frontmatter / write_frontmatter call in scripts/*.py
+    whose literal dict argument carries `type` or `tracker_ref` — none today: the writers
+    build the record through the sites in SCRIPT_API_STAMPS."""
+    return _frontmatter_calls_with_the_fields(("update_frontmatter", "write_frontmatter"))
+
+
+def _append_calls_with_the_fields():
+    """(file, field) for every append_frontmatter_field call in scripts/*.py whose field
+    argument is literally `type` or `tracker_ref` — the D8 review stamp alone."""
+    return _frontmatter_calls_with_the_fields(("append_frontmatter_field",))
+
+
+def _frontmatter_calls_with_the_fields(callees):
+    import ast
+
+    found = set()
+    for name in sorted(os.listdir(os.path.join(REPO_ROOT, "scripts"))):
+        if not name.endswith(".py"):
+            continue
+        rel = f"scripts/{name}"
+        for node in ast.walk(ast.parse(_read(rel))):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            callee = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+            if callee not in callees:
+                continue
+            for arg in node.args:
+                if isinstance(arg, ast.Dict):
+                    for key in arg.keys:
+                        if isinstance(key, ast.Constant) and key.value in NEW_FIELDS:
+                            found.add((rel, key.value))
+                elif isinstance(arg, ast.Constant) and arg.value in NEW_FIELDS:
+                    found.add((rel, arg.value))
+    return found
+
+
+def _skill_stamps():
+    """(file, fields) for every `python3 scripts/frontmatter.py set` command in our skill
+    bodies that carries `type=` / `tracker_ref=` (backslash continuations joined)."""
+    found = {}
+    for dirpath, dirnames, filenames in os.walk(os.path.join(REPO_ROOT, ".claude/skills")):
+        # Vendored assess-rfe skills are runtime-installed, not ours.
+        dirnames[:] = [
+            d for d in dirnames if d not in ("assess-rfe", "assess-initiative", "export-rubric")
+        ]
+        for name in sorted(filenames):
+            if not name.endswith(".md"):
+                continue
+            rel = os.path.relpath(os.path.join(dirpath, name), REPO_ROOT)
+            lines = _read(rel).splitlines()
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+                if "frontmatter.py set" in line:
+                    command = line
+                    while command.rstrip().endswith("\\") and i + 1 < len(lines):
+                        i += 1
+                        command = command.rstrip()[:-1] + " " + lines[i].strip()
+                    fields = tuple(dict.fromkeys(_STAMP_FIELD.findall(command)))
+                    if fields:
+                        found.setdefault(rel, set()).update(fields)
+                i += 1
+    return {(rel, tuple(f for f in NEW_FIELDS if f in fields)) for rel, fields in found.items()}
+
+
+class TestSelfDescribingWriters:
+    def test_exactly_these_script_argv_writers(self):
+        assert _script_argv_stamps() == SCRIPT_ARGV_STAMPS
+
+    def test_exactly_these_script_api_writers(self):
+        import inspect
+
+        import artifact_utils
+
+        for rel, lines in SCRIPT_API_STAMPS.items():
+            source = _read(rel)
+            for line in lines:
+                assert source.count(line) == 1, (rel, line)
+        assert _direct_frontmatter_calls_with_the_fields() == set()
+        assert _append_calls_with_the_fields() == SCRIPT_APPEND_STAMPS
+        # The rename helper is called from rename_to_tracker_key alone: the task file and
+        # the review file it already rewrites (D7), nowhere else.
+        assert (
+            inspect.getsource(artifact_utils.rename_to_tracker_key).count("_self_describing(") == 2
+        )
+        for name in sorted(os.listdir(os.path.join(REPO_ROOT, "scripts"))):
+            if name.endswith(".py") and name != "artifact_utils.py":
+                assert "_self_describing" not in _read(f"scripts/{name}"), name
+
+    def test_exactly_these_skill_writers(self):
+        assert _skill_stamps() == SKILL_STAMPS
+
+    def test_no_other_line_mentions_the_fields_as_frontmatter_args(self):
+        """The PR-1 scan, kept as a ceiling: a `frontmatter.py ... type=` line may appear
+        only in the files named above."""
+        allowed = {rel for rel, _ in SCRIPT_ARGV_STAMPS} | {rel for rel, _ in SKILL_STAMPS}
+        hits = set()
         for root in ("scripts", ".claude/skills"):
             for dirpath, dirnames, filenames in os.walk(os.path.join(REPO_ROOT, root)):
-                # Vendored assess-rfe skills are runtime-installed, not ours.
                 dirnames[:] = [
                     d
                     for d in dirnames
@@ -244,14 +424,100 @@ class TestBaseSchemaAdditions:
                 for name in filenames:
                     if not name.endswith((".py", ".md")):
                         continue
-                    with open(os.path.join(dirpath, name), encoding="utf-8") as f:
-                        for line in f:
-                            if (
-                                re.search(r"(?<![\w-])(type|tracker_ref)=", line)
-                                and "frontmatter.py" in line
-                            ):
-                                hits.append(f"{root}/{name}: {line.strip()}")
-        assert hits == []
+                    rel = os.path.relpath(os.path.join(dirpath, name), REPO_ROOT)
+                    for line in _read(rel).splitlines():
+                        if _STAMP_FIELD.search(line) and "frontmatter.py" in line:
+                            hits.add(rel)
+        assert hits <= allowed, hits - allowed
+
+    def test_review_stamp_is_verify_phase_not_a_prompt(self):
+        """D8: no review-agent / revise-agent prompt sets `type=`; verify() does, once, on a
+        usable review that declares none — one that declares the pipeline's type is left alone,
+        one that declares anything else is reported and never stamped over
+        (tests/test_verify_phase.py holds the behaviour)."""
+        for rel, _ in SKILL_STAMPS:
+            assert "review-agent" not in rel and "revise-agent" not in rel
+        source = _read("scripts/verify_phase.py")
+        assert 'declared = data.get("type")' in source
+        assert "if declared is None:" in source
+        assert "stamp_review_type(path, pipeline_type)" in source
+        assert "elif declared != pipeline_type:" in source
+
+
+# Pre-migration artifacts on disk: the GOLDEN bytes above, exactly as an existing results
+# repo holds them (complete records, schema defaults materialized, no type/tracker_ref).
+LEGACY_FIXTURES = {schema: (SAMPLES[schema][0], GOLDEN[schema]) for schema in sorted(SCHEMAS)}
+
+
+class TestLegacyArtifactsStayByteIdentical:
+    """D7: readers learn the new fields but never back-fill them. A pre-migration task or
+    review read, defaulted, updated in an unrelated field through the API or through
+    `frontmatter.py set` is byte-identical afterwards; only a writer that sets the fields
+    (rename, fetch, the stubs, the D8 stamp) changes such a file."""
+
+    def _legacy(self, tmp_path, schema):
+        rel, raw = LEGACY_FIXTURES[schema]
+        path = tmp_path / "artifacts" / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw)
+        return path, raw
+
+    @pytest.mark.parametrize("schema", sorted(SCHEMAS))
+    def test_read_and_defaults_add_nothing(self, tmp_path, schema):
+        from artifact_utils import read_frontmatter, read_frontmatter_validated
+
+        path, raw = self._legacy(tmp_path, schema)
+        data, body = read_frontmatter(str(path))
+        assert not (set(data) & set(NEW_FIELDS)) and body == BODY
+        apply_defaults(data, schema)
+        assert not (set(data) & set(NEW_FIELDS))
+        validated, _ = read_frontmatter_validated(str(path), schema)
+        assert not (set(validated) & set(NEW_FIELDS))
+        assert path.read_bytes() == raw
+
+    @pytest.mark.parametrize("schema", sorted(SCHEMAS))
+    def test_api_update_of_an_unrelated_field_is_byte_identical(self, tmp_path, schema):
+        path, raw = self._legacy(tmp_path, schema)
+        _, _, update = SAMPLES[schema]
+        update_frontmatter(str(path), dict(update), schema)  # the value already on disk
+        assert path.read_bytes() == raw
+        # A different unrelated value changes exactly that line and nothing else.
+        field = "status" if schema.endswith("-task") else "needs_attention"
+        new = "Ready" if field == "status" else True
+        update_frontmatter(str(path), {field: new}, schema)
+        out = path.read_bytes()
+        assert not _NEW_FIELD_LINE.search(out)
+        diff = [(a, b) for a, b in zip(raw.splitlines(), out.splitlines()) if a != b]
+        assert len(raw.splitlines()) == len(out.splitlines())
+        assert len(diff) <= 1 and all(a.startswith(field.encode()) for a, _ in diff)
+
+    @pytest.mark.parametrize("schema", sorted(SCHEMAS))
+    def test_cli_set_of_an_unrelated_field_is_byte_identical(self, tmp_path, schema):
+        path, raw = self._legacy(tmp_path, schema)
+        (field, value), *_ = SAMPLES[schema][2].items()
+        result = subprocess.run(
+            [sys.executable, "scripts/frontmatter.py", "set", str(path), f"{field}={value}"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert path.read_bytes() == raw
+
+    @pytest.mark.parametrize("schema", sorted(SCHEMAS))
+    def test_cli_set_appends_the_fields_only_when_the_caller_sets_them(self, tmp_path, schema):
+        path, raw = self._legacy(tmp_path, schema)
+        type_name = schema.split("-")[0]
+        result = subprocess.run(
+            [sys.executable, "scripts/frontmatter.py", "set", str(path), f"type={type_name}"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert path.read_bytes() == raw.replace(
+            b"---\n" + BODY.encode(), f"type: {type_name}\n---\n".encode() + BODY.encode()
+        )
 
 
 # ── 2. issuetype in the fetch field lists ─────────────────────────────────────
@@ -345,11 +611,14 @@ DESC_MD = (
     "- Manual copies drift from the registry\n- No audit trail\n"
 )
 
-# Captured on main c1df503 by running _fetch_all over ISSUE/COMMENTS.
+# Captured on main c1df503 by running _fetch_all over ISSUE/COMMENTS. PR-3c appends exactly
+# the two self-describing lines after the pre-3c fields (D7); tests/test_fetch_issue.py holds
+# the same golden.
 GOLDEN_TASK = (
     b"---\nrfe_id: RHAIRFE-1595\ntitle: Add model registry export to S3-compatible storage\n"
     b"priority: Major\nstatus: Ready\noriginal_labels:\n- rfe-creator-autofix-rubric-pass\n"
-    b"- customer-request\nlocal_id: null\nsize: null\nparent_key: null\n---\n" + DESC_MD.encode()
+    b"- customer-request\ntype: rfe\ntracker_ref: RHAIRFE-1595\n"
+    b"local_id: null\nsize: null\nparent_key: null\n---\n" + DESC_MD.encode()
 )
 GOLDEN_ORIGINAL = DESC_MD.encode()
 GOLDEN_COMMENTS = (
@@ -381,7 +650,7 @@ def fake_jira(monkeypatch):
 
 
 class TestFetchIssueIssuetype:
-    def test_fetch_all_requests_issuetype_and_writes_identical_artifacts(
+    def test_fetch_all_requests_issuetype_and_writes_the_stamped_golden_artifacts(
         self, tmp_path, monkeypatch, fake_jira
     ):
         # _fetch_all shells out to scripts/frontmatter.py by relative path.
@@ -391,7 +660,17 @@ class TestFetchIssueIssuetype:
             rc = fetch_issue._fetch_all("RHAIRFE-1595", str(artifacts), "http://x", "u", "t")
         assert rc == 0
         assert fake_jira["fields"] == DEFAULT_FIELDS
-        assert (artifacts / "rfe-tasks" / "RHAIRFE-1595.md").read_bytes() == GOLDEN_TASK
+        task = (artifacts / "rfe-tasks" / "RHAIRFE-1595.md").read_bytes()
+        assert task == GOLDEN_TASK
+        # issuetype is requested only; the artifact differs from the c1df503 bytes by the
+        # two PR-3c stamp lines alone (nothing written reads the issue type).
+        assert task.replace(b"type: rfe\ntracker_ref: RHAIRFE-1595\n", b"") == (
+            b"---\nrfe_id: RHAIRFE-1595\ntitle: Add model registry export to S3-compatible"
+            b" storage\npriority: Major\nstatus: Ready\noriginal_labels:\n"
+            b"- rfe-creator-autofix-rubric-pass\n- customer-request\nlocal_id: null\n"
+            b"size: null\nparent_key: null\n---\n" + DESC_MD.encode()
+        )
+        assert b"Feature Request" not in task and b"issuetype" not in task
         assert (artifacts / "rfe-originals" / "RHAIRFE-1595.md").read_bytes() == GOLDEN_ORIGINAL
         assert (
             artifacts / "rfe-tasks" / "RHAIRFE-1595-comments.md"
