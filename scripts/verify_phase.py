@@ -95,6 +95,16 @@ def write_error_stubs(phase, ids, pipeline_type="rfe", outcome="failed", error=N
     unwritten = []
     for rfe_id in ids:
         review_path = f"{tc['reviews_dir']}/{rfe_id}-review.md"
+        why = _outside_reviews_dir(tc["reviews_dir"], review_path, rfe_id)
+        if why:
+            # An id that would resolve outside the reviews directory (a path separator or
+            # a ".." segment) is never written anywhere: the ids files are pipeline-owned,
+            # but this writer is the one place that turns an id into a path it creates.
+            unwritten.append(rfe_id)
+            if failures is not None:
+                failures[rfe_id] = why
+            print(f"verify_phase: {rfe_id}: no {error_msg} stub written: {why}", file=sys.stderr)
+            continue
         cmd = [
             "python3",
             "scripts/frontmatter.py",
@@ -141,6 +151,20 @@ def write_error_stubs(phase, ids, pipeline_type="rfe", outcome="failed", error=N
             file=sys.stderr,
         )
     return unwritten
+
+
+def _outside_reviews_dir(reviews_dir, review_path, rfe_id):
+    """The reason ``review_path`` must not be written, or None when it stays inside
+    ``reviews_dir`` (CWE-22: an id such as ``../../outside`` would escape it)."""
+    root = os.path.realpath(reviews_dir)
+    candidate = os.path.realpath(review_path)
+    try:
+        inside = os.path.commonpath((root, candidate)) == root
+    except ValueError:  # different drives / mixed absolute-relative on some platforms
+        inside = False
+    if inside and os.sep not in rfe_id and "/" not in rfe_id:
+        return None
+    return f"invalid id {rfe_id!r}: its review path would resolve outside {reviews_dir}"
 
 
 def _stub_record(rfe_id, error_msg, pipeline_type):

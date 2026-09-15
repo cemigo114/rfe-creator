@@ -7,6 +7,7 @@ check_review_progress.PHASE_CHECKS.
 """
 
 import os
+import pathlib
 import sys
 
 import pytest
@@ -483,6 +484,25 @@ class TestWriteErrorStubs:
             "verify_phase: RHAIRFE-3: no review_failed stub written: frontmatter.py set failed ("
         )
         assert "and replacing the review frontmatter failed too (IsADirectoryError:" in err[0]
+
+    @pytest.mark.parametrize("bad", ["../../outside", "sub/RHAIRFE-9", "a/../../b"])
+    def test_an_id_that_escapes_the_reviews_dir_is_never_written(self, workdir, capsys, bad):
+        """CWE-22 guard: the ids files are pipeline-owned, but this is the one writer that
+        turns an id into a path it creates, so an id whose review path would resolve outside
+        the reviews directory is reported as unwritten and nothing is created anywhere.
+        (A bare ``..`` is not a traversal here: it names the file ``..-review.md`` inside the
+        reviews directory.)"""
+        before = set(pathlib.Path(".").rglob("*"))
+        failures = {}
+        assert write_error_stubs("review", [bad, "RHAIRFE-1"], failures=failures) == [bad]
+        assert set(failures) == {bad}
+        assert failures[bad].startswith(f"invalid id {bad!r}: its review path would resolve")
+        created = set(pathlib.Path(".").rglob("*")) - before
+        assert pathlib.Path("artifacts/rfe-reviews/RHAIRFE-1-review.md") in created
+        assert all(p.parts[0] == "artifacts" for p in created), created
+        assert not any("outside" in str(p) or "sub" in p.parts for p in created), created
+        err = capsys.readouterr().err.splitlines()
+        assert len(err) == 1 and err[0].startswith(f"verify_phase: {bad}: no review_failed stub")
 
     def test_failures_dict_receives_the_writers_reason(self, workdir, capsys):
         """pipeline_state's stall guard has to report an unwritten stub itself (its ESCALATION
