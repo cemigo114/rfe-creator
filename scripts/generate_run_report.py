@@ -49,6 +49,10 @@ def _type_config(desc):
         # admits the RHAISTRAT strategy rollup this predicate has to exclude.
         "child_parent_prefixes": (desc.local_prefix, *desc.key_prefixes),
         "tracker_prefix": desc.write_prefix,
+        # The tracker key prefixes as a union (write prefix first, then read prefixes): the
+        # pre-migration fallback for tracker_ref tests membership here, not the write
+        # prefix alone, so an artifact fetched under a read prefix is still a ticket.
+        "key_prefixes": tuple(desc.key_prefixes),
         "local_prefix": desc.local_prefix,
     }
 
@@ -115,7 +119,7 @@ def _ids_from_filenames(artifacts_dir, config):
     tasks_dir = os.path.join(artifacts_dir, config["tasks_dir"])
     if not os.path.isdir(tasks_dir):
         return []
-    prefixes = (config["local_prefix"], config["tracker_prefix"])
+    prefixes = (config["local_prefix"], *config["key_prefixes"])
     ids = []
     for filename in os.listdir(tasks_dir):
         if not filename.endswith(".md") or _is_companion_file(filename):
@@ -126,9 +130,27 @@ def _ids_from_filenames(artifacts_dir, config):
     return ids
 
 
-def _task_status_map(tasks, config):
-    """Map item id -> task frontmatter status, for role classification."""
-    return {task_data[config["id_field"]]: task_data.get("status") for _, task_data in tasks}
+def _task_map(tasks, config):
+    """Map item id -> task frontmatter (the validated rows scan_tasks returned), for the
+    tracker_ref and role of each entry."""
+    return {task_data[config["id_field"]]: task_data for _, task_data in tasks}
+
+
+def _is_tracker_key(item_id, config):
+    """``item_id`` carries one of the type's tracker key prefixes (the ``key_prefixes`` union).
+
+    The pre-migration fallback for ``tracker_ref``: an artifact whose frontmatter carries the
+    field is never prefix-sniffed (design work-item-types-unified.md §5).
+    """
+    return item_id.startswith(config["key_prefixes"])
+
+
+def _frontmatter_tracker_ref(task_fm):
+    """The ``tracker_ref`` a task's frontmatter carries, or None (pre-migration artifact,
+    unsubmitted item, or no task file)."""
+    if not task_fm:
+        return None
+    return task_fm.get("tracker_ref") or None
 
 
 def _usable_score(value):
@@ -172,7 +194,7 @@ def build_report(
     # Expand ID list to include split children discovered from task files
     tasks = list(config["scan_tasks"](artifacts_dir))
     children_map = split_children_map(artifacts_dir, config, tasks=tasks)
-    status_map = _task_status_map(tasks, config)
+    task_map = _task_map(tasks, config)
     all_children = [c for kids in children_map.values() for c in kids]
     expanded_ids = list(ids) + [c for c in all_children if c not in ids]
     # ...and every task file the run left behind. The CLI's default population
@@ -182,8 +204,8 @@ def build_report(
     # marked processed yet absent from all 77 entries (RHAIFIRST-582). Tasks
     # without a review land in the review-file-not-found error path below.
     known = set(expanded_ids)
-    expanded_ids += [tid for tid in status_map if tid not in known]
-    known.update(status_map)
+    expanded_ids += [tid for tid in task_map if tid not in known]
+    known.update(task_map)
     # A task file torn mid-write (orchestrator killed) fails the frontmatter
     # scan and would vanish the same way — recover the id from the filename,
     # which is {ID}.md for every task the pipeline writes.
@@ -204,15 +226,15 @@ def build_report(
             review_path = os.path.join(reviews_dir, f"{item_id}-review.md")
             if not os.path.exists(review_path):
                 review_path = None
-        # Error entries carry tracker_ref too — it derives from the id alone,
-        # and without it these are the only rows a consumer would still have
-        # to prefix-sniff.
-        is_tracker_id = item_id.startswith(config["tracker_prefix"])
-        tracker_ref = item_id if is_tracker_id else None
+        # The pre-migration derivation of tracker_ref: the id itself when it carries one
+        # of the type's tracker key prefixes. Error entries carry tracker_ref too and keep
+        # this derivation — it needs nothing but the id, so without it these are the only
+        # rows a consumer would still have to prefix-sniff.
+        fallback_ref = item_id if _is_tracker_key(item_id, config) else None
 
         if not review_path:
             per_item.append(
-                {"id": item_id, "tracker_ref": tracker_ref, "error": "review file not found"}
+                {"id": item_id, "tracker_ref": fallback_ref, "error": "review file not found"}
             )
             counts["errors"] += 1
             continue
@@ -248,24 +270,30 @@ def build_report(
                     if bad:
                         raise ValueError(f"review has unusable {field_name} members: {bad!r}")
         except Exception as e:
-            per_item.append({"id": item_id, "tracker_ref": tracker_ref, "error": str(e)})
+            per_item.append({"id": item_id, "tracker_ref": fallback_ref, "error": str(e)})
             counts["errors"] += 1
             continue
 
         entry = {"id": item_id}
 
-        # The canonical remote reference (work-item-types-unified.md §5): the id
-        # itself once submitted, null while none exists. Consumers must never
+        # The canonical remote reference (work-item-types-unified.md §5): read from
+        # the task frontmatter when the artifact carries it (stamped at fetch and at
+        # rename), null while no ticket exists. A pre-migration artifact has no
+        # field and falls back to the derivation above. Consumers must never
         # infer "is this a real ticket" from the id prefix again.
-        entry["tracker_ref"] = tracker_ref
+        task_fm = task_map.get(item_id)
+        fm_ref = _frontmatter_tracker_ref(task_fm)
+        entry["tracker_ref"] = fm_ref if fm_ref is not None else fallback_ref
 
         # A local-id node that was split again is a structural stepping stone —
         # archived, never submitted, its children re-parented at submit time by
         # split_submit._collect_leaves. Everything else is a leaf. Absent means
-        # the task file was not found, so the role could not be determined.
-        task_status = status_map.get(item_id)
-        if task_status is not None:
-            is_local_id = item_id.startswith(config["local_prefix"])
+        # the task file was not found, so the role could not be determined. An
+        # artifact carrying tracker_ref is a ticket whatever its id looks like;
+        # without the field the id's local prefix decides, as before.
+        if task_fm is not None:
+            task_status = task_fm.get("status")
+            is_local_id = fm_ref is None and item_id.startswith(config["local_prefix"])
             entry["role"] = "intermediary" if is_local_id and task_status == "Archived" else "leaf"
 
         # Provenance: the pre-submission id, persisted by the rename. Only

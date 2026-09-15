@@ -41,6 +41,13 @@ def _report_config(desc):
         "id_field": desc.id_field,
         "jira_prefix": desc.write_prefix,
         "local_prefix": desc.local_prefix,
+        # The id-classification inputs (design work-item-types-unified.md §5): the tracker
+        # key prefixes as a union (write prefix first, then read prefixes) for "is a tracker
+        # key", and the descriptor itself, whose ownership ladder (Descriptor.owns:
+        # local_id_pattern, key prefixes, local prefix) decides "is one of this type's
+        # artifacts" — a split parent_key, and the task-file lookup.
+        "key_prefixes": tuple(desc.key_prefixes),
+        "desc": desc,
         "entity_name": entity,
         "entity_name_plural": html.escape(desc.get("display.entity_plural"), quote=True),
         # Interpolated raw into the <h1>, hence the entity for the ampersand.
@@ -65,6 +72,22 @@ def _report_config(desc):
 REPORT_CONFIG = {name: _report_config(_TYPES.get(name)) for name in _TYPES.names()}
 
 DEFAULT_ARTIFACTS = os.path.join(os.getcwd(), "artifacts")
+
+
+def _is_tracker_key(item_id, config):
+    """``item_id`` carries one of the type's tracker key prefixes (the ``key_prefixes`` union)."""
+    return bool(item_id) and item_id.startswith(config["key_prefixes"])
+
+
+def _tracker_ref(item):
+    """The remote reference to link an item to: its task frontmatter's ``tracker_ref`` when
+    the artifact carries one, else the id itself when it is a tracker key (pre-migration
+    artifacts), else None (a local id — nothing to link)."""
+    ref = item.get("tracker_ref")
+    if ref:
+        return ref
+    rfe_id = item["rfe_id"]
+    return rfe_id if _is_tracker_key(rfe_id, item["_config"]) else None
 
 
 def get_revision_history(body):
@@ -356,11 +379,7 @@ def main():
         review_fm, review_body = read_frontmatter(os.path.join(reviews_dir, rf))
 
         task_path = find_task_file_including_archived(
-            artifacts_dir,
-            rfe_id,
-            config["tasks_dir"],
-            config["jira_prefix"],
-            config["local_prefix"],
+            artifacts_dir, rfe_id, config["tasks_dir"], desc=config["desc"]
         )
         task_fm = {}
         if task_path and os.path.exists(task_path):
@@ -398,9 +417,7 @@ def main():
         # Outcome rollup, which would otherwise file every strategy-linked
         # Initiative under "New Initiatives from Splits".
         parent_key = task_fm.get("parent_key")
-        is_split_child = bool(parent_key) and parent_key.startswith(
-            (config["local_prefix"], config["jira_prefix"])
-        )
+        is_split_child = bool(parent_key) and config["desc"].owns(parent_key)
         is_split_parent = (
             task_fm.get("status") == "Archived" and review_fm.get("recommendation") == "split"
         )
@@ -408,6 +425,11 @@ def main():
         rfes.append(
             {
                 "rfe_id": rfe_id,
+                # The canonical remote reference the task frontmatter carries (stamped at
+                # fetch and at rename); None on a pre-migration or unsubmitted artifact,
+                # where _tracker_ref falls back to the id's tracker key prefix.
+                "tracker_ref": task_fm.get("tracker_ref") or None,
+                "_config": config,
                 "title": title,
                 "is_split_child": is_split_child,
                 "is_split_parent": is_split_parent,
@@ -1492,18 +1514,23 @@ def main():
         return "&mdash;"
 
     has_alignment = "alignment" in config["extra_fields"]
-    jira_prefix = config["jira_prefix"]
 
-    def jira_link(rfe_id):
-        """Wrap an ID in a Jira link if it's a real key and server is configured."""
-        if jira_server and rfe_id.startswith(jira_prefix):
-            return f'<a href="{jira_server}/browse/{html_escape(rfe_id)}" target="_blank" class="jira-link" title="Open in Jira">{html_escape(rfe_id)} &#x1F517;</a>'
+    def jira_link(r):
+        """Wrap an item's ID in a Jira link when it has a ticket and a server is configured.
+
+        The link target is the artifact's tracker_ref when it carries one, else the id
+        itself when it is a tracker key; the visible text is always the id."""
+        rfe_id = r["rfe_id"]
+        ref = _tracker_ref(r)
+        if jira_server and ref:
+            return f'<a href="{jira_server}/browse/{html_escape(ref)}" target="_blank" class="jira-link" title="Open in Jira">{html_escape(rfe_id)} &#x1F517;</a>'
         return html_escape(rfe_id)
 
-    def jira_ext(rfe_id):
-        """Small external link icon for Jira keys in summary table."""
-        if jira_server and rfe_id.startswith(jira_prefix):
-            return f' <a href="{jira_server}/browse/{html_escape(rfe_id)}" target="_blank" style="color:#0f3460;text-decoration:none;font-size:9pt;" title="Open in Jira">&#x1F517;</a>'
+    def jira_ext(r):
+        """Small external link icon for items with a ticket in the summary table."""
+        ref = _tracker_ref(r)
+        if jira_server and ref:
+            return f' <a href="{jira_server}/browse/{html_escape(ref)}" target="_blank" style="color:#0f3460;text-decoration:none;font-size:9pt;" title="Open in Jira">&#x1F517;</a>'
         return ""
 
     def revision_rejected(r):
@@ -1549,7 +1576,7 @@ def main():
             if error:
                 tip = r.get("needs_attention_reason", str(error))
                 rows += f"""        <tr>
-            <td class="key-col"><a href="#{r["rfe_id"]}">{html_escape(r["rfe_id"])}</a>{jira_ext(r["rfe_id"])} {badge(False, error=error, tooltip=tip)}</td>
+            <td class="key-col"><a href="#{r["rfe_id"]}">{html_escape(r["rfe_id"])}</a>{jira_ext(r)} {badge(False, error=error, tooltip=tip)}</td>
             <td colspan="4" style="color:#8b4513;font-size:8pt;">{html_escape(str(error))}</td>
             <td>&mdash;</td>
             <td>{feas}</td>
@@ -1563,7 +1590,7 @@ def main():
                     else ""
                 )
                 rows += f"""        <tr{' style="opacity:0.6;"' if r.get("parent_refused") else ""}>
-            <td class="key-col"><a href="#{r["rfe_id"]}">{html_escape(r["rfe_id"])}</a>{jira_ext(r["rfe_id"])}{refused_marker}{attn_badge(r)}</td>
+            <td class="key-col"><a href="#{r["rfe_id"]}">{html_escape(r["rfe_id"])}</a>{jira_ext(r)}{refused_marker}{attn_badge(r)}</td>
             <td>&mdash;</td>
             <td></td>
             <td>{r["after_total"]}/10</td>
@@ -1575,7 +1602,7 @@ def main():
 """
             else:
                 rows += f'''        <tr>
-            <td class="key-col"><a href="#{r["rfe_id"]}">{html_escape(r["rfe_id"])}</a>{jira_ext(r["rfe_id"])}{rejected_badge(r)}{attn_badge(r)}</td>
+            <td class="key-col"><a href="#{r["rfe_id"]}">{html_escape(r["rfe_id"])}</a>{jira_ext(r)}{rejected_badge(r)}{attn_badge(r)}</td>
             <td>{r["before_total"]}/10</td>
             <td>{badge(r["before_pass"])}</td>
             <td>{r["after_total"]}/10</td>
@@ -1596,7 +1623,7 @@ def main():
             if error:
                 tip = r.get("needs_attention_reason", str(error))
                 rows += f"""        <tr>
-            <td class="key-col"><a href="#{r["rfe_id"]}">{html_escape(r["rfe_id"])}</a>{jira_ext(r["rfe_id"])} {badge(False, error=error, tooltip=tip)}</td>
+            <td class="key-col"><a href="#{r["rfe_id"]}">{html_escape(r["rfe_id"])}</a>{jira_ext(r)} {badge(False, error=error, tooltip=tip)}</td>
             <td>{r["before_total"]}/10</td>
             <td>{badge(r["before_pass"])}</td>
             <td colspan="2" style="font-size:8pt;color:#8b4513;font-weight:600;">&rarr; {len(leaves)} children ({"may be partially submitted" if _split_outcome(error) == "failed" else "not submitted"})</td>
@@ -1614,7 +1641,7 @@ def main():
                     else 0
                 )
                 rows += f"""        <tr>
-            <td class="key-col"><a href="#{r["rfe_id"]}">{html_escape(r["rfe_id"])}</a>{jira_ext(r["rfe_id"])}{attn_badge(r)}</td>
+            <td class="key-col"><a href="#{r["rfe_id"]}">{html_escape(r["rfe_id"])}</a>{jira_ext(r)}{attn_badge(r)}</td>
             <td>{r["before_total"]}/10</td>
             <td>{badge(r["before_pass"])}</td>
             <td colspan="2" style="font-size:8pt;">&rarr; {len(leaves)} children ({leaf_passing}/{len(leaf_scored)} passing, avg {leaf_avg:.1f})</td>
@@ -1757,7 +1784,7 @@ def main():
                 )
                 if is_refused:
                     html += f"""        <tr style="opacity:0.6;">
-            <td class="key-col"><a href="#{r["rfe_id"]}">{html_escape(r["rfe_id"])}</a>{jira_ext(r["rfe_id"])}{refused_marker}</td>
+            <td class="key-col"><a href="#{r["rfe_id"]}">{html_escape(r["rfe_id"])}</a>{jira_ext(r)}{refused_marker}</td>
             <td>&mdash;</td>
             <td></td>
             <td colspan="2" style="font-size:8pt;">superseded &rarr; {len(leaves)} children (not submitted)</td>
@@ -1768,7 +1795,7 @@ def main():
 """
                 else:
                     html += f"""        <tr>
-            <td class="key-col"><a href="#{r["rfe_id"]}">{html_escape(r["rfe_id"])}</a>{jira_ext(r["rfe_id"])}</td>
+            <td class="key-col"><a href="#{r["rfe_id"]}">{html_escape(r["rfe_id"])}</a>{jira_ext(r)}</td>
             <td>&mdash;</td>
             <td></td>
             <td colspan="2" style="font-size:8pt;">superseded &rarr; {len(leaves)} children ({leaf_passing}/{len(leaf_scored)} passing, avg {leaf_avg:.1f})</td>
@@ -1896,7 +1923,7 @@ def main():
 
         html += f'''
         <div class="page">
-            <h1 id="{r["rfe_id"]}">{jira_link(r["rfe_id"])}</h1>
+            <h1 id="{r["rfe_id"]}">{jira_link(r)}</h1>
             <h2>{html_escape(r["title"])}</h2>
             <p style="margin:0 0 10pt 0;font-size:9pt;">{'Split from: <a href="#' + r["parent_key"] + '">' + html_escape(r["parent_key"]) + "</a> &nbsp;|&nbsp; " if r.get("parent_key") else ""}Technical Feasibility: {feasibility_text(r.get("feasibility", ""))}{" &nbsp;|&nbsp; Alignment: " + alignment_text(r.get("alignment", "")) if has_alignment and r.get("alignment") else ""}</p>
 '''
@@ -2031,7 +2058,7 @@ def main():
 """
             for c in leaves:
                 html += f"""                    <tr>
-                        <td class="key-col"><a href="#{c["rfe_id"]}">{html_escape(c["rfe_id"])}</a>{jira_ext(c["rfe_id"])}</td>
+                        <td class="key-col"><a href="#{c["rfe_id"]}">{html_escape(c["rfe_id"])}</a>{jira_ext(c)}</td>
                         <td>{html_escape(c["title"])}</td>
                         <td>{c["after_total"]}/10</td>
                         <td>{badge(c["after_pass"])}</td>

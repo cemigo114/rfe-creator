@@ -26,6 +26,12 @@ Usage:
 
     # Rebuild the rfes.md index from all task and review files
     python3 scripts/frontmatter.py rebuild-index [--artifacts-dir artifacts]
+
+The schema a read/set validates against is chosen by --schema-type, else by the file's own
+``type:`` frontmatter field combined with the task/review kind of its directory (a file whose
+type disagrees with its directory is refused), else by the directory alone. A set never
+writes that disagreement either: under a known directory, --schema-type (or a type= being set)
+must name the directory's own type.
 """
 
 import argparse
@@ -107,6 +113,117 @@ def _detect_schema_type(path):
     return None
 
 
+class SchemaTypeError(Exception):
+    """The frontmatter rung could not name a schema: the file's ``type:`` disagrees with its
+    directory, or names no registered type."""
+
+
+def _frontmatter_type(path):
+    """The work-item type a file's frontmatter declares (its ``type:`` field), or None.
+
+    None for a file that does not exist yet, has no frontmatter, has no ``type`` field, whose
+    frontmatter block is unparseable, or that cannot be read as text at all (not UTF-8,
+    unreadable): none of these is a signal (``set`` repairs a broken file through
+    update_frontmatter; ``read`` fails on it with the parser's or the OS's own message, as
+    before).
+    """
+    if not os.path.isfile(path):
+        return None
+    try:
+        data, _ = read_frontmatter(path)
+    except (ValidationError, UnicodeDecodeError, OSError):
+        return None
+    value = data.get("type")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise SchemaTypeError(
+            f"{path}: frontmatter 'type' must be a non-empty string naming a registered "
+            f"type, got {value!r}"
+        )
+    return value.strip()
+
+
+def _schema_for(path, schema_type=None):
+    """The schema a read or set of ``path`` validates against.
+
+    The design §5 frontmatter rung for the one CLI every skill writes through:
+
+    * ``schema_type`` (``--schema-type``) overrides everything;
+    * else, when the file exists and its frontmatter carries ``type: <name>``, the schema is
+      ``<name>-<kind>`` where kind (task or review) still comes from the path table. A
+      ``type`` naming no registered type, or naming a type other than the one whose
+      directory holds the file (a ``type: initiative`` file under ``rfe-reviews/``), raises
+      SchemaTypeError: an artifact that contradicts itself is never validated against a
+      guess. Without a directory match there is no kind and the path table's answer (None)
+      stands;
+    * else the path table alone, exactly as before (every pre-migration artifact, and every
+      file that does not exist yet).
+
+    Only the schema choice is affected: the bytes a set writes to a file that lacks the
+    self-describing fields are unchanged.
+    """
+    if schema_type:
+        return schema_type
+    by_dir = _detect_schema_type(path)
+    fm_type = _frontmatter_type(path)
+    if fm_type is None or by_dir is None:
+        return by_dir
+    registered = ", ".join(_TYPES.names())
+    if fm_type not in _TYPES:
+        raise SchemaTypeError(
+            f"{path}: frontmatter type: {fm_type} is not a registered type (registered "
+            f"types: {registered})"
+        )
+    dir_type, kind = by_dir.rsplit("-", 1)
+    if dir_type != fm_type:
+        raise SchemaTypeError(
+            f"{path}: frontmatter type: {fm_type} but the path is under the {dir_type} "
+            f"{kind} directory ({by_dir} by path); a self-describing artifact and its "
+            f"directory must agree — move the file or fix the type field"
+        )
+    return f"{fm_type}-{kind}"
+
+
+def _directory_disagreement(path, schema_type, new_type):
+    """Why a ``set`` of ``path`` under ``schema_type`` would leave a self-contradicting artifact
+    on disk, or None when it would not.
+
+    Guards ``--schema-type``, which bypasses the rung: without this, ``--schema-type
+    initiative-task type=initiative`` on a file under ``rfe-tasks/`` writes exactly the
+    artifact ``_schema_for`` then refuses to read. The path table names the directory's type;
+    the effective type is ``new_type`` (a ``type=`` being set), else the ``type:`` the file
+    already declares, else ``schema_type``'s owner. They must agree. A path outside every known
+    directory (path table None) has no directory type and is never refused here, so
+    ``--schema-type`` on such a file works as before. Without ``--schema-type`` this is a
+    no-op: ``_schema_for`` already bound the schema to the directory and ``cmd_set`` already
+    bound ``type=`` to the schema.
+
+    Raises SchemaTypeError when the file's own ``type:`` is not a usable string (the same
+    refusal ``_schema_for`` gives a read of that file).
+    """
+    by_dir = _detect_schema_type(path)
+    if by_dir is None:
+        return None
+    dir_type, kind = by_dir.rsplit("-", 1)
+    if new_type is not None:
+        effective, source = new_type, f"type={new_type}"
+    else:
+        effective = _frontmatter_type(path)
+        source = f"its frontmatter type: {effective}"
+        if effective is None:
+            effective = schema_type.rsplit("-", 1)[0]
+            source = f"--schema-type {schema_type}"
+    if effective == dir_type:
+        return None
+    return (
+        f"{path} is under the {dir_type} {kind} directory ({by_dir} by path) but {source} "
+        f"would make its type {effective}; a self-describing artifact and its directory must "
+        f"agree — write it with the {dir_type} schema and type, or place it under the "
+        f"{effective} type's {kind} directory"
+    )
+
+
 def cmd_schema(args):
     """Print the schema for a file type."""
     try:
@@ -123,7 +240,11 @@ def cmd_read(args):
         print(f"Error: {args.file} not found", file=sys.stderr)
         sys.exit(1)
 
-    schema_type = args.schema_type or _detect_schema_type(args.file)
+    try:
+        schema_type = _schema_for(args.file, args.schema_type)
+    except SchemaTypeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     if schema_type:
         try:
@@ -144,7 +265,11 @@ def cmd_read(args):
 
 def cmd_set(args):
     """Set/update frontmatter fields on a file."""
-    schema_type = args.schema_type or _detect_schema_type(args.file)
+    try:
+        schema_type = _schema_for(args.file, args.schema_type)
+    except SchemaTypeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     if not schema_type:
         print("Error: cannot detect schema type from path. Use --schema-type.", file=sys.stderr)
         sys.exit(1)
@@ -188,6 +313,27 @@ def cmd_set(args):
                 sys.exit(1)
             data[field_name] = _coerce_value(value_str, schema[field_name])
 
+    # A `type=` being written must name the schema's own type: writing `type: initiative`
+    # into a file the rfe schema validates would create exactly the self-contradicting
+    # artifact the rung above refuses to read.
+    schema_owner = schema_type.rsplit("-", 1)[0]
+    if data.get("type") is not None and data["type"] != schema_owner:
+        print(
+            f"Error: type={data['type']} disagrees with the {schema_type} schema that "
+            f"validates {args.file} (its type is {schema_owner})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    # ...and, under a known directory, the directory's own type: an explicit --schema-type
+    # (or a type= it admits) may not write a file the rung above would refuse to read.
+    try:
+        disagreement = _directory_disagreement(args.file, schema_type, data.get("type"))
+    except SchemaTypeError as e:
+        disagreement = str(e)
+    if disagreement:
+        print(f"Error: {disagreement}", file=sys.stderr)
+        sys.exit(1)
+
     if os.path.exists(args.file):
         try:
             update_frontmatter(args.file, data, schema_type)
@@ -212,7 +358,11 @@ def cmd_batch_read(args):
             results.append({"_file": filepath, "_error": "not found"})
             continue
 
-        schema_type = _detect_schema_type(filepath)
+        try:
+            schema_type = _schema_for(filepath)
+        except SchemaTypeError as e:
+            results.append({"_file": filepath, "_error": str(e)})
+            continue
         if schema_type:
             try:
                 data, _ = read_frontmatter_validated(filepath, schema_type)
