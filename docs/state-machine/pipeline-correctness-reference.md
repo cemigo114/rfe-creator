@@ -924,9 +924,15 @@ polling loop to hang until timeout.
 `error` per ID. The output format is `COMPLETED=N/M, PENDING=N, ERRORS=N,
 NEXT_POLL=N`. Error IDs are neither completed nor pending — they form a third
 bucket. Polling terminates when `pending == 0`, so errors cause termination (not
-hang). The review-phase error check (`data.get("error")` at line 36) is gated
-on score being truthy — if score is falsy but error is set, the ID stays
-`pending` rather than being detected as `error`.
+hang). Only an explicit `error` field on a review with a score makes a review
+or revise slot `error`; a file without a readable frontmatter block, or without
+a score, is `pending` — the review agent writes the body first and sets the
+frontmatter in a later tool call, and classifying that moment `error` (as
+7f3cc47 did after CI #122/#128, to keep a broken agent from hanging the
+barrier) released the barrier on a file still being written and sent the item
+through a spurious ERROR_COLLECT retry batch. A review agent that never writes
+its frontmatter is now bounded by the wave stall guard (`docs/wave-stall-guard.md`)
+instead.
 
 **Known bug: revise polling ignores non-revised IDs.** The revise-phase check
 returns "completed" only when `auto_revised=true`. If the revise agent runs but
