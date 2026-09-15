@@ -8,6 +8,7 @@ revision is followed by a review.
 import os
 import subprocess
 import sys
+import types
 
 import pytest
 
@@ -2732,3 +2733,1193 @@ class TestInitRefusesTypesWithoutAPhaseTable:
             text=True,
         )
         assert probe.stdout.strip() == "1"
+
+
+# ---------- Wave stall guard ----------
+
+SCRIPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts"))
+POLL_SECS = 90  # the --max-wait the barrier passes; one fake poll consumes this much fake time
+RFE_SCORES = {"what": 2, "why": 1, "open_to_how": 1, "not_a_task": 0, "right_sized": 1}
+
+
+@pytest.fixture
+def stall_dir(tmp_dir, monkeypatch):
+    """tmp_dir plus a scripts/ symlink and clean knobs.
+
+    The escalation stub is written by ``python3 scripts/frontmatter.py`` (verify_phase's
+    writer) and the consumer runs below shell out to ``scripts/*.py`` relative to cwd.
+    """
+    os.symlink(SCRIPTS_DIR, tmp_dir / "scripts")
+    for d in ("artifacts/initiative-reviews", "artifacts/initiatives", "artifacts/rfe-originals"):
+        os.makedirs(d, exist_ok=True)
+    for var in ("PIPELINE_WAVE_STALL_SECS", "PIPELINE_WAVE_RETRY_CAP"):
+        monkeypatch.delenv(var, raising=False)
+    return tmp_dir
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 1_700_000_000.0
+
+    def now(self):
+        return self.t
+
+    def advance(self, secs):
+        self.t += secs
+
+
+def _arm(monkeypatch, clock, pending, poll_rc=3, during_poll=None):
+    """Fake clock, fake check_id, fake barrier subprocess.
+
+    ``pending`` is a live set of ids or (poll phase, id) pairs that check_id reports pending on
+    every call (everything else is completed), so a test can flip an id to completed. The fake
+    ``check_review_progress.py`` run consumes POLL_SECS of fake time and returns ``poll_rc``;
+    ``during_poll(n)``, if given, runs inside the n-th poll once that time has passed, so a test
+    can complete a slot while the barrier is blocked. Every other subprocess (frontmatter.py,
+    verify_phase.py, the consumer scripts) runs for real. Returns the list of barrier
+    invocations and the real check_id for consumer assertions.
+    """
+    import check_review_progress as crp
+
+    monkeypatch.setattr(ps, "_now", clock.now)
+    real_check_id = crp.check_id
+
+    def fake_check_id(phase, rid):
+        return "pending" if rid in pending or (phase, rid) in pending else "completed"
+
+    monkeypatch.setattr(crp, "check_id", fake_check_id)
+    real_run = subprocess.run
+    polls = []
+
+    def fake_run(cmd, **kw):
+        if any(str(c).endswith("check_review_progress.py") for c in cmd):
+            polls.append(list(cmd))
+            clock.advance(POLL_SECS)
+            if during_poll:
+                during_poll(len(polls))
+            return types.SimpleNamespace(returncode=poll_rc)
+        return real_run(cmd, **kw)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return polls, real_check_id
+
+
+def _drive(max_calls=100):
+    """Re-run wait-for-wave on exit 3 exactly as the orchestrator does.
+
+    Returns the number of calls it took to return (exit 0); fails if the barrier does not
+    terminate within ``max_calls`` — the bounded-barrier property itself.
+    """
+    for n in range(1, max_calls + 1):
+        try:
+            ps.cmd_wait_for_wave([])
+        except SystemExit as exc:
+            assert exc.code == 3
+            continue
+        return n
+    pytest.fail(f"wait-for-wave did not terminate within {max_calls} calls")
+
+
+def _stall_lines(capsys):
+    captured = capsys.readouterr()
+    return captured.out, [
+        ln for ln in captured.err.splitlines() if ln.startswith("wait-for-wave: STALL")
+    ]
+
+
+def _write_review(rid, **over):
+    from artifact_utils import write_frontmatter
+
+    data = {
+        "rfe_id": rid,
+        "score": 5,
+        "pass": False,
+        "recommendation": "revise",
+        "feasibility": "feasible",
+        "scores": dict(RFE_SCORES),
+    }
+    data.update(over)
+    write_frontmatter(f"artifacts/rfe-reviews/{rid}-review.md", data, "rfe-review")
+
+
+def _write_raw_review(rid, **over):
+    """A review written by hand, outside the schema: ``feasibility: likely`` is not in the
+    enum, so update_frontmatter refuses to touch it, yet check_id's review row (score present,
+    no error) reads it as completed and the REVISE / SPLIT waves are reachable."""
+    data = {
+        "rfe_id": rid,
+        "score": 5,
+        "pass": False,
+        "recommendation": "revise",
+        "feasibility": "likely",
+        "scores": dict(RFE_SCORES),
+    }
+    data.update(over)
+    import yaml
+
+    with open(f"artifacts/rfe-reviews/{rid}-review.md", "w") as f:
+        f.write("---\n" + yaml.safe_dump(data, sort_keys=False) + "---\nbody\n")
+
+
+def _write_task(rid, body="body\n", **over):
+    fm = {"rfe_id": rid, "title": f"T {rid}", "priority": "Major", "status": "Ready"}
+    fm.update(over)
+    import yaml
+
+    text = "---\n" + yaml.safe_dump(fm, sort_keys=False) + "---\n" + body
+    with open(f"artifacts/rfe-tasks/{rid}.md", "w") as f:
+        f.write(text)
+    with open(f"artifacts/rfe-originals/{rid}.md", "w") as f:
+        f.write(text)
+
+
+def _sh(*argv):
+    result = subprocess.run(["python3", *argv], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+def _expected_stub(pipeline_type, rid, error):
+    """The registry error stub for ``rid`` as frontmatter.py writes it (defaults applied)."""
+    import artifact_utils
+    import type_registry
+    import validate_types
+
+    desc = type_registry.load().get(pipeline_type)
+    stub = validate_types.build_error_stub(desc, phase=error.rsplit("_", 1)[0])
+    stub[desc.id_field] = rid
+    stub["error"] = error
+    stub["needs_attention_reason"] = f"Agent failed: {error}"
+    return artifact_utils.apply_defaults(stub, f"{pipeline_type}-review")
+
+
+class TestStallRetryCounters:
+    def test_malformed_persisted_counts_read_as_zero(self, tmp_dir):
+        """A hand-edited or truncated counter file must not make a stalled wave fail on
+        ``None < cap`` or buy/deny a retry: only a non-negative non-bool int counts."""
+        os.makedirs("tmp", exist_ok=True)
+        with open(ps.STALL_RETRIES_FILE, "w") as f:
+            f.write(
+                "ASSESS:RHAIRFE-1002:\n"  # null
+                "ASSESS:RHAIRFE-1003: '2'\n"  # string
+                "ASSESS:RHAIRFE-1004: true\n"  # bool
+                "ASSESS:RHAIRFE-1005: -3\n"  # negative
+                "ASSESS:RHAIRFE-1006: 1.5\n"  # float
+                "ASSESS:RHAIRFE-1007: 1\n"  # the only valid one
+                "7: 3\n"  # non-string key is dropped
+            )
+        assert ps._read_stall_retries() == {
+            "ASSESS:RHAIRFE-1002": 0,
+            "ASSESS:RHAIRFE-1003": 0,
+            "ASSESS:RHAIRFE-1004": 0,
+            "ASSESS:RHAIRFE-1005": 0,
+            "ASSESS:RHAIRFE-1006": 0,
+            "ASSESS:RHAIRFE-1007": 1,
+        }
+
+    def test_non_mapping_file_reads_as_empty(self, tmp_dir):
+        os.makedirs("tmp", exist_ok=True)
+        with open(ps.STALL_RETRIES_FILE, "w") as f:
+            f.write("- not\n- a\n- mapping\n")
+        assert ps._read_stall_retries() == {}
+
+
+class TestWaveStallPolicy:
+    """WAVE_STALL_POLICY is keyed by pipeline phase and must classify every agent phase."""
+
+    @pytest.mark.parametrize("ptype", sorted(ps.PIPELINE_TYPES))
+    def test_every_agent_phase_is_classified(self, ptype):
+        config = ps._build_phase_config(ptype)
+        agent_phases = {p for p, c in config.items() if c.get("type") == "agent"}
+        assert set(ps.WAVE_STALL_POLICY) == agent_phases
+        assert set(ps.WAVE_STALL_POLICY.values()) <= {ps.RETRY, ps.ESCALATE}
+
+    @pytest.mark.parametrize("ptype", sorted(ps.PIPELINE_TYPES))
+    def test_escalate_only_is_exactly_the_mutating_phases(self, ptype):
+        """Retry re-dispatches concurrently, so only single-output-file agents may be retried:
+        the phases polling the revise or split base are the ones that edit or mint artifacts."""
+        prefix = ps.PIPELINE_TYPES[ptype]["poll_prefix"]
+        for phase, config in ps._build_phase_config(ptype).items():
+            if config.get("type") != "agent":
+                continue
+            base = config["poll_phase"][len(prefix) :]
+            mutating = base in ("revise", "split")
+            assert (ps.WAVE_STALL_POLICY[phase] == ps.ESCALATE) == mutating, phase
+
+    def test_knobs(self, monkeypatch):
+        for var in ("PIPELINE_WAVE_STALL_SECS", "PIPELINE_WAVE_RETRY_CAP"):
+            monkeypatch.delenv(var, raising=False)
+        assert ps._stall_window(ps.RETRY) == 900
+        assert ps._stall_window(ps.ESCALATE) == 1800
+        assert ps._wave_retry_cap() == 2
+        monkeypatch.setenv("PIPELINE_WAVE_STALL_SECS", "600")
+        monkeypatch.setenv("PIPELINE_WAVE_RETRY_CAP", "1")
+        assert (ps._stall_window(ps.RETRY), ps._stall_window(ps.ESCALATE)) == (600, 1200)
+        assert ps._wave_retry_cap() == 1
+        monkeypatch.setenv("PIPELINE_WAVE_STALL_SECS", "0")
+        assert ps._stall_window(ps.RETRY) == 0 and ps._stall_window(ps.ESCALATE) == 0
+        monkeypatch.setenv("PIPELINE_WAVE_STALL_SECS", "-5")
+        assert ps._stall_window(ps.ESCALATE) == 0
+        monkeypatch.setenv("PIPELINE_WAVE_STALL_SECS", "soon")
+        monkeypatch.setenv("PIPELINE_WAVE_RETRY_CAP", "-1")
+        assert ps._stall_window(ps.RETRY) == 900  # unparsable -> default
+        assert ps._wave_retry_cap() == 0
+
+
+class TestWaveStall:
+    """wait-for-wave terminates on a silently-dead subagent (design D14 / R2).
+
+    Retry-eligible phases re-dispatch the stuck id up to the cap, then escalate it through the
+    verify_phase failure contract; escalate-only phases wait a double window and escalate with
+    the marker their consumers already handle. No fake agent output is ever written.
+    """
+
+    def _assess(self, ids, pipeline_type="rfe", phase="ASSESS"):
+        ps._save_state(make_state(phase=phase, type=pipeline_type, batch=1))
+        write_ids("tmp/pipeline-active-ids.txt", ids)
+        write_ids("tmp/pipeline-all-ids.txt", ids)
+        write_ids(ps.WAVE_IDS_FILE, ids)
+
+    def test_bounded_barrier_retries_then_escalates(self, stall_dir, monkeypatch, capsys):
+        """The plan's bounded-barrier test: one id never completes; the loop still ends."""
+        ids = ["RHAIRFE-1001", "RHAIRFE-1002"]
+        self._assess(ids)
+        _write_review("RHAIRFE-1001", score=9, **{"pass": True, "recommendation": "submit"})
+        clock, pending = _Clock(), {"RHAIRFE-1002"}
+        _arm(monkeypatch, clock, pending)
+        monkeypatch.setattr(ps, "_run_script", lambda cmd: "")  # pre_script / post_verify
+
+        # Stall 1 and 2: the id is left pending, its counter bumped, no marker written, and
+        # next-action re-derives a wave that contains it.
+        rerun = "Re-run: python3 scripts/pipeline_state.py wait-for-wave\n"
+        for attempt in (1, 2):
+            assert _drive() == 900 // POLL_SECS
+            out, lines = _stall_lines(capsys)
+            assert out == rerun * 9  # nine exit-3 polls; the call that returned prints no Re-run
+            assert lines == [
+                "wait-for-wave: STALL in ASSESS (assess+feasibility): no wave slot reached a"
+                " terminal state for 900s (window 900s, policy retry); re-dispatching"
+                f" RHAIRFE-1002 (attempt {attempt}/2)"
+            ]
+            assert ps._read_stall_retries() == {"ASSESS:RHAIRFE-1002": attempt}
+            assert "RHAIRFE-1002" in read_ids("tmp/pipeline-active-ids.txt")
+            assert not os.path.exists("artifacts/rfe-reviews/RHAIRFE-1002-review.md")
+            assert not os.path.exists(ps.WAVE_PROGRESS_FILE)  # fresh window for the retry
+            action = _run_next_action()
+            assert action["action"] == "launch_wave"
+            assert all("RHAIRFE-1002" in a["vars"] for a in action["agents"])
+            assert read_ids(ps.WAVE_IDS_FILE) == ["RHAIRFE-1002"]
+
+        # Stall 3: past the cap -> escalated exactly like a verify_phase failure.
+        assert _drive() == 900 // POLL_SECS
+        out, lines = _stall_lines(capsys)
+        assert out == rerun * 9
+        assert lines == [
+            "wait-for-wave: STALL in ASSESS (assess+feasibility): no wave slot reached a"
+            " terminal state for 900s (window 900s, policy retry); escalating RHAIRFE-1002"
+            " (retry cap 2 reached) -> assess_stalled error-stub review, removed from the wave"
+            " and tmp/pipeline-active-ids.txt"
+        ]
+        from artifact_utils import read_frontmatter
+
+        data, _ = read_frontmatter("artifacts/rfe-reviews/RHAIRFE-1002-review.md")
+        assert data == _expected_stub("rfe", "RHAIRFE-1002", "assess_stalled")
+        assert not os.path.exists("tmp/rfe-assess/single/RHAIRFE-1002.result.md")
+        assert not os.path.exists("artifacts/rfe-reviews/RHAIRFE-1002-feasibility.md")
+        assert read_ids(ps.WAVE_IDS_FILE) == []
+        assert read_ids("tmp/pipeline-active-ids.txt") == ["RHAIRFE-1001"]
+        assert ps._read_stall_retries() == {"ASSESS:RHAIRFE-1002": 2}
+
+        # The barrier is released: advance proceeds on the remaining id.
+        config = ps._get_config(ps._load_state())["ASSESS"]
+        assert ps._check_agent_phase_complete(config)
+        ps.cmd_advance([])
+        assert "ASSESS → REVIEW" in capsys.readouterr().out
+        assert ps._load_state()["phase"] == "REVIEW"
+
+        # ERROR_COLLECT classifies the stall as retryable and queues the one retry batch.
+        ps._save_state(make_state(phase="BATCH_DONE", type="rfe", batch=1, total_batches=1))
+        out = _sh("scripts/error_collect.py", "--type", "rfe")
+        assert "retry batch with 1 error IDs [RHAIRFE-1002]" in out
+        assert read_ids("tmp/pipeline-retry-ids.txt") == ["RHAIRFE-1002"]
+        import yaml
+
+        with open("tmp/pipeline-retry-errors.yaml") as f:
+            assert yaml.safe_load(f) == {"RHAIRFE-1002": {"error": "assess_stalled"}}
+
+    def test_post_verify_runs_on_the_survivors_only_after_escalation(
+        self, stall_dir, monkeypatch, capsys
+    ):
+        """The leg the bounded-barrier test stubs out. After the escalation next-action finds
+        ASSESS complete and runs the REAL post_verify over the ids file the guard rewrote: the
+        survivor's outputs satisfy it and it drops nothing, the escalated id (no longer in that
+        file) is not re-stubbed as assess_failed over its assess_stalled stub, and the phase
+        advances to a REVIEW wave of the survivor alone."""
+        ids = ["RHAIRFE-1001", "RHAIRFE-1002"]
+        self._assess(ids)
+        monkeypatch.setenv("PIPELINE_WAVE_RETRY_CAP", "0")
+        outputs = [
+            "tmp/rfe-assess/single/RHAIRFE-1001.result.md",
+            "artifacts/rfe-reviews/RHAIRFE-1001-feasibility.md",
+        ]
+        for path in outputs:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write("output\n")
+        # RHAIRFE-1002 never finishes; RHAIRFE-1001's review slot stays pending so next-action
+        # stops at REVIEW's first wave instead of walking the rest of the batch.
+        clock, pending = _Clock(), {"RHAIRFE-1002", ("review", "RHAIRFE-1001")}
+        _arm(monkeypatch, clock, pending)
+        scripts, real_run_script = [], ps._run_script
+
+        def spy(cmd):
+            out = real_run_script(cmd)
+            scripts.append((cmd, out))
+            return out
+
+        monkeypatch.setattr(ps, "_run_script", spy)
+
+        assert _drive() == 10
+        _, lines = _stall_lines(capsys)
+        assert "escalating RHAIRFE-1002 (retry cap 0 reached) -> assess_stalled" in lines[0]
+        assert read_ids("tmp/pipeline-active-ids.txt") == ["RHAIRFE-1001"]
+        assert scripts == []  # the escalation itself runs no script
+
+        action = _run_next_action()
+        assert scripts == [
+            (
+                "python3 scripts/verify_phase.py --type rfe --phase assess"
+                " --ids-file tmp/pipeline-active-ids.txt",
+                "FAILED=",
+            )
+        ]
+        assert "ASSESS → REVIEW" in capsys.readouterr().err
+        assert ps._load_state()["phase"] == "REVIEW"
+        assert action["action"] == "launch_wave" and action["phase"] == "REVIEW"
+        assert [a["vars"].splitlines()[1] for a in action["agents"]] == ["ID=RHAIRFE-1001"]
+        assert read_ids("tmp/pipeline-active-ids.txt") == ["RHAIRFE-1001"]
+        assert all(os.path.exists(p) for p in outputs)
+        from artifact_utils import read_frontmatter
+
+        data, _ = read_frontmatter("artifacts/rfe-reviews/RHAIRFE-1002-review.md")
+        assert data == _expected_stub("rfe", "RHAIRFE-1002", "assess_stalled")
+        assert not os.path.exists("artifacts/rfe-reviews/RHAIRFE-1001-review.md")
+
+    def test_mixed_wave_retries_one_and_escalates_the_other(self, stall_dir, monkeypatch, capsys):
+        ids = ["RHAIRFE-1002", "RHAIRFE-1003"]
+        self._assess(ids)
+        ps._write_stall_retries({"ASSESS:RHAIRFE-1002": 2})  # already used its retries
+        clock, pending = _Clock(), set(ids)
+        _arm(monkeypatch, clock, pending)
+        assert _drive() == 10
+        _, lines = _stall_lines(capsys)
+        assert lines == [
+            "wait-for-wave: STALL in ASSESS (assess+feasibility): no wave slot reached a"
+            " terminal state for 900s (window 900s, policy retry); re-dispatching RHAIRFE-1003"
+            " (attempt 1/2); escalating RHAIRFE-1002 (retry cap 2 reached) -> assess_stalled"
+            " error-stub review, removed from the wave and tmp/pipeline-active-ids.txt"
+        ]
+        assert read_ids(ps.WAVE_IDS_FILE) == ["RHAIRFE-1003"]
+        assert read_ids("tmp/pipeline-active-ids.txt") == ["RHAIRFE-1003"]
+        assert ps._read_stall_retries() == {"ASSESS:RHAIRFE-1002": 2, "ASSESS:RHAIRFE-1003": 1}
+
+    def test_stub_names_the_agent_that_died(self, stall_dir, monkeypatch, capsys):
+        """Only the feasibility companion is stuck: the stub says feasibility_stalled, and no
+        feasibility file is fabricated (the assess result the scorer wrote is untouched)."""
+        self._assess(["RHAIRFE-1002"])
+        monkeypatch.setenv("PIPELINE_WAVE_RETRY_CAP", "0")
+        clock, pending = _Clock(), {("feasibility", "RHAIRFE-1002")}
+        _arm(monkeypatch, clock, pending)
+        assert _drive() == 10
+        from artifact_utils import read_frontmatter
+
+        data, _ = read_frontmatter("artifacts/rfe-reviews/RHAIRFE-1002-review.md")
+        assert data == _expected_stub("rfe", "RHAIRFE-1002", "feasibility_stalled")
+        assert not os.path.exists("artifacts/rfe-reviews/RHAIRFE-1002-feasibility.md")
+        _, lines = _stall_lines(capsys)
+        assert "-> feasibility_stalled error-stub review" in lines[0]
+        assert "(retry cap 0 reached)" in lines[0]
+
+    def test_initiative_stub_uses_its_id_field_and_score_fields(
+        self, stall_dir, monkeypatch, capsys
+    ):
+        self._assess(["RHOAIENG-1002"], pipeline_type="initiative")
+        monkeypatch.setenv("PIPELINE_WAVE_RETRY_CAP", "0")
+        clock, pending = _Clock(), {"RHOAIENG-1002"}
+        _arm(monkeypatch, clock, pending)
+        assert _drive() == 10
+        from artifact_utils import read_frontmatter
+
+        data, _ = read_frontmatter("artifacts/initiative-reviews/RHOAIENG-1002-review.md")
+        assert data == _expected_stub("initiative", "RHOAIENG-1002", "assess_stalled")
+        assert data["initiative_id"] == "RHOAIENG-1002"
+        assert "scope" in data["scores"] and "not_a_task" not in data["scores"]
+        assert not os.path.exists("artifacts/rfe-reviews/RHOAIENG-1002-review.md")
+        _, lines = _stall_lines(capsys)
+        assert lines[0].startswith(
+            "wait-for-wave: STALL in ASSESS"
+            " (initiative-assess+initiative-feasibility+initiative-alignment):"
+        )
+        assert read_ids("tmp/pipeline-active-ids.txt") == []
+
+    def test_reset_on_progress(self, stall_dir, monkeypatch, capsys):
+        """A completion inside the window moves the deadline; it is noticed on the pre-poll
+        count of the next call (the post-poll re-check covers completions during the poll)."""
+        ids = ["RHAIRFE-1001", "RHAIRFE-1002"]
+        self._assess(ids)
+        monkeypatch.setenv("PIPELINE_WAVE_RETRY_CAP", "0")
+        clock, pending = _Clock(), set(ids)
+        _arm(monkeypatch, clock, pending)
+        for _ in range(5):  # 450s of no progress
+            with pytest.raises(SystemExit):
+                ps.cmd_wait_for_wave([])
+        pending.discard("RHAIRFE-1001")  # progress at t=450
+        # Without the reset the stall would fire 5 calls later; with it, 10 calls later.
+        assert _drive() == 10
+        _, lines = _stall_lines(capsys)
+        assert "escalating RHAIRFE-1002" in lines[0] and "RHAIRFE-1001" not in lines[0]
+        assert read_ids("tmp/pipeline-active-ids.txt") == ["RHAIRFE-1001"]
+
+    def test_completion_during_the_poll_resets(self, stall_dir, monkeypatch, capsys):
+        """The rule's other half: the count is re-checked when the 90-second poll returns, so a
+        slot that turns terminal while the barrier is blocked in check_review_progress resets
+        the deadline on that same call. Without the post-poll re-check this call would be the
+        one that completes the window and fires the stall."""
+        ids = ["RHAIRFE-1001", "RHAIRFE-1002"]
+        self._assess(ids)
+        monkeypatch.setenv("PIPELINE_WAVE_RETRY_CAP", "0")
+        clock, pending = _Clock(), set(ids)
+        polls_per_window = 900 // POLL_SECS
+
+        def finish_1001_inside_the_window_completing_poll(n):
+            if n == polls_per_window:
+                pending.discard("RHAIRFE-1001")
+
+        _arm(monkeypatch, clock, pending, during_poll=finish_1001_inside_the_window_completing_poll)
+        for _ in range(polls_per_window - 1):  # 810s of no progress: one poll short of the window
+            with pytest.raises(SystemExit) as exc:
+                ps.cmd_wait_for_wave([])
+            assert exc.value.code == 3
+        assert ps._read_wave_progress()["done"] == 0
+        capsys.readouterr()
+
+        with pytest.raises(SystemExit) as exc:  # RHAIRFE-1001 finishes during this poll
+            ps.cmd_wait_for_wave([])
+        assert exc.value.code == 3
+        out, lines = _stall_lines(capsys)
+        assert lines == []
+        assert out == "Re-run: python3 scripts/pipeline_state.py wait-for-wave\n"
+        prog = ps._read_wave_progress()
+        assert prog["done"] == 2  # RHAIRFE-1001's assess and feasibility slots
+        assert prog["last_progress_ts"] == clock.now()  # reset by the post-poll re-check
+        assert not os.path.exists("artifacts/rfe-reviews/RHAIRFE-1002-review.md")
+        assert read_ids("tmp/pipeline-active-ids.txt") == ids
+
+        # The stall fires a full window after that completion, not before.
+        assert _drive() == polls_per_window
+        _, lines = _stall_lines(capsys)
+        assert "escalating RHAIRFE-1002" in lines[0] and "RHAIRFE-1001" not in lines[0]
+        assert read_ids("tmp/pipeline-active-ids.txt") == ["RHAIRFE-1001"]
+
+    def test_split_is_escalate_only(self, stall_dir, monkeypatch, capsys):
+        """SPLIT: no re-dispatch (a second agent would mint duplicate children), a double
+        window, the non-retryable split_not_attempted class and a no-split status file that
+        every split consumer accepts."""
+        parent = "RHAIRFE-1001"
+        ps._save_state(make_state(phase="SPLIT", type="rfe", batch=1))
+        write_ids("tmp/pipeline-split-ids.txt", [parent])
+        write_ids("tmp/pipeline-all-ids.txt", [parent])
+        write_ids(ps.WAVE_IDS_FILE, [parent])
+        _write_review(parent, recommendation="split")
+        clock, pending = _Clock(), {parent}
+        _, real_check_id = _arm(monkeypatch, clock, pending)
+
+        assert _drive() == 1800 // POLL_SECS  # twice the retry window
+        assert not os.path.exists(ps.STALL_RETRIES_FILE)  # never counted as a retry
+        _, lines = _stall_lines(capsys)
+        assert lines == [
+            "wait-for-wave: STALL in SPLIT (split): no wave slot reached a terminal state for"
+            " 1800s (window 1800s, policy escalate-only); escalating RHAIRFE-1001 ->"
+            " split_not_attempted error + no-split status file, removed from the wave and"
+            " tmp/pipeline-split-ids.txt"
+        ]
+        from artifact_utils import read_frontmatter
+
+        data, _ = read_frontmatter(f"artifacts/rfe-reviews/{parent}-review.md")
+        assert data["error"].startswith("split_not_attempted: wave stalled in SPLIT")
+        assert data["recommendation"] == "split" and data["score"] == 5  # review kept intact
+        assert data["needs_attention"] is True  # submit.py labels + comments the parent
+        assert data["needs_attention_reason"] == f"Agent failed: {data['error']}"
+        assert read_ids(ps.WAVE_IDS_FILE) == [] and read_ids("tmp/pipeline-split-ids.txt") == []
+        assert not [f for f in os.listdir("artifacts/rfe-tasks")]  # no child was minted
+
+        # The barrier is released and the phase moves on.
+        ps.cmd_advance([])
+        assert "SPLIT → SPLIT_COLLECT" in capsys.readouterr().out
+
+        # Consumers of the marker.
+        assert real_check_id("split", parent) == "completed"  # the slot is terminal
+        import yaml
+
+        with open(f"artifacts/rfe-reviews/{parent}-split-status.yaml") as f:
+            status = yaml.safe_load(f)
+        assert status["action"] == "no-split" and status["status"] == "failed"
+        assert status["reason"] == data["error"]
+        write_ids("tmp/pipeline-split-ids.txt", [parent])  # were split_collect to read it...
+        assert _sh("scripts/split_collect.py", "--type", "rfe").strip() == "CHILDREN=0"
+        assert read_ids("tmp/pipeline-split-children-ids.txt") == []
+        assert (
+            read_frontmatter(f"artifacts/rfe-reviews/{parent}-review.md")[0]["recommendation"]
+            == "revise"
+        )  # ...the R8 no-split branch, never collect_children
+        assert _sh("scripts/collect_children.py", "--type", "rfe", parent).strip() == f"{parent}:"
+        ps._save_state(make_state(phase="BATCH_DONE", type="rfe", batch=1, total_batches=1))
+        out = _sh("scripts/error_collect.py", "--type", "rfe")
+        assert f"excluded from retry (non-retryable): {parent}" in out
+        assert read_ids("tmp/pipeline-retry-ids.txt") == []
+
+    def test_revise_is_escalate_only(self, stall_dir, monkeypatch, capsys):
+        """REVISE: no re-dispatch (a second agent would double-edit the task file), a double
+        window, the retryable revise_stalled error on the real review with auto_revised left
+        false; ERROR_COLLECT's revise path restores the task file before the retry."""
+        rid = "RHAIRFE-1001"
+        ps._save_state(make_state(phase="REVISE", type="rfe", batch=1))
+        write_ids("tmp/pipeline-revise-ids.txt", [rid])
+        write_ids("tmp/pipeline-active-ids.txt", [rid])
+        write_ids("tmp/pipeline-all-ids.txt", [rid])
+        write_ids(ps.WAVE_IDS_FILE, [rid])
+        _write_review(rid)
+        fm = f"---\nrfe_id: {rid}\ntitle: T\npriority: Major\nstatus: Ready\n---\n"
+        with open(f"artifacts/rfe-originals/{rid}.md", "w") as f:
+            f.write(fm + "original body\n")
+        with open(f"artifacts/rfe-tasks/{rid}.md", "w") as f:
+            f.write(fm + "half-edited body\n")  # the dead agent got this far
+        with open(f"artifacts/rfe-tasks/{rid}-removed-context.yaml", "w") as f:
+            f.write("items: []\n")
+        clock, pending = _Clock(), {rid}
+        _, real_check_id = _arm(monkeypatch, clock, pending)
+
+        assert _drive() == 1800 // POLL_SECS
+        assert not os.path.exists(ps.STALL_RETRIES_FILE)
+        _, lines = _stall_lines(capsys)
+        assert lines == [
+            "wait-for-wave: STALL in REVISE (revise): no wave slot reached a terminal state for"
+            " 1800s (window 1800s, policy escalate-only); escalating RHAIRFE-1001 ->"
+            " revise_stalled error (auto_revised untouched), removed from the wave and"
+            " tmp/pipeline-revise-ids.txt"
+        ]
+        from artifact_utils import read_frontmatter
+
+        data, _ = read_frontmatter(f"artifacts/rfe-reviews/{rid}-review.md")
+        assert data["error"] == "revise_stalled"
+        assert data["auto_revised"] is False  # no revision is claimed
+        assert data["needs_attention"] is True
+        assert data["score"] == 5 and data["recommendation"] == "revise"  # review kept intact
+        assert read_ids(ps.WAVE_IDS_FILE) == [] and read_ids("tmp/pipeline-revise-ids.txt") == []
+        assert read_ids("tmp/pipeline-active-ids.txt") == [rid]  # still in the batch
+
+        # The revise row of check_id keys on auto_revised / recommendation=split, so the
+        # marker alone would still poll as pending: the barrier releases because the id left
+        # the wave and the phase's ids file, which is what advance's guard reads.
+        assert real_check_id("revise", rid) == "pending"
+        config = ps._get_config(ps._load_state())["REVISE"]
+        assert ps._check_agent_phase_complete(config)
+        ps.cmd_advance([])
+        assert "REVISE → FIXUP" in capsys.readouterr().out
+
+        # Consumers: not reassessed, bucketed as an error, retried after a restore.
+        out = _sh("scripts/collect_recommendations.py", "--type", "rfe", "--reassess", rid)
+        assert "REASSESS=\n" in out and f"DONE={rid}" in out
+        assert f"ERRORS={rid}" in _sh("scripts/collect_recommendations.py", "--type", "rfe", rid)
+        ps._save_state(make_state(phase="BATCH_DONE", type="rfe", batch=1, total_batches=1))
+        out = _sh("scripts/error_collect.py", "--type", "rfe")
+        assert f"retry batch with 1 error IDs [{rid}]" in out
+        with open(f"artifacts/rfe-tasks/{rid}.md") as f:
+            assert f.read().endswith("original body\n")
+        assert not os.path.exists(f"artifacts/rfe-tasks/{rid}-removed-context.yaml")
+
+    def test_zero_window_disables_the_guard(self, stall_dir, monkeypatch, capsys):
+        self._assess(["RHAIRFE-1002"])
+        monkeypatch.setenv("PIPELINE_WAVE_STALL_SECS", "0")
+        clock, pending = _Clock(), {"RHAIRFE-1002"}
+        _arm(monkeypatch, clock, pending)
+        before = sorted(os.listdir("tmp"))
+        for _ in range(50):  # 4500s, five retry windows: still the old unbounded wait
+            with pytest.raises(SystemExit) as exc:
+                ps.cmd_wait_for_wave([])
+            assert exc.value.code == 3
+        out, lines = _stall_lines(capsys)
+        assert lines == []
+        assert out == "Re-run: python3 scripts/pipeline_state.py wait-for-wave\n" * 50
+        assert sorted(os.listdir("tmp")) == before  # not even the tracker
+        assert not os.path.exists("artifacts/rfe-reviews/RHAIRFE-1002-review.md")
+
+    def test_new_wave_signature_resets_the_tracker(self, stall_dir, monkeypatch):
+        self._assess(["RHAIRFE-1002"])
+        clock, pending = _Clock(), {"RHAIRFE-1002"}
+        _arm(monkeypatch, clock, pending)
+        stale = {
+            "sig": "ASSESS|RHAIRFE-0999",
+            "phase": "ASSESS",
+            "last_progress_ts": 1.0,
+            "done": 0,
+        }
+        ps._write_wave_progress(stale)
+        with pytest.raises(SystemExit) as exc:  # not a stall, despite the ancient timestamp
+            ps.cmd_wait_for_wave([])
+        assert exc.value.code == 3
+        prog = ps._read_wave_progress()
+        assert prog["sig"] == "ASSESS|RHAIRFE-1002"
+        assert prog["last_progress_ts"] == clock.now() - POLL_SECS  # the pre-poll timestamp
+        assert prog["done"] == 0
+
+    def test_no_stall_leaves_no_trace(self, stall_dir, monkeypatch, capsys):
+        """Byte-identical behaviour when nothing stalls: same output, same exit codes, and
+        the only file the guard adds is its own tmp/ tracker while a wave is pending."""
+        self._assess(["RHAIRFE-1001", "RHAIRFE-1002"])
+        before_tmp = sorted(os.listdir("tmp"))
+        before_reviews = sorted(os.listdir("artifacts/rfe-reviews"))
+        clock, pending = _Clock(), {"RHAIRFE-1002"}
+        _arm(monkeypatch, clock, pending)
+        with pytest.raises(SystemExit) as exc:
+            ps.cmd_wait_for_wave([])
+        assert exc.value.code == 3
+        captured = capsys.readouterr()
+        assert captured.out == "Re-run: python3 scripts/pipeline_state.py wait-for-wave\n"
+        assert captured.err == ""
+        assert sorted(os.listdir("tmp")) == sorted(before_tmp + ["pipeline-wave-progress.yaml"])
+        assert sorted(os.listdir("artifacts/rfe-reviews")) == before_reviews
+        assert read_ids("tmp/pipeline-active-ids.txt") == ["RHAIRFE-1001", "RHAIRFE-1002"]
+
+        pending.clear()
+        _arm(monkeypatch, clock, pending, poll_rc=0)
+        ps.cmd_wait_for_wave([])  # returns
+        captured = capsys.readouterr()
+        assert captured.out == "" and captured.err == ""
+        assert sorted(os.listdir("tmp")) == before_tmp  # tracker cleared on completion
+        assert not os.path.exists(ps.STALL_RETRIES_FILE)
+
+    def test_state_clean_wipes_the_tracker_files(self, stall_dir):
+        ps._write_wave_progress({"sig": "x", "phase": "ASSESS", "last_progress_ts": 1.0, "done": 0})
+        ps._write_stall_retries({"ASSESS:RHAIRFE-1": 1})
+        _sh("scripts/state.py", "clean")
+        assert not os.path.exists(ps.WAVE_PROGRESS_FILE)
+        assert not os.path.exists(ps.STALL_RETRIES_FILE)
+
+    # ----- a new wave never inherits a previous wave's deadline -----
+
+    def test_wave_written_by_next_action_starts_a_fresh_window(
+        self, stall_dir, monkeypatch, capsys
+    ):
+        """The previous barrier never observed exit 0: the agent finished and the orchestrator
+        ran next-action instead of re-running wait-for-wave (the deviation class seen in
+        production), so the tracker stays on disk. When the same phase later runs the same id
+        (the retry batch, a later reassess cycle) the signature matches, and the new wave must
+        not inherit the old deadline and be declared stalled on its first poll."""
+        rid = "RHAIRFE-1002"
+        self._assess([rid])
+        clock, pending = _Clock(), {rid}
+        _arm(monkeypatch, clock, pending)
+        monkeypatch.setattr(ps, "_run_script", lambda cmd: "")
+        with pytest.raises(SystemExit) as exc:
+            ps.cmd_wait_for_wave([])
+        assert exc.value.code == 3
+        stale = ps._read_wave_progress()
+        assert stale["sig"] == f"ASSESS|{rid}"
+
+        pending.clear()  # the agent finishes...
+        action = _run_next_action()  # ...and the orchestrator deviates to next-action
+        assert action["action"] != "launch_wave"  # ASSESS (and REVIEW) complete, no new wave
+        assert ps._read_wave_progress() == stale  # the abandoned tracker is still there
+
+        # Much later the retry batch runs ASSESS over the same id: fresh agents, fresh wave.
+        clock.advance(4000)
+        ps._save_state(make_state(phase="ASSESS", type="rfe", batch=2, retry_cycle=1))
+        write_ids("tmp/pipeline-active-ids.txt", [rid])
+        pending.add(rid)
+        action = _run_next_action()
+        assert action["action"] == "launch_wave" and read_ids(ps.WAVE_IDS_FILE) == [rid]
+        assert not os.path.exists(ps.WAVE_PROGRESS_FILE)  # writing the wave dropped it
+        capsys.readouterr()
+
+        with pytest.raises(SystemExit) as exc:  # first poll: pending, not stalled
+            ps.cmd_wait_for_wave([])
+        assert exc.value.code == 3
+        out, lines = _stall_lines(capsys)
+        assert lines == [] and out == "Re-run: python3 scripts/pipeline_state.py wait-for-wave\n"
+        assert not os.path.exists(ps.STALL_RETRIES_FILE)
+        prog = ps._read_wave_progress()
+        assert prog["sig"] == f"ASSESS|{rid}"
+        assert prog["last_progress_ts"] == clock.now() - POLL_SECS  # the new wave's own clock
+
+    def test_wave_written_by_set_wave_starts_a_fresh_window(self, stall_dir, monkeypatch, capsys):
+        rid = "RHAIRFE-1002"
+        self._assess([rid])
+        clock, pending = _Clock(), {rid}
+        _arm(monkeypatch, clock, pending)
+        stale_ts = clock.now() - 5000
+        ps._write_wave_progress(
+            {"sig": f"ASSESS|{rid}", "phase": "ASSESS", "last_progress_ts": stale_ts, "done": 0}
+        )
+        ps.cmd_set_wave([rid])
+        assert not os.path.exists(ps.WAVE_PROGRESS_FILE)
+        capsys.readouterr()
+        with pytest.raises(SystemExit) as exc:
+            ps.cmd_wait_for_wave([])
+        assert exc.value.code == 3
+        _, lines = _stall_lines(capsys)
+        assert lines == []
+        assert ps._read_wave_progress()["last_progress_ts"] == clock.now() - POLL_SECS
+
+    # ----- escalation never raises: a review the schema rejects gets the stub -----
+
+    def _single_wave(self, phase, ids_file, rid):
+        ps._save_state(make_state(phase=phase, type="rfe", batch=1))
+        write_ids(ids_file, [rid])
+        write_ids("tmp/pipeline-active-ids.txt", [rid])
+        write_ids("tmp/pipeline-all-ids.txt", [rid])
+        write_ids(ps.WAVE_IDS_FILE, [rid])
+
+    def test_revise_escalation_survives_a_schema_invalid_review(
+        self, stall_dir, monkeypatch, capsys
+    ):
+        """update_frontmatter refuses the review; without the fallback the ValidationError fired
+        before the wave and ids files were rewritten and every re-run crashed the same way (a
+        crash loop instead of a pending loop). The marker falls back to the registry stub with
+        the same retryable error and the slot is released."""
+        rid = "RHAIRFE-1001"
+        self._single_wave("REVISE", "tmp/pipeline-revise-ids.txt", rid)
+        _write_raw_review(rid)
+        _write_task(rid)
+        clock, pending = _Clock(), {rid}
+        _arm(monkeypatch, clock, pending)
+
+        assert _drive() == 1800 // POLL_SECS
+        err = capsys.readouterr().err.splitlines()
+        warn = [ln for ln in err if ln.startswith("wait-for-wave: could not mark")]
+        assert warn == [
+            f"wait-for-wave: could not mark {rid}'s review (Frontmatter validation failed after"
+            f" update in artifacts/rfe-reviews/{rid}-review.md: - feasibility: 'likely' not in"
+            " ['feasible', 'infeasible', 'indeterminate']); replacing it with the revise error"
+            " stub (error=revise_stalled)"
+        ]
+        stall = [ln for ln in err if ln.startswith("wait-for-wave: STALL")]
+        assert len(stall) == 1 and f"escalating {rid} -> revise_stalled error" in stall[0]
+        from artifact_utils import read_frontmatter
+
+        data, _ = read_frontmatter(f"artifacts/rfe-reviews/{rid}-review.md")
+        assert data == _expected_stub("rfe", rid, "revise_stalled")
+        assert read_ids(ps.WAVE_IDS_FILE) == [] and read_ids("tmp/pipeline-revise-ids.txt") == []
+        assert not os.path.exists(ps.WAVE_PROGRESS_FILE)
+        ps._save_state(make_state(phase="BATCH_DONE", type="rfe", batch=1, total_batches=1))
+        out = _sh("scripts/error_collect.py", "--type", "rfe")
+        assert f"retry batch with 1 error IDs [{rid}]" in out
+
+    def test_split_escalation_survives_a_schema_invalid_review(
+        self, stall_dir, monkeypatch, capsys
+    ):
+        """Same fallback on the split path, keeping the non-retryable class: the stub carries
+        the split_not_attempted: error, the no-split status file is written first (it does not
+        go through the schema, so the slot is terminal even if the review cannot be marked)."""
+        parent = "RHAIRFE-1001"
+        self._single_wave("SPLIT", "tmp/pipeline-split-ids.txt", parent)
+        _write_raw_review(parent, recommendation="split")
+        clock, pending = _Clock(), {parent}
+        _, real_check_id = _arm(monkeypatch, clock, pending)
+
+        assert _drive() == 1800 // POLL_SECS
+        err = capsys.readouterr().err.splitlines()
+        warn = [ln for ln in err if ln.startswith("wait-for-wave: could not mark")]
+        assert len(warn) == 1
+        assert warn[0].endswith(
+            "replacing it with the split error stub (error=split_not_attempted: wave stalled in"
+            " SPLIT: no agent reached a terminal state for 1800s (window 1800s); the subagent"
+            " produced no output)"
+        )
+        assert len([ln for ln in err if ln.startswith("wait-for-wave: STALL")]) == 1
+        from artifact_utils import read_frontmatter
+
+        data, _ = read_frontmatter(f"artifacts/rfe-reviews/{parent}-review.md")
+        error = data["error"]
+        assert error.startswith("split_not_attempted: wave stalled in SPLIT")
+        expected = _expected_stub("rfe", parent, "split_stalled")
+        expected.update({"error": error, "needs_attention_reason": f"Agent failed: {error}"})
+        assert data == expected
+        import yaml
+
+        with open(f"artifacts/rfe-reviews/{parent}-split-status.yaml") as f:
+            status = yaml.safe_load(f)
+        assert status == {"status": "failed", "action": "no-split", "reason": error}
+        assert real_check_id("split", parent) == "completed"
+        assert read_ids(ps.WAVE_IDS_FILE) == [] and read_ids("tmp/pipeline-split-ids.txt") == []
+        assert not os.listdir("artifacts/rfe-tasks")
+        ps._save_state(make_state(phase="BATCH_DONE", type="rfe", batch=1, total_batches=1))
+        out = _sh("scripts/error_collect.py", "--type", "rfe")
+        assert f"excluded from retry (non-retryable): {parent}" in out
+
+    def test_review_escalation_replaces_an_unmergeable_half_written_review(
+        self, stall_dir, monkeypatch, capsys
+    ):
+        """A review agent that died after writing a partial file with a ``scores`` member the
+        schema does not know: check_id reads it as pending (no score), and frontmatter.py's
+        merge-then-validate cannot turn it into the stub. Before the fallback the escalation
+        dropped the id from the ids file and left no error marker: error_collect never retried
+        it and the run report showed it failed for no reason. Now the frontmatter is replaced
+        with the review_stalled stub and ERROR_COLLECT queues the retry."""
+        rid = "RHAIRFE-1002"
+        self._assess([rid], phase="REVIEW")
+        monkeypatch.setenv("PIPELINE_WAVE_RETRY_CAP", "0")
+        with open(f"artifacts/rfe-reviews/{rid}-review.md", "w") as f:
+            f.write(f"---\nrfe_id: {rid}\nscores:\n  bogus: 1\n---\n")
+        clock, pending = _Clock(), {rid}
+        _, real_check_id = _arm(monkeypatch, clock, pending)
+        assert real_check_id("review", rid) == "pending"  # what the fake stands in for
+
+        assert _drive() == 900 // POLL_SECS
+        assert capsys.readouterr().err.splitlines() == [
+            f"verify_phase: {rid}: frontmatter.py set failed (Error: Frontmatter validation"
+            f" failed after update in artifacts/rfe-reviews/{rid}-review.md: - scores: unknown"
+            " field 'bogus'); replaced the review frontmatter with the review_stalled stub",
+            "wait-for-wave: STALL in REVIEW (review): no wave slot reached a terminal state for"
+            f" 900s (window 900s, policy retry); escalating {rid} (retry cap 0 reached) ->"
+            " review_stalled error-stub review, removed from the wave and"
+            " tmp/pipeline-active-ids.txt",
+        ]
+        from artifact_utils import read_frontmatter
+
+        data, _ = read_frontmatter(f"artifacts/rfe-reviews/{rid}-review.md")
+        assert data == _expected_stub("rfe", rid, "review_stalled")
+        assert real_check_id("review", rid) == "error"  # the slot is terminal
+        assert read_ids(ps.WAVE_IDS_FILE) == [] and read_ids("tmp/pipeline-active-ids.txt") == []
+
+        # ERROR_COLLECT classifies it as retryable and cleans the stub for the retry.
+        ps._save_state(make_state(phase="BATCH_DONE", type="rfe", batch=1, total_batches=1))
+        out = _sh("scripts/error_collect.py", "--type", "rfe")
+        assert f"retry batch with 1 error IDs [{rid}]" in out
+        assert read_ids("tmp/pipeline-retry-ids.txt") == [rid]
+        import yaml
+
+        with open("tmp/pipeline-retry-errors.yaml") as f:
+            assert yaml.safe_load(f) == {rid: {"error": "review_stalled"}}
+        assert not os.path.exists(f"artifacts/rfe-reviews/{rid}-review.md")
+
+    # ----- what submit.py does with a stall-escalated split parent -----
+
+    def test_split_marker_flags_the_parent_for_attention(self, stall_dir):
+        """A stall-escalated split parent is still ``status: Ready`` with no children, so it is
+        not a Phase 1 split parent for submit.py: it reaches Phase 2 as a regular item and is
+        disposed there ("Label only", marked processed in the snapshot, so it is not
+        re-selected until its Jira content changes — docs/wave-stall-guard.md). needs_attention
+        on the marker is what turns that into a visible needs-attention label and comment
+        instead of a silent feasibility-pass label."""
+        parent = "RHAIRFE-1001"
+        _write_task(parent, original_labels=["rfe-rubric-pass"])
+        _write_review(parent, recommendation="split", score=6)
+        reason = "wave stalled in SPLIT: test"
+        assert ps._mark_split_not_attempted([parent], "rfe", reason) == ("split_not_attempted", {})
+        from artifact_utils import read_frontmatter
+
+        data, _ = read_frontmatter(f"artifacts/rfe-reviews/{parent}-review.md")
+        assert data["error"] == f"split_not_attempted: {reason}"
+        assert data["needs_attention"] is True
+        assert data["needs_attention_reason"] == f"Agent failed: split_not_attempted: {reason}"
+        assert data["recommendation"] == "split" and data["score"] == 6  # review kept intact
+
+        import type_registry
+
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith("RFE_CREATOR_") and k not in type_registry.HEADLESS_MARKER_VARS
+        }
+        env.update(
+            JIRA_SERVER="https://fake.atlassian.net", JIRA_USER="fake@example.com", JIRA_TOKEN="t"
+        )
+        result = subprocess.run(
+            ["python3", "scripts/submit.py", "--type", "rfe", "--dry-run"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode == 0, result.stderr
+        plan_row = next(ln for ln in result.stdout.splitlines() if ln.startswith(parent))
+        assert "Label only" in plan_row  # disposed in Phase 2, not re-selected
+        assert f"{parent}: Would add labels: rfe-creator-needs-attention\n" in result.stdout
+        assert f"{parent}: Would post needs-attention comment" in result.stdout
+        # A review carrying an error has no feasibility verdict: the marker's inherited
+        # feasibility: feasible earns no feasibility-pass label (submit.py, finding R2-4).
+        assert "rfe-creator-feasibility" not in result.stdout
+
+    # ----- the tracker record is normalized, never trusted -----
+
+    @pytest.mark.parametrize("bad_ts", ["missing", None, "not-a-number", True])
+    def test_tracker_without_a_usable_timestamp_starts_a_fresh_record(
+        self, stall_dir, monkeypatch, capsys, bad_ts
+    ):
+        """A tracker for the current wave whose last_progress_ts is missing, null or not a
+        number (a hand-edited or truncated file) used to survive _track_wave_progress and
+        make every wait-for-wave call die with KeyError / TypeError on the idle computation:
+        a crash loop instead of a bounded barrier. It is treated as absent: a fresh record,
+        a fresh window, exit 3 as on any first poll."""
+        rid = "RHAIRFE-1002"
+        self._assess([rid])
+        clock, pending = _Clock(), {rid}
+        _arm(monkeypatch, clock, pending)
+        record = {"sig": f"ASSESS|{rid}", "phase": "ASSESS", "done": 0}
+        if bad_ts != "missing":
+            record["last_progress_ts"] = bad_ts
+        ps._write_wave_progress(record)
+
+        with pytest.raises(SystemExit) as exc:
+            ps.cmd_wait_for_wave([])
+        assert exc.value.code == 3
+        out, lines = _stall_lines(capsys)
+        assert lines == [] and out == "Re-run: python3 scripts/pipeline_state.py wait-for-wave\n"
+        prog = ps._read_wave_progress()
+        assert prog == {
+            "sig": f"ASSESS|{rid}",
+            "phase": "ASSESS",
+            "last_progress_ts": clock.now() - POLL_SECS,  # the pre-poll clock: a fresh record
+            "done": 0,
+        }
+        assert not os.path.exists(f"artifacts/rfe-reviews/{rid}-review.md")
+
+    @pytest.mark.parametrize("bad_done", ["3", None, 2.5, False])
+    def test_tracker_done_is_coerced_to_an_int(self, stall_dir, monkeypatch, capsys, bad_done):
+        """A ``done`` that is not an int is read as 0, so the comparison never raises and the
+        worst case is one extra deadline reset (progress is counted from zero again)."""
+        rid = "RHAIRFE-1002"
+        self._assess([rid])
+        clock, pending = _Clock(), {rid}
+        _arm(monkeypatch, clock, pending)
+        stale_ts = clock.now() - 100
+        ps._write_wave_progress(
+            {
+                "sig": f"ASSESS|{rid}",
+                "phase": "ASSESS",
+                "last_progress_ts": stale_ts,
+                "done": bad_done,
+            }
+        )
+        with pytest.raises(SystemExit) as exc:
+            ps.cmd_wait_for_wave([])
+        assert exc.value.code == 3
+        prog = ps._read_wave_progress()
+        assert prog["done"] == 0 and isinstance(prog["done"], int)
+        assert prog["last_progress_ts"] == stale_ts  # no progress (0 -> 0): the deadline stands
+        assert prog["sig"] == f"ASSESS|{rid}"
+
+    # ----- an id no marker could be written for is never retired silently -----
+
+    def _drive_to_failure(self, max_calls=100):
+        """Re-run wait-for-wave on exit 3 until it exits with another code; return that code."""
+        for _ in range(max_calls):
+            try:
+                ps.cmd_wait_for_wave([])
+            except SystemExit as exc:
+                if exc.code == 3:
+                    continue
+                return exc.code
+            pytest.fail("wait-for-wave returned 0 although an escalation failed")
+        pytest.fail(f"wait-for-wave did not terminate within {max_calls} calls")
+
+    def test_review_class_escalation_failure_is_loud_and_leaves_the_id_in_place(
+        self, stall_dir, monkeypatch, capsys
+    ):
+        """The stub writer reports it could not write RHAIRFE-1003's stub. Before: the id was
+        removed from the wave and the ids file anyway, so with no marker on disk it vanished
+        from collect_recommendations --errors, error_collect and the report. Now: the sibling
+        whose stub landed is retired as before, the unrecorded id stays in both files, one
+        ESCALATION FAILED line names it and the command exits 1 instead of 0."""
+        import verify_phase
+
+        ids = ["RHAIRFE-1002", "RHAIRFE-1003"]
+        self._assess(ids)
+        monkeypatch.setenv("PIPELINE_WAVE_RETRY_CAP", "0")
+        clock, pending = _Clock(), set(ids)
+        _arm(monkeypatch, clock, pending)
+        real_writer, calls = verify_phase.write_error_stubs, []
+
+        def failing_writer(phase, ids, pipeline_type="rfe", **kw):
+            calls.append((phase, list(ids), kw.get("outcome")))
+            if "RHAIRFE-1003" in ids:
+                return list(ids)  # nothing written, no reason given
+            return real_writer(phase, ids, pipeline_type, **kw)
+
+        monkeypatch.setattr(verify_phase, "write_error_stubs", failing_writer)
+
+        assert self._drive_to_failure() == 1
+        err = capsys.readouterr().err.splitlines()
+        assert err == [
+            "wait-for-wave: STALL in ASSESS (assess+feasibility): no wave slot reached a"
+            " terminal state for 900s (window 900s, policy retry); escalating RHAIRFE-1002"
+            " (retry cap 0 reached) -> assess_stalled error-stub review, removed from the wave"
+            " and tmp/pipeline-active-ids.txt; escalation FAILED for RHAIRFE-1003 (retry cap 0"
+            " reached) (see next line)",
+            "wait-for-wave: ESCALATION FAILED for RHAIRFE-1003: no error marker could be"
+            " written; left in the wave and tmp/pipeline-active-ids.txt - fix the reviews"
+            " directory and re-run",
+        ]
+        assert calls == [
+            ("assess", ["RHAIRFE-1002"], "stalled"),
+            ("assess", ["RHAIRFE-1003"], "stalled"),
+        ]
+        from artifact_utils import read_frontmatter
+
+        data, _ = read_frontmatter("artifacts/rfe-reviews/RHAIRFE-1002-review.md")
+        assert data == _expected_stub("rfe", "RHAIRFE-1002", "assess_stalled")  # sibling marked
+        assert not os.path.exists("artifacts/rfe-reviews/RHAIRFE-1003-review.md")
+        assert read_ids(ps.WAVE_IDS_FILE) == ["RHAIRFE-1003"]  # left in the wave...
+        assert read_ids("tmp/pipeline-active-ids.txt") == ["RHAIRFE-1003"]  # ...and the ids file
+        assert not os.path.exists(ps.WAVE_PROGRESS_FILE)  # tracker cleared all the same
+        assert not os.path.exists("tmp/rfe-assess/single/RHAIRFE-1003.result.md")
+
+        # After the operator fixes the reviews directory, the re-run escalates it for real.
+        monkeypatch.setattr(verify_phase, "write_error_stubs", real_writer)
+        assert _drive() == 900 // POLL_SECS  # a fresh window, not an instant stall
+        _, lines = _stall_lines(capsys)
+        assert "escalating RHAIRFE-1003 (retry cap 0 reached) -> assess_stalled" in lines[0]
+        data, _ = read_frontmatter("artifacts/rfe-reviews/RHAIRFE-1003-review.md")
+        assert data == _expected_stub("rfe", "RHAIRFE-1003", "assess_stalled")
+        assert read_ids(ps.WAVE_IDS_FILE) == [] and read_ids("tmp/pipeline-active-ids.txt") == []
+
+    def test_revise_escalation_failure_carries_the_writers_reason(
+        self, stall_dir, monkeypatch, capsys
+    ):
+        """Both writers fail for real (the review path is a directory): update_frontmatter
+        raises, then frontmatter.py set and the replace both fail, and the ESCALATION FAILED
+        line carries the writer's reason. The marked sibling is retired; the other stays in
+        the wave and tmp/pipeline-revise-ids.txt and still shows up as an error nowhere, which
+        is exactly why the exit code is 1."""
+        ids = ["RHAIRFE-1001", "RHAIRFE-1002"]
+        ps._save_state(make_state(phase="REVISE", type="rfe", batch=1))
+        write_ids("tmp/pipeline-revise-ids.txt", ids)
+        write_ids("tmp/pipeline-active-ids.txt", ids)
+        write_ids("tmp/pipeline-all-ids.txt", ids)
+        write_ids(ps.WAVE_IDS_FILE, ids)
+        _write_review("RHAIRFE-1001")
+        os.makedirs("artifacts/rfe-reviews/RHAIRFE-1002-review.md")  # neither writer can win
+        clock, pending = _Clock(), set(ids)
+        _arm(monkeypatch, clock, pending)
+
+        assert self._drive_to_failure() == 1
+        err = capsys.readouterr().err.splitlines()
+        assert err[0].startswith("wait-for-wave: could not mark RHAIRFE-1002's review (")
+        assert err[0].endswith("replacing it with the revise error stub (error=revise_stalled)")
+        assert err[1].startswith(
+            "verify_phase: RHAIRFE-1002: no revise_stalled stub written: frontmatter.py set"
+            " failed ("
+        )
+        assert err[2] == (
+            "wait-for-wave: STALL in REVISE (revise): no wave slot reached a terminal state for"
+            " 1800s (window 1800s, policy escalate-only); escalating RHAIRFE-1001 ->"
+            " revise_stalled error (auto_revised untouched), removed from the wave and"
+            " tmp/pipeline-revise-ids.txt; escalation FAILED for RHAIRFE-1002 (see next line)"
+        )
+        assert err[3].startswith(
+            "wait-for-wave: ESCALATION FAILED for RHAIRFE-1002: no error marker could be"
+            " written (RHAIRFE-1002: frontmatter.py set failed ("
+        )
+        assert "and replacing the review frontmatter failed too (IsADirectoryError:" in err[3]
+        assert err[3].endswith(
+            "); left in the wave and tmp/pipeline-revise-ids.txt - fix the reviews directory"
+            " and re-run"
+        )
+        assert len(err) == 4
+        from artifact_utils import read_frontmatter
+
+        data, _ = read_frontmatter("artifacts/rfe-reviews/RHAIRFE-1001-review.md")
+        assert data["error"] == "revise_stalled" and data["score"] == 5  # sibling marked
+        assert read_ids(ps.WAVE_IDS_FILE) == ["RHAIRFE-1002"]
+        assert read_ids("tmp/pipeline-revise-ids.txt") == ["RHAIRFE-1002"]
+        assert read_ids("tmp/pipeline-active-ids.txt") == ids
+        assert not os.path.exists(ps.WAVE_PROGRESS_FILE)
+        assert os.path.isdir("artifacts/rfe-reviews/RHAIRFE-1002-review.md")  # untouched
+        # The barrier is NOT released for the phase: the id is still in the ids file.
+        config = ps._get_config(ps._load_state())["REVISE"]
+        assert not ps._check_agent_phase_complete(config)
+
+    def test_split_escalation_failure_writes_no_status_file_for_the_unrecorded_parent(
+        self, stall_dir, monkeypatch, capsys
+    ):
+        """Split path with the writers stubbed as the finding describes: update_frontmatter
+        raises for one parent and the stub writer returns it as failed. That parent gets no
+        no-split status file either (a status file would make its slot terminal and let the
+        next poll release it with no error recorded), stays in the wave and
+        tmp/pipeline-split-ids.txt, and the command exits 1. The sibling gets marker and
+        status file and is retired."""
+        import artifact_utils
+        import verify_phase
+
+        parents = ["RHAIRFE-1001", "RHAIRFE-1002"]
+        ps._save_state(make_state(phase="SPLIT", type="rfe", batch=1))
+        write_ids("tmp/pipeline-split-ids.txt", parents)
+        write_ids("tmp/pipeline-all-ids.txt", parents)
+        write_ids(ps.WAVE_IDS_FILE, parents)
+        for parent in parents:
+            _write_review(parent, recommendation="split")
+        clock, pending = _Clock(), set(parents)
+        _, real_check_id = _arm(monkeypatch, clock, pending)
+        real_update = artifact_utils.update_frontmatter
+
+        def update(path, updates, schema):
+            if "RHAIRFE-1002" in path:
+                raise OSError("read-only reviews directory")
+            return real_update(path, updates, schema)
+
+        def writer(phase, ids, pipeline_type="rfe", **kw):
+            failures = kw.get("failures")
+            if failures is not None:
+                for rid in ids:
+                    failures[rid] = "frontmatter.py set failed (read-only reviews directory)"
+            return list(ids)
+
+        monkeypatch.setattr(artifact_utils, "update_frontmatter", update)
+        monkeypatch.setattr(verify_phase, "write_error_stubs", writer)
+
+        assert self._drive_to_failure() == 1
+        err = capsys.readouterr().err.splitlines()
+        assert err == [
+            "wait-for-wave: could not mark RHAIRFE-1002's review (read-only reviews directory);"
+            " replacing it with the split error stub (error=split_not_attempted: wave stalled in"
+            " SPLIT: no agent reached a terminal state for 1800s (window 1800s); the subagent"
+            " produced no output)",
+            "wait-for-wave: STALL in SPLIT (split): no wave slot reached a terminal state for"
+            " 1800s (window 1800s, policy escalate-only); escalating RHAIRFE-1001 ->"
+            " split_not_attempted error + no-split status file, removed from the wave and"
+            " tmp/pipeline-split-ids.txt; escalation FAILED for RHAIRFE-1002 (see next line)",
+            "wait-for-wave: ESCALATION FAILED for RHAIRFE-1002: no error marker could be"
+            " written (RHAIRFE-1002: frontmatter.py set failed (read-only reviews directory));"
+            " left in the wave and tmp/pipeline-split-ids.txt - fix the reviews directory and"
+            " re-run",
+        ]
+        from artifact_utils import read_frontmatter
+
+        data, _ = read_frontmatter("artifacts/rfe-reviews/RHAIRFE-1001-review.md")
+        assert data["error"].startswith("split_not_attempted: wave stalled in SPLIT")
+        assert os.path.exists("artifacts/rfe-reviews/RHAIRFE-1001-split-status.yaml")
+        assert real_check_id("split", "RHAIRFE-1001") == "completed"
+        data, _ = read_frontmatter("artifacts/rfe-reviews/RHAIRFE-1002-review.md")
+        assert data.get("error") is None  # untouched: no marker, no claim
+        assert not os.path.exists("artifacts/rfe-reviews/RHAIRFE-1002-split-status.yaml")
+        assert real_check_id("split", "RHAIRFE-1002") == "pending"  # the slot stays pending
+        assert read_ids(ps.WAVE_IDS_FILE) == ["RHAIRFE-1002"]
+        assert read_ids("tmp/pipeline-split-ids.txt") == ["RHAIRFE-1002"]
+        assert not os.path.exists(ps.WAVE_PROGRESS_FILE)
+        assert not os.listdir("artifacts/rfe-tasks")
+
+    def test_split_marker_return_shape_names_the_unrecorded_parents(self, stall_dir, monkeypatch):
+        """Unit view of the contract _escalate_stuck relies on: both markers return their
+        label and ``id -> reason`` for the ids they could not mark; a writer that gives no
+        reason yields None."""
+        import verify_phase
+
+        monkeypatch.setattr(
+            verify_phase, "write_error_stubs", lambda phase, ids, *a, **kw: list(ids)
+        )
+        _write_review("RHAIRFE-1001")
+        label, failures = ps._mark_revise_stalled(["RHAIRFE-1001", "RHAIRFE-1002"], "rfe")
+        assert label == "revise_stalled" and failures == {"RHAIRFE-1002": None}
+        label, failures = ps._mark_split_not_attempted(["RHAIRFE-1003"], "rfe", "test")
+        assert label == "split_not_attempted" and failures == {"RHAIRFE-1003": None}
+        assert not os.path.exists("artifacts/rfe-reviews/RHAIRFE-1003-split-status.yaml")

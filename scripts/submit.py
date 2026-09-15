@@ -31,6 +31,7 @@ import type_registry  # noqa: E402
 from artifact_utils import (  # noqa: E402
     ValidationError,
     find_removed_context_yaml,
+    read_frontmatter,
     read_frontmatter_validated,
     rebuild_index,
     rename_to_tracker_key,
@@ -38,8 +39,8 @@ from artifact_utils import (  # noqa: E402
     scan_tasks,
     update_frontmatter,
 )
+from generate_run_report import SPLIT_NOT_ATTEMPTED_PREFIX, _parse_run_id  # noqa: E402
 from generate_run_report import TYPE_CONFIG as REPORT_TYPE_CONFIG  # noqa: E402
-from generate_run_report import _parse_run_id  # noqa: E402
 from jira_utils import (  # noqa: E402
     add_comment,
     add_labels,
@@ -135,6 +136,52 @@ def _find_review(artifacts_dir, item_id, cfg):
     """Find review file path for an item, or None."""
     path = os.path.join(artifacts_dir, cfg["reviews_dir"], f"{item_id}-review.md")
     return path if os.path.isfile(path) else None
+
+
+def _review_error(artifacts_dir, item_id, cfg):
+    """The ``error`` of an item's review as a string, or None (no review, an unreadable one,
+    or no error). Read with the lax reader on purpose: the error is what matters here and a
+    review the schema rejects may still carry one."""
+    review_path = _find_review(artifacts_dir, item_id, cfg)
+    if not review_path:
+        return None
+    try:
+        data, _ = read_frontmatter(review_path)
+    except Exception:
+        return None
+    error = data.get("error") if isinstance(data, dict) else None
+    return str(error) if error else None
+
+
+# The reason the pipeline's wave stall guard puts after ``split_not_attempted:`` (see
+# pipeline_state._stall_reason). Only THAT marker means "the split agent never finished and its
+# children were never reviewed"; this script's own ``split_not_attempted: Jira preflight
+# failed`` / ``split phase aborted`` markers mean "not attempted yet" and a re-run over the same
+# artifacts (the manual submit jobs) must still attempt those.
+STALL_NOT_ATTEMPTED_PREFIX = f"{SPLIT_NOT_ATTEMPTED_PREFIX} wave stalled"
+
+
+def _is_stall_escalation(error):
+    """True for the review errors the pipeline's wave stall guard leaves on an item it gave
+    up on (docs/wave-stall-guard.md): ``split_not_attempted: wave stalled ...`` and the
+    ``<agent>_stalled`` stubs. This script's own not-attempted markers are NOT matched."""
+    return bool(error) and (
+        error.startswith(STALL_NOT_ATTEMPTED_PREFIX) or error.endswith("_stalled")
+    )
+
+
+def _feasibility_verdict(review_data):
+    """The review's feasibility verdict, or None when the review carries an ``error``.
+
+    An error-bearing review has no verdict: the registry error stub (``*_failed`` /
+    ``*_stalled``) inherits ``feasibility: feasible`` from the stub shape although no
+    feasibility review ran, and a stall or split marker on a real review no longer
+    describes the item's state. With None, feasibility_label_changes adds no label and
+    removes none, so whatever label the item carries in Jira is left alone.
+    """
+    if not review_data or review_data.get("error"):
+        return None
+    return review_data.get("feasibility")
 
 
 def _generate_reports(args):
@@ -398,6 +445,19 @@ def main():
         and data[id_field].startswith(jira_prefix)
         and data[id_field] in child_parent_keys
     }
+    # A parent whose review the wave stall guard marked (split_not_attempted: / *_stalled)
+    # left the pipeline before its children were collected: a split agent that was slow
+    # rather than dead can still archive the parent and mint children afterwards, but no
+    # SPLIT_ASSESS / SPLIT_REVIEW wave ever saw them, and split_submit.py would push them
+    # without review data. Such a parent is not split-submitted and not marked processed
+    # (it is in no plan): the children stay local, the parent stays selectable, and the
+    # run report keeps counting it failed, not split.
+    stalled_split_parents = {}
+    for parent_key in sorted(split_parent_data):
+        error = _review_error(args.artifacts_dir, parent_key, cfg)
+        if _is_stall_escalation(error):
+            stalled_split_parents[parent_key] = error
+            del split_parent_data[parent_key]
     split_parents = list(split_parent_data.keys())
 
     _parent_of = {}
@@ -420,6 +480,14 @@ def main():
     # Hoisted above the split loop: both loops record into it, and every exit
     # path reports it.
     submit_errors = []
+
+    if stalled_split_parents:
+        for parent_key, error in stalled_split_parents.items():
+            print(
+                f"  {parent_key}: SKIP split-submit - review error {error}; children were not"
+                " reviewed, left for an operator"
+            )
+        print()
 
     if split_parents:
         print(f"Phase 1: Submitting {len(split_parents)} split parent(s)\n")
@@ -679,7 +747,7 @@ def main():
         if not _has_jira_ancestor(data[id_field])
     )
     if not submittable:
-        if split_parents or any_submitted:
+        if split_parents or stalled_split_parents or any_submitted:
             if cfg["has_index"]:
                 rebuild_index(args.artifacts_dir)
                 print(f"Done. Index rebuilt at {args.artifacts_dir}/rfes.md")
@@ -707,7 +775,7 @@ def main():
             labels.append(cfg["rubric_pass_label"])
         if review_data:
             feas_add, _ = feasibility_label_changes(
-                review_data.get("feasibility"),
+                _feasibility_verdict(review_data),
                 is_reject=False,
                 original_labels=original_labels,
                 feasibility_labels=cfg["feasibility_labels"],
@@ -784,9 +852,12 @@ def main():
         # auto-approves. An `indeterminate` verdict means the assessment was
         # inconclusive, which is not a basis for transitioning a ticket to
         # Approved on its own. `needs_attention` is advisory here — it drives
-        # the needs-attention label, not the transition.
-        auto_approve = (
+        # the needs-attention label, not the transition. A review carrying an
+        # `error` has no verdict at all (see _feasibility_verdict), whatever
+        # its `pass` and `feasibility` fields say.
+        auto_approve = bool(
             review_data
+            and not review_data.get("error")
             and review_data.get("pass", False)
             and review_data.get("feasibility") == "feasible"
         )
@@ -872,7 +943,7 @@ def main():
                     feas_remove = []
                     if review_data:
                         _, feas_remove = feasibility_label_changes(
-                            review_data.get("feasibility"),
+                            _feasibility_verdict(review_data),
                             is_reject=False,
                             original_labels=original_labels,
                             feasibility_labels=cfg["feasibility_labels"],
@@ -902,7 +973,7 @@ def main():
         feas_remove = []
         if review_data:
             _, feas_remove = feasibility_label_changes(
-                review_data.get("feasibility"),
+                _feasibility_verdict(review_data),
                 is_reject=False,
                 original_labels=original_labels,
                 feasibility_labels=cfg["feasibility_labels"],

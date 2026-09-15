@@ -7,6 +7,7 @@ check_review_progress.PHASE_CHECKS.
 """
 
 import os
+import pathlib
 import sys
 
 import pytest
@@ -18,6 +19,7 @@ from verify_phase import (  # noqa: E402
     _INITIATIVE_PHASE_OUTPUT,
     _RFE_PHASE_OUTPUT,
     verify,
+    write_error_stubs,
 )
 
 SCRIPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts"))
@@ -63,6 +65,10 @@ def _failed(capsys):
 
 
 REVIEW_FM = "---\nrfe_id: RHAIRFE-1\nscore: 7\n---\nBody\n"
+# A review agent that died after writing a partial file: no score (check_id: pending, verify:
+# failed) and a ``scores`` member the schema does not know, which frontmatter.py's
+# merge-then-validate cannot repair — the stub never sets ``scores.bogus``.
+UNMERGEABLE_FM = "---\nrfe_id: RHAIRFE-2\nscores:\n  bogus: 1\n---\nhalf-written body\n"
 
 
 # ── Degenerate inputs ─────────────────────────────────────────────────────────
@@ -354,3 +360,195 @@ class TestDerivedFromRegistry:
             "review": "artifacts/widget-reviews/W-1-review.md",
             "split": "artifacts/widget-reviews/W-1-split-status.yaml",
         }
+
+
+# ── The stub writer on its own ────────────────────────────────────────────────
+
+
+class TestWriteErrorStubs:
+    """verify() and pipeline_state's wave stall guard share one writer; only the outcome
+    suffix differs (failed: the agent finished without output; stalled: it never finished)."""
+
+    def test_default_outcome_is_failed(self, workdir):
+        from artifact_utils import read_frontmatter
+
+        write_error_stubs("review", ["RHAIRFE-1"])
+        data, _ = read_frontmatter("artifacts/rfe-reviews/RHAIRFE-1-review.md")
+        assert data["error"] == "review_failed"
+        assert data["needs_attention_reason"] == "Agent failed: review_failed"
+
+    def test_stalled_outcome_keeps_the_stub_shape(self, workdir):
+        import validate_types
+        from artifact_utils import apply_defaults, read_frontmatter
+        from type_registry import load
+
+        write_error_stubs("feasibility", ["INIT-001", "INIT-002"], "initiative", outcome="stalled")
+        for id_ in ("INIT-001", "INIT-002"):
+            data, _ = read_frontmatter(f"artifacts/initiative-reviews/{id_}-review.md")
+            expected = validate_types.build_error_stub(
+                load().get("initiative"), phase="feasibility"
+            )
+            expected.update(
+                {
+                    "initiative_id": id_,
+                    "error": "feasibility_stalled",
+                    "needs_attention_reason": "Agent failed: feasibility_stalled",
+                }
+            )
+            assert data == apply_defaults(expected, "initiative-review")
+
+    def test_error_override_replaces_the_derived_value(self, workdir):
+        """The stall guard keeps the non-retryable split_not_attempted: class when a split
+        parent's review has to be replaced by the stub."""
+        from artifact_utils import read_frontmatter
+
+        error = "split_not_attempted: wave stalled in SPLIT: test"
+        write_error_stubs("split", ["RHAIRFE-1"], error=error)
+        data, _ = read_frontmatter("artifacts/rfe-reviews/RHAIRFE-1-review.md")
+        assert data["error"] == error
+        assert data["needs_attention_reason"] == f"Agent failed: {error}"
+        assert data["score"] == 0 and data["recommendation"] == "revise"
+        assert data["needs_attention"] is True
+
+    def test_repairs_a_schema_invalid_review(self, workdir):
+        """The stub sets every field the schema constrains, so frontmatter.py set's
+        merge-then-validate turns a review the schema rejects into a valid stub (the body is
+        kept) instead of failing the way update_frontmatter does on a partial update."""
+        from artifact_utils import read_frontmatter
+
+        _write(
+            "artifacts/rfe-reviews/RHAIRFE-1-review.md",
+            "---\nrfe_id: RHAIRFE-1\nscore: 5\nfeasibility: likely\n---\nbody\n",
+        )
+        write_error_stubs("revise", ["RHAIRFE-1"], outcome="stalled")
+        data, body = read_frontmatter("artifacts/rfe-reviews/RHAIRFE-1-review.md")
+        assert data["error"] == "revise_stalled" and data["feasibility"] == "feasible"
+        assert body.strip() == "body"
+
+    def test_replaces_a_review_the_stub_cannot_be_merged_into(self, workdir, capsys):
+        """frontmatter.py set merges, so a member the stub does not set fails the merged
+        record's validation. Swallowing that left the id dropped from its ids file with no
+        error marker: never retried, reported failed for no reason. The fallback replaces the
+        frontmatter outright, keeps the body, and says so once on stderr."""
+        from artifact_utils import read_frontmatter_validated
+
+        _write("artifacts/rfe-reviews/RHAIRFE-2-review.md", UNMERGEABLE_FM)
+        assert write_error_stubs("review", ["RHAIRFE-2"], outcome="stalled") == []
+        data, body = read_frontmatter_validated(
+            "artifacts/rfe-reviews/RHAIRFE-2-review.md", "rfe-review"
+        )
+        assert data["error"] == "review_stalled"
+        assert data["scores"] == {
+            "what": 0,
+            "why": 0,
+            "open_to_how": 0,
+            "not_a_task": 0,
+            "right_sized": 0,
+        }
+        assert body == "half-written body\n"
+        assert capsys.readouterr().err.splitlines() == [
+            "verify_phase: RHAIRFE-2: frontmatter.py set failed (Error: Frontmatter validation"
+            " failed after update in artifacts/rfe-reviews/RHAIRFE-2-review.md: - scores: unknown"
+            " field 'bogus'); replaced the review frontmatter with the review_stalled stub"
+        ]
+
+    def test_fallback_writes_the_record_frontmatter_py_writes(self, workdir, capsys):
+        """Two writers, one stub: the replaced review equals the merged one field for field,
+        in the same order, and the merge path stays silent."""
+        from artifact_utils import read_frontmatter
+
+        _write("artifacts/rfe-reviews/RHAIRFE-2-review.md", UNMERGEABLE_FM)
+        assert write_error_stubs("assess", ["RHAIRFE-1", "RHAIRFE-2"], outcome="stalled") == []
+        merged, _ = read_frontmatter("artifacts/rfe-reviews/RHAIRFE-1-review.md")
+        replaced, _ = read_frontmatter("artifacts/rfe-reviews/RHAIRFE-2-review.md")
+        merged["rfe_id"] = "RHAIRFE-2"
+        assert replaced == merged
+        assert list(replaced) == list(merged)
+        err = capsys.readouterr().err.splitlines()
+        assert len(err) == 1 and err[0].startswith("verify_phase: RHAIRFE-2: ")
+
+    def test_returns_the_ids_no_stub_could_be_written_for(self, workdir, capsys):
+        """The residual degradation: neither writer can produce the file (here the review path
+        is a directory). That id is returned and named on stderr; the others are written."""
+        from artifact_utils import read_frontmatter
+
+        os.makedirs("artifacts/rfe-reviews/RHAIRFE-3-review.md")
+        ids = ["RHAIRFE-1", "RHAIRFE-3", "RHAIRFE-4"]
+        assert write_error_stubs("review", ids) == ["RHAIRFE-3"]
+        for id_ in ("RHAIRFE-1", "RHAIRFE-4"):
+            data, _ = read_frontmatter(f"artifacts/rfe-reviews/{id_}-review.md")
+            assert data["error"] == "review_failed"
+        err = capsys.readouterr().err.splitlines()
+        assert len(err) == 1
+        assert err[0].startswith(
+            "verify_phase: RHAIRFE-3: no review_failed stub written: frontmatter.py set failed ("
+        )
+        assert "and replacing the review frontmatter failed too (IsADirectoryError:" in err[0]
+
+    @pytest.mark.parametrize("bad", ["../../outside", "sub/RHAIRFE-9", "a/../../b"])
+    def test_an_id_that_escapes_the_reviews_dir_is_never_written(self, workdir, capsys, bad):
+        """CWE-22 guard: the ids files are pipeline-owned, but this is the one writer that
+        turns an id into a path it creates, so an id whose review path would resolve outside
+        the reviews directory is reported as unwritten and nothing is created anywhere.
+        (A bare ``..`` is not a traversal here: it names the file ``..-review.md`` inside the
+        reviews directory.)"""
+        before = set(pathlib.Path(".").rglob("*"))
+        failures = {}
+        assert write_error_stubs("review", [bad, "RHAIRFE-1"], failures=failures) == [bad]
+        assert set(failures) == {bad}
+        assert failures[bad].startswith(f"invalid id {bad!r}: its review path would resolve")
+        created = set(pathlib.Path(".").rglob("*")) - before
+        assert pathlib.Path("artifacts/rfe-reviews/RHAIRFE-1-review.md") in created
+        assert all(p.parts[0] == "artifacts" for p in created), created
+        assert not any("outside" in str(p) or "sub" in p.parts for p in created), created
+        err = capsys.readouterr().err.splitlines()
+        assert len(err) == 1 and err[0].startswith(f"verify_phase: {bad}: no review_failed stub")
+
+    def test_failures_dict_receives_the_writers_reason(self, workdir, capsys):
+        """pipeline_state's stall guard has to report an unwritten stub itself (its ESCALATION
+        FAILED line), so the writer hands the reason back structurally when asked: the same
+        text the stderr line carries, keyed by id, only for the ids it returns."""
+        os.makedirs("artifacts/rfe-reviews/RHAIRFE-3-review.md")
+        failures = {}
+        assert write_error_stubs("review", ["RHAIRFE-1", "RHAIRFE-3"], failures=failures) == [
+            "RHAIRFE-3"
+        ]
+        assert list(failures) == ["RHAIRFE-3"]
+        reason = failures["RHAIRFE-3"]
+        assert reason.startswith("frontmatter.py set failed (")
+        assert "and replacing the review frontmatter failed too (IsADirectoryError:" in reason
+        assert "\n" not in reason
+        err = capsys.readouterr().err.splitlines()
+        assert err == [f"verify_phase: RHAIRFE-3: no review_failed stub written: {reason}"]
+
+    def test_verify_stdout_is_unchanged_by_the_fallback(self, workdir, capsys):
+        """verify() reaches the fallback on its own (a review without a score is a failed
+        review) and its FAILED= contract line is byte-identical; the fallback speaks on stderr
+        only, and the repaired file carries verify's own error."""
+        from artifact_utils import read_frontmatter
+
+        _write_ids("RHAIRFE-1", "RHAIRFE-2")
+        _write("artifacts/rfe-reviews/RHAIRFE-1-review.md", REVIEW_FM)
+        _write("artifacts/rfe-reviews/RHAIRFE-2-review.md", UNMERGEABLE_FM)
+        verify("review", "ids.txt")
+        captured = capsys.readouterr()
+        assert captured.out == "FAILED=RHAIRFE-2\n"
+        assert captured.err.splitlines() == [
+            "verify_phase: RHAIRFE-2: frontmatter.py set failed (Error: Frontmatter validation"
+            " failed after update in artifacts/rfe-reviews/RHAIRFE-2-review.md: - scores: unknown"
+            " field 'bogus'); replaced the review frontmatter with the review_failed stub"
+        ]
+        assert _read_ids() == ["RHAIRFE-1"]
+        data, _ = read_frontmatter("artifacts/rfe-reviews/RHAIRFE-2-review.md")
+        assert data["error"] == "review_failed" and "bogus" not in data["scores"]
+
+    def test_verify_delegates_to_the_writer(self, workdir, capsys, monkeypatch):
+        import verify_phase
+
+        calls = []
+        monkeypatch.setattr(verify_phase, "write_error_stubs", lambda *a, **k: calls.append((a, k)))
+        _write_ids("RHAIRFE-1", "RHAIRFE-2")
+        _write("tmp/rfe-assess/single/RHAIRFE-2.result.md", "result\n")
+        verify("assess", "ids.txt")
+        assert calls == [(("assess", ["RHAIRFE-1"], "rfe"), {})]
+        assert _read_ids() == ["RHAIRFE-2"]
