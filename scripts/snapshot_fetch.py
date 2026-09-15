@@ -111,10 +111,25 @@ def _blank_negated_groups(jql):
     positive about the binding, so none of the clauses inside it is read."""
     out = []
     i = 0
+    outer_quote = None
     while i < len(jql):
+        ch = jql[i]
+        # A quoted literal is copied verbatim: a ``not (`` inside ``summary ~ "not (a"`` is
+        # text, not a group, and must not swallow the clauses that follow it.
+        if outer_quote is not None:
+            if ch == outer_quote:
+                outer_quote = None
+            out.append(ch)
+            i += 1
+            continue
+        if ch in "\"'":
+            outer_quote = ch
+            out.append(ch)
+            i += 1
+            continue
         match = _JQL_NOT_GROUP_RE.match(jql, i)
         if match is None:
-            out.append(jql[i])
+            out.append(ch)
             i += 1
             continue
         depth, quote, j = 0, None, match.end() - 1

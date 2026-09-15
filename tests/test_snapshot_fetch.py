@@ -1211,6 +1211,19 @@ class TestJqlBindingCheck:
     @pytest.mark.parametrize(
         "jql",
         [
+            'summary ~ "not (a" AND project = RHOAIENG',
+            "summary ~ 'NOT (x' AND project = RHOAIENG",
+            'text ~ "foo not (bar) baz" AND issuetype = Epic',
+        ],
+    )
+    def test_a_quoted_not_paren_is_text_not_a_negated_group(self, jql):
+        """``not (`` inside a quoted literal must not open a group and swallow the clauses
+        after it (the guard would otherwise pass a conflicting JQL through)."""
+        assert jql_binding_conflict(jql, self.RFE, "rfe") is not None
+
+    @pytest.mark.parametrize(
+        "jql",
+        [
             'issuetype in ("Feature Request")',
             "project in (RHAIRFE) AND issuetype in ('Feature Request')",
             "project not in (RHOAIENG)",

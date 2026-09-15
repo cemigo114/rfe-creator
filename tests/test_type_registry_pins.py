@@ -2229,7 +2229,15 @@ class TestSkillLayer:
         mcp = re.search(r"mcp__atlassian__getJiraIssue .*?fields=\[([^\]]*)\]", text).group(1)
         fields = [f.strip('"') for f in mcp.split(",")]
         assert fields[:5] == ["summary", "description", "priority", "labels", "status"]
-        pin("companions.comments", "fetch-agent.md MCP fields", comments, fields[5:] == ["comment"])
+        # PR-3c-ii: the MCP fallback requests the same two witnesses fetch_issue verifies and
+        # stops before any write on a mismatch (the fallback cannot call verify_binding).
+        assert fields[5:7] == ["issuetype", "project"]
+        pin("companions.comments", "fetch-agent.md MCP fields", comments, fields[7:] == ["comment"])
+        assert (
+            f"If the response's project.key or issuetype.name differs from the {ctx.t} binding "
+            f"(python3 scripts/type_registry.py binding {ctx.t} shows it), report the mismatch "
+            "and stop — write no files."
+        ) in text
         pin(
             "companions.comments",
             "fetch-agent.md",
