@@ -64,7 +64,19 @@ agent phase must be classified.
 bumped, and the command exits 0. The orchestrator runs `next-action` as
 usual; its pre-filter re-derives a wave from the still-pending ids and
 launches them again (running the phase's `pre_script` again, which is
-idempotent). Ids at the cap are escalated instead.
+idempotent). A re-dispatch relaunches *every* agent of that id's wave, not
+only the stuck slot — the wave directive is per id, and `prep_assess.py`
+re-stages the item, so a scorer that had already finished runs once more;
+that is the cost of a retry and the reason the policy admits only idempotent
+phases. Ids at the cap are escalated instead.
+
+Observed live (fault-injected eval, 2026-09-15, window 60 s, one weak-draft
+case at full effort): the scorer finished inside the first poll, the
+feasibility agent did not, the second poll returned with no new completion,
+the barrier printed the STALL line and exited 0, and the orchestrator
+continued with `next-action` ("The stall guard re-dispatched the stuck
+feasibility agent. The barrier exited 0, so continuing with next-action").
+The re-dispatched wave completed and the run passed.
 
 **Escalate.** Escalation goes through the existing post-barrier contract and
 never fabricates agent output — no assess result, dimension file or fetch
