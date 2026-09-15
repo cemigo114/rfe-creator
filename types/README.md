@@ -316,13 +316,15 @@ on a freshly created file the schema defaults the CLI materializes (`local_id`, 
 `original_labels`, `size`) follow it, and a fetch appends `tracker_ref:` after it; the D8 review
 stamp and the rename stamp on an existing file are the ones that land truly last.
 `artifact_utils.rename_to_tracker_key` stamps `tracker_ref:` (and `type:` when absent) on the task
-and review files it already rewrites at submit time. **Review** files are stamped `type:` by
-`verify_phase.py` after the review barrier, deterministically (D8) — not by the review-agent or
+and review files it already rewrites at submit time, and refuses the whole rename — before any
+file is touched — when either of them declares another type. **Review** files are stamped `type:`
+by `verify_phase.py` after the review barrier, deterministically (D8) — not by the review-agent or
 revise-agent prompts, so an interactive review stays unstamped and every reader tolerates that.
 That stamp is a pure append (`artifact_utils.append_frontmatter_field`: the one `type: <t>` line
 is inserted before the closing `---`, every other byte kept) rather than a `frontmatter.py set`,
 whose re-dump would also materialize defaults, rename `revised` and re-wrap long strings on a
-review of an older schema vintage; a review the schema rejects in another field is left unstamped.
+review of an older schema vintage; a review the schema rejects in another field is left unstamped,
+and an id whose review path would resolve outside the reviews directory is failed, never stamped.
 Rules (D7): new artifacts only — there is no back-fill pass; fields are appended in the writer's
 order and never reordered; a pre-migration artifact stays byte-identical until a writer rewrites it
 anyway, and `frontmatter.py set` / the `artifact_utils` writers add neither field to a file that

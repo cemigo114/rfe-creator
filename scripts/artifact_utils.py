@@ -991,6 +991,24 @@ def _review_to_rename(reviews_dir, item_id, desc):
     return old_review if os.path.isfile(old_review) else None
 
 
+def _reject_declared_type_conflict(path, desc, label):
+    """Refuse to rename an artifact that says it is not one of ``desc``'s.
+
+    ``rename_to_tracker_key`` calls this for the task file and the review file before it
+    renames or rewrites anything, so a conflict leaves every file exactly where and as it
+    was — the same pre-flight contract as its id guards, hence the same ``ValueError`` with
+    the same label. Only a non-empty declared type that differs from ``desc.name`` is a
+    conflict; a file that is missing, declares no ``type``, declares an empty one or does
+    not parse is left to the rename (``_declared_type`` reads all of those as None, and the
+    stamp then applies).
+    """
+    declared = _declared_type(path)
+    if declared is not None and declared != desc.name:
+        raise ValueError(
+            f"{label}: {path} declares type={declared!r}, expected {desc.name}; nothing renamed"
+        )
+
+
 def rename_to_tracker_key(artifacts_dir, item_id, tracker_key, desc):
     """Rename a submitted item's files from its local id to its tracker key.
 
@@ -1004,11 +1022,20 @@ def rename_to_tracker_key(artifacts_dir, item_id, tracker_key, desc):
     fields (``type`` first, then ``tracker_ref``, the schema order). Companion files are
     renamed only, never rewritten.
 
+    A task or review file that already declares another type is not this type's to rename:
+    the conflict is detected before the first ``os.rename`` and raised as a ``ValueError``
+    naming the file, the type it declares and the one expected, with every file left
+    untouched (no half-renamed item to repair).
+
     Args:
         artifacts_dir: path to artifacts directory
         item_id: e.g. "RFE-001" — must match ``identity.local_id_pattern``
         tracker_key: e.g. "RHAIRFE-1600" — must be the type's write prefix + digits
         desc: a ``type_registry.Descriptor``
+
+    Raises:
+        ValueError: ``item_id`` or ``tracker_key`` is not the documented shape, or the task
+            or review file declares a type other than ``desc.name``.
     """
     # Both ids become path components below. item_id comes from validated
     # frontmatter, but tracker_key arrives from a Jira API response — reject
@@ -1028,6 +1055,17 @@ def rename_to_tracker_key(artifacts_dir, item_id, tracker_key, desc):
     tasks_dir = os.path.join(artifacts_dir, dirs["tasks"])
     reviews_dir = os.path.join(artifacts_dir, dirs["reviews"])
     id_field = desc.id_field
+
+    # The two files the rename rewrites are the two it may not claim from another type:
+    # both are checked here, before the first os.rename, so a conflict leaves the item
+    # exactly as it was (the task rename below never touches reviews_dir, so the review
+    # resolved here is the one renamed after it).
+    _reject_declared_type_conflict(os.path.join(tasks_dir, f"{item_id}.md"), desc, label)
+    old_review = (
+        _review_to_rename(reviews_dir, item_id, desc) if os.path.isdir(reviews_dir) else None
+    )
+    if old_review is not None:
+        _reject_declared_type_conflict(old_review, desc, label)
 
     # Rename task file and companions
     if os.path.isdir(tasks_dir):
@@ -1071,18 +1109,16 @@ def rename_to_tracker_key(artifacts_dir, item_id, tracker_key, desc):
                 )
 
     # Rename review file
-    if os.path.isdir(reviews_dir):
-        old_review = _review_to_rename(reviews_dir, item_id, desc)
-        if old_review is not None:
-            new_review = os.path.join(reviews_dir, f"{tracker_key}-review.md")
-            os.rename(old_review, new_review)
-            update_frontmatter(
-                new_review,
-                _self_describing(
-                    new_review, {id_field: tracker_key, "local_id": item_id}, tracker_key, desc
-                ),
-                f"{desc.name}-review",
-            )
+    if old_review is not None:
+        new_review = os.path.join(reviews_dir, f"{tracker_key}-review.md")
+        os.rename(old_review, new_review)
+        update_frontmatter(
+            new_review,
+            _self_describing(
+                new_review, {id_field: tracker_key, "local_id": item_id}, tracker_key, desc
+            ),
+            f"{desc.name}-review",
+        )
 
 
 def _self_describing(path, updates, tracker_key, desc):
@@ -1090,7 +1126,9 @@ def _self_describing(path, updates, tracker_key, desc):
     <desc.name>`` only when the file at ``path`` declares none yet (a pre-migration draft),
     then ``tracker_ref: tracker_key`` always. Appended after the caller's fields, so on a
     file that already has them they are overwritten in place and on one that lacks them they
-    land after every existing field (D7: appended, never reordered)."""
+    land after every existing field (D7: appended, never reordered). By the time this runs
+    a declared type can only be ``desc.name`` — a different one was rejected by
+    ``_reject_declared_type_conflict`` before the rename began."""
     stamped = dict(updates)
     if _declared_type(path) is None:
         stamped["type"] = desc.name

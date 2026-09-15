@@ -81,10 +81,13 @@ def _is_tracker_key(item_id, config):
 
 def _tracker_ref(item):
     """The remote reference to link an item to: its task frontmatter's ``tracker_ref`` when
-    the artifact carries one, else the id itself when it is a tracker key (pre-migration
-    artifacts), else None (a local id — nothing to link)."""
+    the artifact carries one as a non-empty string, else the id itself when it is a tracker
+    key (pre-migration artifacts), else None (a local id — nothing to link). The task
+    frontmatter is read unvalidated, so any other shape a hand-edited file may carry (a
+    list, a number, an empty string) is not a reference: it is ignored and the id rule
+    decides, rather than being interpolated into a URL."""
     ref = item.get("tracker_ref")
-    if ref:
+    if isinstance(ref, str) and ref:
         return ref
     rfe_id = item["rfe_id"]
     return rfe_id if _is_tracker_key(rfe_id, item["_config"]) else None

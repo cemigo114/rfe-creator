@@ -551,6 +551,15 @@ class TestTrackerRefOfAnItem:
         item = {"rfe_id": "RHAIOLD-7", "tracker_ref": None, "_config": _union_rfe_config()}
         assert generate_review_pdf._tracker_ref(item) == "RHAIOLD-7"
 
+    @pytest.mark.parametrize("bad", [["RHAIRFE-1"], 5, "", 0, {"k": "v"}, True])
+    def test_a_non_string_or_empty_value_is_not_a_reference(self, bad):
+        # The task frontmatter is read unvalidated: only a non-empty str is a reference;
+        # anything else falls through to the id rule instead of being put into a URL.
+        key = {"rfe_id": "RHAIRFE-1595", "tracker_ref": bad, "_config": REPORT_CONFIG["rfe"]}
+        assert generate_review_pdf._tracker_ref(key) == "RHAIRFE-1595"
+        local = {"rfe_id": "RFE-001", "tracker_ref": bad, "_config": REPORT_CONFIG["rfe"]}
+        assert generate_review_pdf._tracker_ref(local) is None
+
 
 def _task(root, type_name, item_id, title="T", status="Ready", extra=""):
     dirs = REPORT_CONFIG[type_name]
@@ -634,6 +643,28 @@ class TestReportLinksAndSplitClassification:
         assert "browse/RFE-002" not in html
         assert "browse/RFE-003" not in html
         assert "New RFEs from Splits (1)" in html
+
+    def test_a_non_string_tracker_ref_falls_back_to_the_id_rule(self, tmp_path, monkeypatch):
+        """A hand-edited task file may carry `tracker_ref: [x]` or `tracker_ref: 5`; the
+        report neither raises on it nor links to it — the id rule decides, as for an
+        artifact without the field (a tracker key links to itself, a local id has no link)."""
+        root = tmp_path / "artifacts"
+        _task(root, "rfe", "RHAIRFE-4004", extra="type: rfe\ntracker_ref: [x]\n")
+        _review(root, "rfe", "RHAIRFE-4004")
+        _task(root, "rfe", "RFE-005", extra="type: rfe\ntracker_ref: 5\n")
+        _review(root, "rfe", "RFE-005")
+        _task(root, "rfe", "RFE-006", extra="tracker_ref: [x]\n")
+        _review(root, "rfe", "RFE-006")
+        _task(root, "rfe", "RHAIRFE-7007", extra="tracker_ref: 7\n")
+        _review(root, "rfe", "RHAIRFE-7007")
+
+        html = _render(tmp_path, monkeypatch, "rfe")
+
+        assert _link("RHAIRFE-4004", "RHAIRFE-4004") in html
+        assert _link("RHAIRFE-7007", "RHAIRFE-7007") in html
+        assert "browse/RFE-005" not in html and "browse/RFE-006" not in html
+        for junk in ("browse/5", "browse/7", "browse/[", "browse/x"):
+            assert junk not in html, junk
 
     def test_initiative_rollup_is_not_a_split(self, tmp_path, monkeypatch):
         root = tmp_path / "artifacts"

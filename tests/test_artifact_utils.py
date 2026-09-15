@@ -1605,13 +1605,107 @@ class TestRenameStampsSelfDescribingFields:
         # defaults write_frontmatter appended); only tracker_ref was added, at the end.
         assert list(review)[7:10] == ["scores", "type", "local_id"]
 
-    def test_a_declared_type_is_never_overwritten(self, tmp_dir):
-        # Not a shape the pipeline produces; the rename's contract is "type only when absent".
+    @pytest.mark.parametrize(
+        "declared, kept_in_place",
+        [(None, False), ("rfe", True), ("''", True)],
+        ids=["absent", "equal", "empty"],
+    )
+    def test_an_absent_or_matching_type_lets_the_rename_stamp(
+        self, tmp_dir, declared, kept_in_place
+    ):
+        """The passing side of the pre-flight type check: no `type` -> stamped after the
+        existing fields; `type: rfe` -> kept where it is, only tracker_ref added; an empty
+        string is "none declared" (`_declared_type`), so it is stamped in place too."""
         os.makedirs("artifacts/rfe-tasks")
-        _write("artifacts/rfe-tasks/RFE-001.md", _task_fm("rfe_id", "RFE-001", type="initiative"))
+        extra = {} if declared is None else {"type": declared}
+        _write("artifacts/rfe-tasks/RFE-001.md", _task_fm("rfe_id", "RFE-001", **extra))
         rename_to_tracker_key("artifacts", "RFE-001", "RHAIRFE-1", RFE)
+        assert not os.path.exists("artifacts/rfe-tasks/RFE-001.md")
         data, _ = read_frontmatter("artifacts/rfe-tasks/RHAIRFE-1.md")
-        assert (data["type"], data["tracker_ref"]) == ("initiative", "RHAIRFE-1")
+        assert (data["rfe_id"], data["local_id"], data["status"]) == (
+            "RHAIRFE-1",
+            "RFE-001",
+            "Submitted",
+        )
+        assert (data["type"], data["tracker_ref"]) == ("rfe", "RHAIRFE-1")
+        # Field order (D7): the file's own fields first; then, for a file without `type`,
+        # the rename's fields in stamp order (local_id, type, tracker_ref); for one that
+        # has it, `type` stays where it was and only tracker_ref is added. The schema
+        # defaults update_frontmatter materializes on a minimal file (size, ...) follow.
+        keys = list(data)
+        assert keys[:4] == ["rfe_id", "title", "priority", "status"]
+        if kept_in_place:
+            assert keys[4:7] == ["type", "local_id", "tracker_ref"]
+        else:
+            assert keys[4:7] == ["local_id", "type", "tracker_ref"]
+
+    @pytest.mark.parametrize(
+        "task_type, review_type, offending, declared",
+        [
+            ("initiative", None, "artifacts/rfe-tasks/RFE-001.md", "initiative"),
+            (None, "initiative", "artifacts/rfe-reviews/RFE-001-review.md", "initiative"),
+            ("epic", "initiative", "artifacts/rfe-tasks/RFE-001.md", "epic"),
+        ],
+        ids=["task", "review", "both-task-first"],
+    )
+    def test_a_conflicting_declared_type_is_rejected_before_anything_is_renamed(
+        self, tmp_dir, task_type, review_type, offending, declared
+    ):
+        """A task or review file that declares another type is not this type's to rename:
+        the rename raises before its first os.rename, naming the file and both types, and
+        every file — task, companions, review — is left byte-identical under its old name,
+        with nothing under the tracker key."""
+        self._draft()
+        if task_type is not None:
+            _write("artifacts/rfe-tasks/RFE-001.md", _task_fm("rfe_id", "RFE-001", type=task_type))
+        if review_type is not None:
+            _write(
+                "artifacts/rfe-reviews/RFE-001-review.md",
+                f"---\nrfe_id: RFE-001\nscore: 8\ntype: {review_type}\n---\nBody.\n",
+            )
+        before = _snapshot("artifacts")
+        with pytest.raises(ValueError) as exc:
+            rename_to_tracker_key("artifacts", "RFE-001", "RHAIRFE-1", RFE)
+        assert str(exc.value) == (
+            f"rename_to_jira_key: {offending} declares type={declared!r}, expected rfe; "
+            "nothing renamed"
+        )
+        assert _snapshot("artifacts") == before
+        assert not any(
+            name.startswith("RHAIRFE-1")
+            for d in ("artifacts/rfe-tasks", "artifacts/rfe-reviews")
+            for name in os.listdir(d)
+        )
+
+    def test_the_review_check_follows_the_slug_tolerant_lookup(self, tmp_dir):
+        # The review checked is the one _review_to_rename would rename — for rfe, a legacy
+        # slug-suffixed name too — not only `{item_id}-review.md`.
+        os.makedirs("artifacts/rfe-tasks")
+        _write("artifacts/rfe-tasks/RFE-001.md", _task_fm("rfe_id", "RFE-001"))
+        _write(
+            "artifacts/rfe-reviews/RFE-001-some-slug-review.md",
+            "---\nrfe_id: RFE-001\nscore: 8\ntype: initiative\n---\nBody.\n",
+        )
+        before = _snapshot("artifacts")
+        with pytest.raises(
+            ValueError, match=r"RFE-001-some-slug-review\.md declares type='initiative'"
+        ):
+            rename_to_tracker_key("artifacts", "RFE-001", "RHAIRFE-1", RFE)
+        assert _snapshot("artifacts") == before
+
+    def test_initiative_rename_rejects_a_conflict_with_its_own_label(self, tmp_dir):
+        os.makedirs("artifacts/initiatives")
+        _write(
+            "artifacts/initiatives/INIT-001.md", _task_fm("initiative_id", "INIT-001", type="rfe")
+        )
+        before = _snapshot("artifacts")
+        with pytest.raises(ValueError) as exc:
+            rename_initiative_to_jira_key("artifacts", "INIT-001", "RHOAIENG-1")
+        assert str(exc.value) == (
+            "rename_initiative_to_jira_key: artifacts/initiatives/INIT-001.md declares "
+            "type='rfe', expected initiative; nothing renamed"
+        )
+        assert _snapshot("artifacts") == before
 
     def test_initiative_rename_stamps_the_same_way(self, tmp_dir):
         os.makedirs("artifacts/initiatives")

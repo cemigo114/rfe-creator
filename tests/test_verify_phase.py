@@ -425,6 +425,47 @@ class TestReviewTypeStamp:
         # review lacks (local_id, error, ..., alignment) are NOT materialized by the stamp.
         assert text == review.replace("---\nBody\n", "type: initiative\n---\nBody\n")
 
+    @pytest.mark.parametrize(
+        "bad, resolved, needs_dir",
+        [
+            ("../../outside", "outside-review.md", None),
+            ("sub/RHAIRFE-9", "artifacts/rfe-reviews/sub/RHAIRFE-9-review.md", None),
+            ("a/../../b", "artifacts/b-review.md", "artifacts/rfe-reviews/a"),
+        ],
+    )
+    def test_a_review_outside_the_reviews_dir_is_failed_never_stamped(
+        self, workdir, capsys, bad, resolved, needs_dir
+    ):
+        """CWE-22, the stamp side: an id whose review path escapes the reviews directory
+        (or carries a separator) may name a real, usable file — the stamp must not write to
+        it. verify() fails the id instead of stamping, on the same `_outside_reviews_dir`
+        guard write_error_stubs applies, so the id flows to the stub writer, which refuses
+        the same path: the outside file stays byte-identical, no stub lands anywhere, the id
+        is reported in FAILED= and dropped, and the healthy neighbour is stamped as usual."""
+        if needs_dir:
+            os.makedirs(needs_dir)
+        target = pathlib.Path(resolved)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(REVIEW_FM)
+        _write_ids(bad, "RHAIRFE-1")
+        _write("artifacts/rfe-reviews/RHAIRFE-1-review.md", REVIEW_FM)
+        before_mtime = target.stat().st_mtime_ns
+        before_files = set(pathlib.Path(".").rglob("*-review.md"))
+        verify("review", "ids.txt")
+        captured = capsys.readouterr()
+        reason = f"invalid id {bad!r}: its review path would resolve outside artifacts/rfe-reviews"
+        assert captured.out == f"FAILED={bad}\n"
+        assert captured.err == (
+            f"verify_phase: {bad}: review not stamped: {reason}\n"
+            f"verify_phase: {bad}: no review_failed stub written: {reason}\n"
+        )
+        assert _read_ids() == ["RHAIRFE-1"]
+        assert target.read_text() == REVIEW_FM
+        assert target.stat().st_mtime_ns == before_mtime
+        assert set(pathlib.Path(".").rglob("*-review.md")) == before_files
+        with open("artifacts/rfe-reviews/RHAIRFE-1-review.md") as f:
+            assert f.read() == self.STAMPED
+
     def test_only_the_review_phase_stamps(self, workdir, capsys, monkeypatch):
         import verify_phase
 

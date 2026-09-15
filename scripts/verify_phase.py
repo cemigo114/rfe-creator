@@ -206,8 +206,10 @@ def stamp_review_type(review_path, pipeline_type):
     it would also materialize ``local_id: null`` and the other defaults, rename ``revised``
     and re-wrap long strings — more than the single appended field D7 allows on an artifact
     this writer did not produce. On a review the agents wrote in-run the bytes are the same
-    either way. The caller invokes this only for a review that exists with a usable score
-    and declares no ``type`` yet, so the stamp is idempotent across re-runs (the reassess
+    either way. The caller invokes this only for a review that exists with a usable score,
+    declares no ``type`` yet and whose path stays inside the reviews directory (an id that
+    would resolve outside it is failed, never stamped — ``_outside_reviews_dir``, the guard
+    ``write_error_stubs`` applies), so the stamp is idempotent across re-runs (the reassess
     pass verifies the same ``review`` phase and goes through here too) and a review that
     already carries ``type`` is never rewritten — one that declares the pipeline's type is
     left alone silently, one that declares anything else (another type, an empty string) is
@@ -269,11 +271,19 @@ def verify(phase, ids_file, pipeline_type="rfe"):
             # after the barrier. One that already declares the pipeline's type is left
             # alone; one that declares anything else (another type, an empty string) is not
             # stamped over — reported once, left byte-identical. Stamping never changes the
-            # verdict below.
+            # verdict below — except that a stamp candidate whose id would place the review
+            # outside the reviews directory (CWE-22, the same guard write_error_stubs
+            # applies) is never written to: the id is failed instead, so it reaches
+            # write_error_stubs, which refuses the same path and reports it unwritten.
             if exists:
                 declared = data.get("type")
                 if declared is None:
-                    stamp_review_type(path, pipeline_type)
+                    why = _outside_reviews_dir(tc["reviews_dir"], path, rfe_id)
+                    if why:
+                        print(f"verify_phase: {rfe_id}: review not stamped: {why}", file=sys.stderr)
+                        exists = False
+                    else:
+                        stamp_review_type(path, pipeline_type)
                 elif declared != pipeline_type:
                     print(
                         f"verify_phase: {path}: review declares type={declared!r}, expected "
