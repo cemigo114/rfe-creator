@@ -153,3 +153,9 @@ in every rung automatically: its `local_id_pattern`, `key_prefixes`, `local_pref
 the signals, and its Jira binding makes it a provisional candidate for any Jira-shaped key. The rung
 table, the workspace file format and the shorthand scope are in
 [`types/README.md`](../types/README.md) "Resolution".
+
+New artifacts are self-describing: the writers that mint them append `type: <t>` (and, once an
+artifact refers to a tracker issue, `tracker_ref: <key>`), so a drop-in type's artifacts take the
+frontmatter rung without any id-grammar work. Which writers stamp which field, the no-back-fill rule
+(D7), the review stamping by `verify_phase` (D8) and how readers fall back for pre-migration artifacts
+are in [`types/README.md`](../types/README.md) "Self-describing artifacts".

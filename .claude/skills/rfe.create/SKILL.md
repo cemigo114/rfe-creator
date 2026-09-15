@@ -89,7 +89,8 @@ python3 scripts/frontmatter.py set artifacts/rfe-tasks/<filename>.md \
     title="<title>" \
     priority=<priority> \
     size=<size> \
-    status=Draft
+    status=Draft \
+    type=rfe
 ```
 
 After all RFE files are written, rebuild the index:

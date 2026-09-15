@@ -65,7 +65,8 @@ python3 scripts/frontmatter.py set artifacts/initiatives/<filename>.md \
     initiative_id=<initiative_id> \
     title="<title>" \
     priority=<priority> \
-    status=Draft
+    status=Draft \
+    type=initiative
 ```
 
 If `--parent` was provided:
