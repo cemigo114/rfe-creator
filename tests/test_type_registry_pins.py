@@ -190,7 +190,9 @@ MIGRATED = [
         "conventions.{comment_prefix,label_prefix}, display.{entity,entity_plural}, id_field, "
         "dirs(bare), f'{type}-review', index.enabled, conventions.labels.alignment; scan_fn / "
         "rename_fn / parse_child_fn = functools.partial(artifact_utils.<generic>, desc=desc) and "
-        "find_review_fn = artifact_utils.find_review_file (detect()-routed; pinned to land in "
+        "find_review_fn = artifact_utils.find_review_file (routed by artifact_utils._type_for: "
+        "candidates(), a probe of the task's type: for an ambiguous or provisional id, else "
+        "detect() or rfe; pinned to land in "
         "dirs.reviews for both id grammars, 34 residue); the six 'Work item split' sites and the "
         "Closed / Obsolete closure read identity.jira.split_link_type and "
         "identity.jira.state_map.close_superseded through the private _TRACKER projection "
@@ -354,7 +356,9 @@ MIGRATED = [
         (179, 180, 182, 183, 184, 185, 186, 187),
         "artifact_utils helpers / frontmatter._detect_schema_type",
         "PR-2b: find_artifact_file_including_archived reads the rfe descriptor; "
-        "find_removed_context_yaml / find_review_file route via registry.detect(id) or rfe; "
+        "find_removed_context_yaml / find_review_file route via _type_for (PR-3c: candidates(), "
+        "a probe of dirs.tasks/<id>.md for its type: when ambiguous or provisional, else detect() "
+        "or rfe); find_task_file_including_archived has a descriptor form (owns()); "
         "scan_tasks / scan_reviews / rename_to_tracker_key / parse_child take a Descriptor (the "
         "per-type names are wrappers); rebuild_index reads the rfe id_field; "
         "frontmatter._SCHEMA_BY_DIR from dirs; still literal and pinned: _is_companion_file "
@@ -426,6 +430,24 @@ def read(rel):
 
 def skill(t, stage, sub="SKILL.md"):
     return read(f".claude/skills/{SKILL_PREFIX[t]}{stage}/{sub}")
+
+
+def set_commands(rel):
+    """Every ``python3 scripts/frontmatter.py set`` command in a skill file as ``(target, fields)``,
+    backslash continuations joined (the multi-line create / split / fetch blocks)."""
+    lines = read(rel).splitlines()
+    out, i = [], 0
+    while i < len(lines):
+        m = re.search(r"python3 scripts/frontmatter\.py set (\S+)(.*)$", lines[i])
+        if m:
+            parts = [m.group(2).strip()]
+            while parts[-1].endswith("\\"):
+                parts[-1] = parts[-1][:-1].strip()
+                i += 1
+                parts.append(lines[i].strip())
+            out.append((m.group(1), " ".join(part for part in parts if part)))
+        i += 1
+    return out
 
 
 def choices(rel, flag="--type"):
@@ -760,7 +782,9 @@ class TestSplitSubmitConfig:
         # rows: 34 (MIGRATED value, residue) — split_submit.py:121-124,:139-144 selected the
         # per-type pair by id_field; since PR-2d scan_fn / rename_fn / parse_child_fn are
         # functools.partial(artifact_utils.<generic>, desc=desc) and find_review_fn is
-        # artifact_utils.find_review_file for every type, which routes by registry.detect(child_id)
+        # artifact_utils.find_review_file for every type, which routes by _type_for(child_id) —
+        # candidates(), a probe of the child's task type: when ambiguous or provisional, else
+        # detect() or rfe
         # (the deleted _direct_review_path built the path from the config's reviews_dir). What
         # stays pinned is the equality that makes that routing a no-op: for both id grammars of
         # the type it renders the path under THIS type's dirs.reviews — the PR-3 binding overlay
@@ -1098,6 +1122,15 @@ class TestSmallRegistries:
         assert 'os.path.join(artifacts_dir, dirs["tasks"])' in source
         assert 'os.path.join(artifacts_dir, dirs["originals"])' in source
         assert 'f"{desc.id_field}={issue_key}"' in source
+        # PR-3c (design §5 self-describing artifacts): the fetched task is a NEW artifact and
+        # carries both fields, appended after the pre-3c argv (D7) — the type name and the
+        # issue key it was fetched from, never re-derived from the id prefix.
+        assert (
+            'f"original_labels={labels_str}",\n'
+            '        f"type={desc.name}",\n'
+            '        f"tracker_ref={issue_key}",\n'
+            "    ]"
+        ) in source
         assert 'if desc.get("companions.comments"):' in source
         assert 'f"{issue_key}-comments.md"' in source
         assert f'os.path.join(artifacts_dir, "{rfe.bare["tasks"]}")' not in source
@@ -1316,9 +1349,26 @@ class TestRunReportConfig:
             r'\s+else:\s+review_path = os\.path\.join\(reviews_dir, f"\{item_id\}-review\.md"\)',
             source,
         )
-        assert 'is_tracker_id = item_id.startswith(config["tracker_prefix"])' in source
-        assert 'is_local_id = item_id.startswith(config["local_prefix"])' in source
+        # rows 83, 84 (PR-3c): tracker_ref and role come from the task frontmatter when the
+        # artifact carries tracker_ref; the pre-migration fallback is membership in the
+        # key_prefixes UNION (config["key_prefixes"], a tuple) — no longer the write prefix
+        # alone — and the local-prefix test applies only to an artifact without the field
+        assert "fallback_ref = item_id if _is_tracker_key(item_id, config) else None" in source
+        assert 'return item_id.startswith(config["key_prefixes"])' in source
+        assert 'entry["tracker_ref"] = fm_ref if fm_ref is not None else fallback_ref' in source
+        assert (
+            'is_local_id = fm_ref is None and item_id.startswith(config["local_prefix"])' in source
+        )
         assert '"intermediary" if is_local_id and task_status == "Archived" else "leaf"' in source
+        assert 'item_id.startswith(config["tracker_prefix"])' not in source
+        g = generate_run_report.TYPE_CONFIG[ctx.t]
+        pin(
+            "identity.jira.key_prefixes",
+            "generate_run_report.TYPE_CONFIG key_prefixes",
+            tuple(ctx.jira["key_prefixes"]),
+            g["key_prefixes"],
+        )
+        assert g["key_prefixes"][0] == g["tracker_prefix"]
         assert re.search(r'if entry_type == "rfe":\s+results\["retried"\]', source), (
             ":352-354 rfe-only"
         )
@@ -1362,12 +1412,35 @@ class TestReviewPdfConfig:
 
     def test_split_child_and_vocabulary_sites(self, ctx):
         # rows: 103, 104 — generate_review_pdf.py:443-449, :1517-1535
+        # row 103 (PR-3c): the split-child predicate is the descriptor's ownership ladder
+        # (Descriptor.owns: local_id_pattern, key_prefixes union, local prefix) and the Jira
+        # link predicate is the key_prefixes union behind the task's own tracker_ref — the
+        # write-prefix-only startswith sites are gone
         source = read("scripts/generate_review_pdf.py")
+        assert 'is_split_child = bool(parent_key) and config["desc"].owns(parent_key)' in source
         assert re.search(
-            r'parent_key\.startswith\(\s*\(config\["local_prefix"\], '
-            r'config\["jira_prefix"\]\)\s*\)',
+            r'find_task_file_including_archived\(\s*artifacts_dir, rfe_id, config\["tasks_dir"\], '
+            r'desc=config\["desc"\]\s*\)',
             source,
         )
+        assert 'return bool(item_id) and item_id.startswith(config["key_prefixes"])' in source
+        assert "rfe_id.startswith(jira_prefix)" not in source
+        assert not re.search(
+            r'parent_key\.startswith\(\s*\(config\["local_prefix"\], config\["jira_prefix"\]\)',
+            source,
+        )
+        cfg = generate_review_pdf.REPORT_CONFIG[ctx.t]
+        pin(
+            "identity.jira.key_prefixes",
+            "generate_review_pdf.REPORT_CONFIG key_prefixes",
+            tuple(ctx.jira["key_prefixes"]),
+            cfg["key_prefixes"],
+        )
+        # The ownership predicate is the descriptor's own ladder, this type's descriptor.
+        assert isinstance(cfg["desc"], type_registry.Descriptor)
+        assert cfg["desc"].name == ctx.t
+        assert cfg["desc"].owns(ctx.sample_ids[0]) and cfg["desc"].owns(ctx.sample_ids[1])
+        assert not cfg["desc"].owns("RHAISTRAT-42")
         assert (
             'task_fm.get("status") == "Archived" and review_fm.get("recommendation") == "split"'
             in source
@@ -1759,6 +1832,9 @@ class TestVerifyPhase:
             "needs_attention=true",
             "needs_attention_reason=Agent failed: review_failed",
         ] + [f"scores.{f}=0" for f in ctx.score_fields]
+        # PR-3c (design §5 self-describing artifacts, D7): the stub is a NEW artifact, so it
+        # carries `type=<t>` — appended after every pre-3c field, never reordered.
+        expected.append(f"type={ctx.t}")
         pin("id_field + score_fields error stub", "verify_phase.py:105-127", expected, captured[0])
         real_run(
             [sys.executable, str(REPO_ROOT / "scripts" / "frontmatter.py"), *captured[0][2:]],
@@ -1773,6 +1849,7 @@ class TestVerifyPhase:
             data[ctx.id_field] == ident and data["score"] == 0 and data["needs_attention"] is True
         )
         assert data["scores"] == {f: 0 for f in ctx.score_fields}
+        assert data["type"] == ctx.t and "tracker_ref" not in data
         assert ids.read_text() == ""
 
 
@@ -1826,7 +1903,8 @@ class TestArtifactSchemas:
 
 class TestArtifactHelpers:
     # rows: 177, 184, 185, 186 (residue) (179, 180, 182-187 MIGRATED: the generics take a
-    # Descriptor and the lookups route via registry.detect(); tests/test_artifact_utils.py and
+    # Descriptor and the lookups route via _type_for — candidates(), the task's type: probe for
+    # an ambiguous or provisional id, else detect() or rfe; tests/test_artifact_utils.py and
     # tests/test_frontmatter.py hold the projections)
 
     def test_companion_suffixes_are_type_agnostic(self, ctx):
@@ -2202,6 +2280,52 @@ class TestSkillLayer:
         assert ("--phase create" in text) is (
             "create" in check_review_progress.PHASE_CHECKS and ctx.t == "rfe"
         )
+
+    def test_self_describing_stamps_in_skill_bodies(self, ctx):
+        # rows: none (PR-3c, design §5 "Self-describing artifacts"; plan D7/D8) — the prompt
+        # writers that mint NEW task artifacts append `type=<t>` as the LAST field of their
+        # frontmatter.py set command: create (SKILL.md), split children (split-agent.md), the MCP
+        # fetch fallback (fetch-agent.md, which also appends `tracker_ref={KEY}`) and the
+        # orchestrator error stubs in the review / split bodies (the same field verify_phase's
+        # stub carries). No other skill command sets either field: the split parent archive
+        # ({TASK_FILE}), initiative-create's parent_key follow-up and every review-agent /
+        # revise-agent command are untouched (D8: reviews are stamped by verify_phase after the
+        # barrier, not by prompt edits).
+        t, tasks, reviews = ctx.t, ctx.dirs["tasks"], ctx.dirs["reviews"]
+        root = f".claude/skills/{ctx.sk}"
+        cmds = [
+            (str(path.relative_to(REPO_ROOT)), target, fields)
+            for path in sorted((REPO_ROOT / ".claude" / "skills").glob(f"{ctx.sk}*/**/*.md"))
+            for target, fields in set_commands(str(path.relative_to(REPO_ROOT)))
+        ]
+        stamped = {c for c in cmds if re.search(r"(?<![\w-])(type|tracker_ref)=", c[2])}
+        tails = {
+            (f"{root}create/SKILL.md", f"{tasks}/<filename>.md"): f"status=Draft type={t}",
+            (f"{root}split/prompts/split-agent.md", f"{tasks}/<child_filename>.md"): (
+                f"parent_key={{ID}} type={t}"
+            ),
+            (f"{root}review/prompts/fetch-agent.md", f"{tasks}/{{KEY}}.md"): (
+                f"type={t} tracker_ref={{KEY}}"
+            ),
+        }
+        expected = set()
+        for (rel, target), tail in tails.items():
+            hits = [c for c in stamped if c[:2] == (rel, target)]
+            assert len(hits) == 1 and hits[0][2].endswith(tail), (rel, target, tail, hits)
+            expected.add(hits[0])
+        stubs = {
+            c
+            for c in cmds
+            if c[0] in (f"{root}review/SKILL.md", f"{root}split/SKILL.md") and "error=" in c[2]
+        }
+        assert stubs and all(c[1] == f"{reviews}/<ID>-review.md" for c in stubs)
+        assert all(c[2].endswith(f" type={t}") for c in stubs), stubs
+        pin("type (skill stamps)", "frontmatter.py set commands", expected | stubs, stamped)
+        assert [c for c in stamped if "tracker_ref=" in c[2]] == [
+            c for c in expected if c[0].endswith("fetch-agent.md")
+        ]
+        untouched = [c for c in cmds if c[1] == "{TASK_FILE}" or c[2].startswith("parent_key=")]
+        assert untouched and not any(c in stamped for c in untouched)
 
 
 # ── eval configs ──────────────────────────────────────────────────────────────────────────────

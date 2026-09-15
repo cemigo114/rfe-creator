@@ -64,7 +64,21 @@ def _failed(capsys):
     return [x for x in line[len("FAILED=") :].split(",") if x]
 
 
-REVIEW_FM = "---\nrfe_id: RHAIRFE-1\nscore: 7\n---\nBody\n"
+# A review exactly as the review agent writes it (frontmatter.py set with every required
+# field, the schema defaults materialized after them). It carries no `type:` — the agents do
+# not stamp it; verify() does, after the barrier (D8).
+REVIEW_FM = (
+    "---\nrfe_id: RHAIRFE-1\nscore: 7\npass: true\nrecommendation: submit\n"
+    "feasibility: feasible\nauto_revised: false\nneeds_attention: false\nscores:\n"
+    "  what: 2\n  why: 2\n  open_to_how: 1\n  not_a_task: 2\n  right_sized: 0\n"
+    "local_id: null\nerror: null\nbefore_score: null\nneeds_attention_reason: null\n"
+    "before_scores: null\n---\nBody\n"
+)
+# A review with a score but not the rest of the required record: verify() accepts it (a
+# usable score is the whole verdict) but the stamp cannot take it — the merged record fails
+# validation, exactly as under frontmatter.py set — so it is skipped and the file is left as
+# written.
+PARTIAL_REVIEW_FM = "---\nrfe_id: RHAIRFE-1\nscore: 7\n---\nBody\n"
 # A review agent that died after writing a partial file: no score (check_id: pending, verify:
 # failed) and a ``scores`` member the schema does not know, which frontmatter.py's
 # merge-then-validate cannot repair — the stub never sets ``scores.bogus``.
@@ -205,6 +219,266 @@ class TestReviewPhaseActs:
         verify("review", "ids.txt")
         assert _failed(capsys) == ["RHAIRFE-1"]
         assert _read_ids() == []
+
+
+# ── Review phase: the post-barrier `type:` stamp (D8) ─────────────────────────
+
+
+class TestReviewTypeStamp:
+    """design-proposals/work-item-types-pr3-plan.md D8: review files are stamped with the
+    self-describing ``type:`` by verify() after the review barrier — deterministically, one
+    file at a time, through ``artifact_utils.append_frontmatter_field`` — not by prompt edits.
+    The stamp is exactly one ``type: <t>`` line appended after whatever the agent wrote (D7:
+    every other byte stays, whatever schema vintage the review has), applied once, and never
+    changes the verdict."""
+
+    STAMPED = REVIEW_FM.replace("---\nBody\n", "type: rfe\n---\nBody\n")
+
+    # Review shapes verify() accepts (a usable score) that predate the current review schema —
+    # the shapes an older results tree holds when the headless pipeline is re-run in a
+    # workspace and a review agent leaves the file in place. A `frontmatter.py set` re-dump
+    # would add more than the type line to each: the missing defaults (`local_id: null`,
+    # `needs_attention_reason: null`, `error: null`), the `revised` -> `auto_revised` rename,
+    # or a yaml re-wrap of a long plain scalar. The body variants pin that the closing `---`
+    # is found even when the body itself opens with `---` rules.
+    _SCORES = "scores:\n  what: 2\n  why: 2\n  open_to_how: 2\n  not_a_task: 2\n  right_sized: 2\n"
+    LEGACY_SHAPES = {
+        "2026-08 (no local_id)": (
+            "rfe_id: RHAIRFE-1\nscore: 10\npass: true\nrecommendation: submit\n"
+            "feasibility: feasible\nneeds_attention: false\nneeds_attention_reason: null\n"
+            + _SCORES
+            + "auto_revised: false\nerror: null\nbefore_score: 10\nbefore_scores:\n  what: 2\n"
+            "  why: 2\n  open_to_how: 2\n  not_a_task: 2\n  right_sized: 2\n",
+            "## Assessor Feedback\n\nFine.\n",
+        ),
+        "older (no local_id, needs_attention_reason, error)": (
+            "rfe_id: RHAIRFE-1\nscore: 8\npass: true\nrecommendation: submit\n"
+            "feasibility: feasible\nauto_revised: false\nneeds_attention: false\n" + _SCORES,
+            "---\n---\n## Assessor Feedback\n",
+        ),
+        "pre-rename (revised)": (
+            "rfe_id: RHAIRFE-1\nscore: 8\npass: true\nrecommendation: submit\n"
+            "feasibility: feasible\nrevised: true\nneeds_attention: false\n"
+            + _SCORES
+            + "before_score: 6\n",
+            "Body\n",
+        ),
+        "long plain scalar": (
+            "rfe_id: RHAIRFE-1\nscore: 4\npass: false\nrecommendation: revise\n"
+            "feasibility: feasible\nauto_revised: false\nneeds_attention: true\n"
+            "needs_attention_reason: " + " ".join(["word"] * 30) + "\n" + _SCORES,
+            "Body\n",
+        ),
+    }
+
+    @pytest.mark.parametrize("shape", sorted(LEGACY_SHAPES))
+    def test_pre_migration_review_differs_by_exactly_the_type_line(self, workdir, capsys, shape):
+        """D7 on a review verify() accepts but did not see written: the stamp is the one
+        appended line — no default materialized, no field renamed, no string re-wrapped."""
+        region, body = self.LEGACY_SHAPES[shape]
+        before = f"---\n{region}---\n{body}"
+        _write_ids("RHAIRFE-1")
+        _write("artifacts/rfe-reviews/RHAIRFE-1-review.md", before)
+        verify("review", "ids.txt")
+        captured = capsys.readouterr()
+        assert captured.out == "FAILED=\n" and captured.err == ""
+        assert _read_ids() == ["RHAIRFE-1"]
+        with open("artifacts/rfe-reviews/RHAIRFE-1-review.md") as f:
+            after = f.read()
+        assert after == f"---\n{region}type: rfe\n---\n{body}"
+        assert (
+            after.splitlines()
+            == before.splitlines()[: len(region.splitlines()) + 1]
+            + ["type: rfe"]
+            + before.splitlines()[len(region.splitlines()) + 1 :]
+        )
+        # ...and a second pass (the reassess verify) leaves the stamped file alone.
+        verify("review", "ids.txt")
+        with open("artifacts/rfe-reviews/RHAIRFE-1-review.md") as f:
+            assert f.read() == after
+
+    def test_usable_review_gets_type_appended(self, workdir, capsys):
+        _write_ids("RHAIRFE-1")
+        _write("artifacts/rfe-reviews/RHAIRFE-1-review.md", REVIEW_FM)
+        verify("review", "ids.txt")
+        captured = capsys.readouterr()
+        assert captured.out == "FAILED=\n" and captured.err == ""
+        assert _read_ids() == ["RHAIRFE-1"]
+        with open("artifacts/rfe-reviews/RHAIRFE-1-review.md") as f:
+            assert f.read() == self.STAMPED
+
+    def test_stamp_is_idempotent(self, workdir, capsys, monkeypatch):
+        import verify_phase
+
+        _write_ids("RHAIRFE-1")
+        _write("artifacts/rfe-reviews/RHAIRFE-1-review.md", REVIEW_FM)
+        verify("review", "ids.txt")
+        calls = []
+        real = verify_phase.stamp_review_type
+        monkeypatch.setattr(
+            verify_phase, "stamp_review_type", lambda *a: calls.append(a) or real(*a)
+        )
+        verify("review", "ids.txt")  # the reassess pass verifies the same phase again
+        assert calls == []
+        with open("artifacts/rfe-reviews/RHAIRFE-1-review.md") as f:
+            assert f.read() == self.STAMPED
+        assert _failed(capsys) == []
+
+    def test_review_that_declares_a_type_is_left_byte_identical(self, workdir, capsys):
+        # An agent-stamped or already-stamped review declaring the pipeline's own type is
+        # never rewritten, and nothing is said about it.
+        agent_stamped = REVIEW_FM.replace("rfe_id: RHAIRFE-1\n", "rfe_id: RHAIRFE-1\ntype: rfe\n")
+        _write_ids("RHAIRFE-1")
+        _write("artifacts/rfe-reviews/RHAIRFE-1-review.md", agent_stamped)
+        before = os.stat("artifacts/rfe-reviews/RHAIRFE-1-review.md").st_mtime_ns
+        verify("review", "ids.txt")
+        captured = capsys.readouterr()
+        assert captured.out == "FAILED=\n" and captured.err == ""
+        with open("artifacts/rfe-reviews/RHAIRFE-1-review.md") as f:
+            assert f.read() == agent_stamped
+        assert os.stat("artifacts/rfe-reviews/RHAIRFE-1-review.md").st_mtime_ns == before
+
+    @pytest.mark.parametrize(
+        "declared, shown", [("initiative", "'initiative'"), ("''", "''"), ("epic", "'epic'")]
+    )
+    def test_review_declaring_another_type_is_reported_not_stamped(
+        self, workdir, capsys, declared, shown
+    ):
+        """The third branch of the D8 stamp (None -> stamped: test_usable_review_gets_type_appended;
+        the pipeline's type -> left alone silently: the test above; anything else -> here): a
+        review that declares another type, or an empty string, is not this writer's to overwrite.
+        One stderr line names what it declares and what was expected, the file stays
+        byte-identical and the verdict is unchanged."""
+        review = REVIEW_FM.replace("rfe_id: RHAIRFE-1\n", f"rfe_id: RHAIRFE-1\ntype: {declared}\n")
+        _write_ids("RHAIRFE-1")
+        _write("artifacts/rfe-reviews/RHAIRFE-1-review.md", review)
+        before = os.stat("artifacts/rfe-reviews/RHAIRFE-1-review.md").st_mtime_ns
+        verify("review", "ids.txt")
+        captured = capsys.readouterr()
+        assert captured.out == "FAILED=\n"
+        assert captured.err == (
+            "verify_phase: artifacts/rfe-reviews/RHAIRFE-1-review.md: review declares "
+            f"type={shown}, expected rfe; not stamped\n"
+        )
+        assert _read_ids() == ["RHAIRFE-1"]
+        with open("artifacts/rfe-reviews/RHAIRFE-1-review.md") as f:
+            assert f.read() == review
+        assert os.stat("artifacts/rfe-reviews/RHAIRFE-1-review.md").st_mtime_ns == before
+        # A second pass says the same thing again and still changes nothing.
+        verify("review", "ids.txt")
+        assert capsys.readouterr().err.count("not stamped") == 1
+        with open("artifacts/rfe-reviews/RHAIRFE-1-review.md") as f:
+            assert f.read() == review
+
+    def test_declared_type_is_judged_against_the_pipeline_type(self, workdir, capsys):
+        review = (
+            "---\ninitiative_id: INIT-001\ntype: rfe\nscore: 6\npass: true\n"
+            "recommendation: submit\nfeasibility: feasible\nauto_revised: false\n"
+            "needs_attention: false\nscores:\n"
+            "  what: 2\n  why: 1\n  scope: 1\n  open_to_how: 1\n  right_sized: 1\n---\nBody\n"
+        )
+        _write_ids("INIT-001")
+        _write("artifacts/initiative-reviews/INIT-001-review.md", review)
+        verify("review", "ids.txt", "initiative")
+        captured = capsys.readouterr()
+        assert captured.out == "FAILED=\n"
+        assert captured.err == (
+            "verify_phase: artifacts/initiative-reviews/INIT-001-review.md: review declares "
+            "type='rfe', expected initiative; not stamped\n"
+        )
+        with open("artifacts/initiative-reviews/INIT-001-review.md") as f:
+            assert f.read() == review
+
+    def test_stamp_failure_leaves_the_review_and_the_verdict_alone(self, workdir, capsys):
+        """A review the schema rejects in a field the stamp does not set cannot take the
+        stamp (frontmatter.py set validates the merged record): it stays exactly as written,
+        it is NOT a failure (the score is the verdict), and one stderr line says why."""
+        _write_ids("RHAIRFE-1")
+        _write("artifacts/rfe-reviews/RHAIRFE-1-review.md", PARTIAL_REVIEW_FM)
+        verify("review", "ids.txt")
+        captured = capsys.readouterr()
+        assert captured.out == "FAILED=\n"
+        assert _read_ids() == ["RHAIRFE-1"]
+        with open("artifacts/rfe-reviews/RHAIRFE-1-review.md") as f:
+            assert f.read() == PARTIAL_REVIEW_FM
+        err = captured.err.splitlines()
+        assert len(err) == 1
+        assert err[0].startswith(
+            "verify_phase: artifacts/rfe-reviews/RHAIRFE-1-review.md: type=rfe not stamped ("
+        )
+        assert err[0].endswith("); the review is left as written")
+        assert "Missing required field: pass" in err[0]
+
+    def test_stamp_uses_the_pipeline_type(self, workdir, capsys):
+        review = (
+            "---\ninitiative_id: INIT-001\nscore: 6\npass: true\nrecommendation: submit\n"
+            "feasibility: feasible\nauto_revised: false\nneeds_attention: false\nscores:\n"
+            "  what: 2\n  why: 1\n  scope: 1\n  open_to_how: 1\n  right_sized: 1\n---\nBody\n"
+        )
+        _write_ids("INIT-001")
+        _write("artifacts/initiative-reviews/INIT-001-review.md", review)
+        verify("review", "ids.txt", "initiative")
+        assert _failed(capsys) == []
+        with open("artifacts/initiative-reviews/INIT-001-review.md") as f:
+            text = f.read()
+        # Appended after the agent's fields, and nothing else: the schema defaults this
+        # review lacks (local_id, error, ..., alignment) are NOT materialized by the stamp.
+        assert text == review.replace("---\nBody\n", "type: initiative\n---\nBody\n")
+
+    def test_only_the_review_phase_stamps(self, workdir, capsys, monkeypatch):
+        import verify_phase
+
+        calls = []
+        monkeypatch.setattr(verify_phase, "stamp_review_type", lambda *a: calls.append(a))
+        _write_ids("RHAIRFE-1")
+        _write("artifacts/rfe-tasks/RHAIRFE-1.md", "task\n")
+        _write("artifacts/rfe-reviews/RHAIRFE-1-feasibility.md", "feasibility\n")
+        _write("artifacts/rfe-reviews/RHAIRFE-1-review.md", REVIEW_FM)
+        verify("feasibility", "ids.txt")
+        verify("fetch", "ids.txt")
+        assert calls == [] and _read_ids() == ["RHAIRFE-1"]
+        # ...and a review without a usable score is a failure, never a stamp candidate.
+        _write("artifacts/rfe-reviews/RHAIRFE-1-review.md", "---\nrfe_id: RHAIRFE-1\n---\nBody\n")
+        verify("review", "ids.txt")
+        assert calls == []
+        assert _failed(capsys) == ["RHAIRFE-1"]
+
+    def test_stamp_is_an_in_process_append_not_a_frontmatter_set(self, workdir, monkeypatch):
+        """The stamp is artifact_utils.append_frontmatter_field on the review path — one
+        appended line, in process — never a `frontmatter.py set` (whose re-dump is what adds
+        the extra bytes on a pre-migration review). It writes exactly what `set` would on a
+        review the agents wrote in-run."""
+        import subprocess
+
+        import artifact_utils
+        import verify_phase
+
+        monkeypatch.setattr(
+            subprocess, "run", lambda *a, **kw: pytest.fail("the stamp must not shell out")
+        )
+        appended = []
+        real = artifact_utils.append_frontmatter_field
+        monkeypatch.setattr(
+            verify_phase,
+            "append_frontmatter_field",
+            lambda *a: appended.append(a) or real(*a),
+        )
+        _write("artifacts/rfe-reviews/RHAIRFE-1-review.md", REVIEW_FM)
+        assert verify_phase.stamp_review_type("artifacts/rfe-reviews/RHAIRFE-1-review.md", "rfe")
+        assert appended == [
+            ("artifacts/rfe-reviews/RHAIRFE-1-review.md", "type", "rfe", "rfe-review")
+        ]
+        with open("artifacts/rfe-reviews/RHAIRFE-1-review.md") as f:
+            assert f.read() == self.STAMPED
+        # The bytes `frontmatter.py set type=rfe` produces on the same in-run review.
+        _write(
+            "artifacts/rfe-reviews/RHAIRFE-2-review.md", REVIEW_FM.replace("RHAIRFE-1", "RHAIRFE-2")
+        )
+        artifact_utils.update_frontmatter(
+            "artifacts/rfe-reviews/RHAIRFE-2-review.md", {"type": "rfe"}, "rfe-review"
+        )
+        with open("artifacts/rfe-reviews/RHAIRFE-2-review.md") as f:
+            assert f.read() == self.STAMPED.replace("RHAIRFE-1", "RHAIRFE-2")
 
 
 # ── Initiative type ───────────────────────────────────────────────────────────
@@ -376,6 +650,29 @@ class TestWriteErrorStubs:
         data, _ = read_frontmatter("artifacts/rfe-reviews/RHAIRFE-1-review.md")
         assert data["error"] == "review_failed"
         assert data["needs_attention_reason"] == "Agent failed: review_failed"
+        # PR-3c: the stub is a new artifact and says which type wrote it; no tracker_ref
+        # (an error stub refers to no tracker issue of its own).
+        assert data["type"] == "rfe" and "tracker_ref" not in data
+
+    def test_stub_appends_type_after_the_pre_3c_fields(self, workdir):
+        """Both stub writers — the frontmatter.py argv and the replace-path record — carry
+        `type=<pipeline_type>` as their LAST field (D7: appended, never reordered), and the
+        file written through frontmatter.py has it right after the scores."""
+        import verify_phase
+
+        record = verify_phase._stub_record("INIT-001", "assess_stalled", "initiative")
+        assert list(record)[-2:] == ["scores", "type"] and record["type"] == "initiative"
+        write_error_stubs("assess", ["INIT-001"], "initiative", outcome="stalled")
+        with open("artifacts/initiative-reviews/INIT-001-review.md") as f:
+            text = f.read()
+        assert text == (
+            "---\ninitiative_id: INIT-001\nerror: assess_stalled\nscore: 0\npass: false\n"
+            "recommendation: revise\nfeasibility: feasible\nauto_revised: false\n"
+            "needs_attention: true\nneeds_attention_reason: 'Agent failed: assess_stalled'\n"
+            "scores:\n  what: 0\n  why: 0\n  scope: 0\n  open_to_how: 0\n  right_sized: 0\n"
+            "type: initiative\nlocal_id: null\nbefore_score: null\nbefore_scores: null\n"
+            "alignment: not_assessed\n---\n"
+        )
 
     def test_stalled_outcome_keeps_the_stub_shape(self, workdir):
         import validate_types

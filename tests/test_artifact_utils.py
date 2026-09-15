@@ -15,6 +15,7 @@ from artifact_utils import (
     _body_without_frontmatter,
     _looks_like_frontmatter_block,
     _migrate_fields,
+    append_frontmatter_field,
     apply_defaults,
     find_artifact_file_including_archived,
     find_removed_context_yaml,
@@ -1230,6 +1231,417 @@ class TestLookupsUseDetect:
             "artifacts", "rfe-tasks", "RHAIRFE-1.md"
         )
         assert find_artifact_file_including_archived("artifacts", "INIT-001") is None
+
+
+# ── PR-3c: self-describing artifacts (design §5; plan D7) ────────────────────
+#
+# `type:` / `tracker_ref:` are read by the id-only routers when an id is ambiguous or
+# provisional, and written by rename_to_tracker_key on the two files it rewrites anyway.
+# Every pre-migration id and artifact behaves exactly as before.
+
+
+class TestAppendFrontmatterField:
+    """append_frontmatter_field: the pure-append writer verify_phase's D8 review stamp uses.
+    One `<name>: <value>` line goes in before the closing `---`; every other byte of the file
+    is untouched — the defaults, renames and re-wrapping update_frontmatter's re-dump would
+    add to a pre-migration file never appear. Its checks are update_frontmatter's."""
+
+    SCORES = "scores:\n  what: 2\n  why: 2\n  open_to_how: 2\n  not_a_task: 2\n  right_sized: 2\n"
+    # A 2026-08 review: complete record of its day, no local_id (added to the schema later).
+    LEGACY = (
+        "---\nrfe_id: RHAIRFE-1\nscore: 10\npass: true\nrecommendation: submit\n"
+        "feasibility: feasible\nneeds_attention: false\nneeds_attention_reason: null\n"
+        + SCORES
+        + "auto_revised: false\nerror: null\nbefore_score: 10\nbefore_scores: null\n---\n"
+        "## Assessor Feedback\n\n---\n\nA body rule.\n"
+    )
+
+    def _write(self, tmp_path, text, name="RHAIRFE-1-review.md"):
+        path = tmp_path / name
+        path.write_bytes(text.encode("utf-8"))
+        return str(path)
+
+    def test_appends_exactly_one_line_to_a_pre_migration_file(self, tmp_path):
+        path = self._write(tmp_path, self.LEGACY)
+        append_frontmatter_field(path, "type", "rfe", "rfe-review")
+        after = open(path, encoding="utf-8").read()
+        assert after == self.LEGACY.replace(
+            "before_scores: null\n---\n", "before_scores: null\ntype: rfe\n---\n"
+        )
+        data, body = read_frontmatter(path)
+        assert data["type"] == "rfe" and "local_id" not in data
+        assert body == "## Assessor Feedback\n\n---\n\nA body rule.\n"
+        # update_frontmatter on the same file is NOT a pure append — the contrast this
+        # writer exists for.
+        other = self._write(tmp_path, self.LEGACY, "RHAIRFE-2-review.md")
+        update_frontmatter(other, {"type": "rfe"}, "rfe-review")
+        assert "local_id: null\n" in open(other, encoding="utf-8").read()
+
+    @pytest.mark.parametrize(
+        "region",
+        [
+            # revised -> auto_revised is applied to the validated record, not to the file
+            "rfe_id: RHAIRFE-1\nscore: 8\npass: true\nrecommendation: submit\n"
+            "feasibility: feasible\nrevised: true\nneeds_attention: false\n" + SCORES,
+            # a long plain scalar update_frontmatter's dumper would fold at 80 columns
+            "rfe_id: RHAIRFE-1\nscore: 4\npass: false\nrecommendation: revise\n"
+            "feasibility: feasible\nauto_revised: false\nneeds_attention: true\n"
+            "needs_attention_reason: " + " ".join(["word"] * 30) + "\n" + SCORES,
+            # a block scalar as the last field: the appended key terminates it cleanly
+            "rfe_id: RHAIRFE-1\nscore: 4\npass: false\nrecommendation: revise\n"
+            "feasibility: feasible\nauto_revised: false\nneeds_attention: true\n"
+            + SCORES
+            + "needs_attention_reason: >-\n  folded\n  text\n",
+        ],
+        ids=["revised", "long-scalar", "block-scalar-last"],
+    )
+    def test_no_rename_no_rewrap_no_defaults(self, tmp_path, region):
+        before = f"---\n{region}---\nBody\n"
+        path = self._write(tmp_path, before)
+        append_frontmatter_field(path, "type", "rfe", "rfe-review")
+        assert open(path, encoding="utf-8").read() == f"---\n{region}type: rfe\n---\nBody\n"
+        data, _ = read_frontmatter(path)
+        assert data["type"] == "rfe" and data["score"] == int(region.split("score: ")[1][0])
+
+    def test_matches_update_frontmatter_on_a_current_schema_file(self, tmp_path):
+        """On a file that already carries the current schema's shape (what every in-run
+        writer produces) the two writers emit the same bytes."""
+        record = {
+            "rfe_id": "RHAIRFE-1",
+            "score": 7,
+            "pass": True,
+            "recommendation": "submit",
+            "feasibility": "feasible",
+            "scores": {"what": 2, "why": 2, "open_to_how": 1, "not_a_task": 2, "right_sized": 0},
+        }
+        a, b = str(tmp_path / "a-review.md"), str(tmp_path / "b-review.md")
+        for path in (a, b):
+            write_frontmatter(path, dict(record), "rfe-review")
+        append_frontmatter_field(a, "type", "rfe", "rfe-review")
+        update_frontmatter(b, {"type": "rfe"}, "rfe-review")
+        assert open(a, "rb").read() == open(b, "rb").read()
+        assert open(a, encoding="utf-8").read().endswith("before_scores: null\ntype: rfe\n---\n")
+
+    def test_keeps_crlf_line_endings(self, tmp_path):
+        before = self.LEGACY.replace("\n", "\r\n")
+        path = self._write(tmp_path, before)
+        append_frontmatter_field(path, "type", "rfe", "rfe-review")
+        after = open(path, "rb").read().decode("utf-8")
+        assert after == before.replace(
+            "before_scores: null\r\n---\r\n", "before_scores: null\r\ntype: rfe\r\n---\r\n"
+        )
+
+    def test_value_that_yaml_would_misread_is_quoted(self, tmp_path):
+        path = self._write(tmp_path, self.LEGACY)
+        append_frontmatter_field(path, "tracker_ref", "a: b", "rfe-review")
+        after = open(path, encoding="utf-8").read()
+        assert "tracker_ref: 'a: b'\n---\n" in after
+        assert read_frontmatter(path)[0]["tracker_ref"] == "a: b"
+
+    @pytest.mark.parametrize(
+        "text, message",
+        [
+            (
+                LEGACY.replace("rfe_id: RHAIRFE-1\n", "rfe_id: RHAIRFE-1\ntype: rfe\n"),
+                "already carries 'type'",
+            ),
+            (
+                LEGACY.replace("rfe_id: RHAIRFE-1\n", "rfe_id: RHAIRFE-1\ntype: null\n"),
+                "already carries 'type'",
+            ),
+            ("---\nrfe_id: RHAIRFE-1\nscore: 7\n---\nBody\n", "Missing required field: pass"),
+            ("# Just a body\n", "No frontmatter found"),
+            ("---\njust a scalar\n---\nBody\n", "No frontmatter mapping found"),
+            ("---\nrfe_id: RHAIRFE-1\nbad: [\n---\nBody\n", "Invalid YAML frontmatter"),
+        ],
+        ids=[
+            "present",
+            "present-null",
+            "invalid-record",
+            "no-frontmatter",
+            "not-a-mapping",
+            "unparseable",
+        ],
+    )
+    def test_refuses_and_leaves_the_file_untouched(self, tmp_path, text, message):
+        path = self._write(tmp_path, text)
+        with pytest.raises(ValidationError, match=message):
+            append_frontmatter_field(path, "type", "rfe", "rfe-review")
+        assert open(path, "rb").read() == text.encode("utf-8")
+
+    def test_unknown_field_is_a_validation_error(self, tmp_path):
+        path = self._write(tmp_path, self.LEGACY)
+        with pytest.raises(ValidationError, match="Unknown field: bogus"):
+            append_frontmatter_field(path, "bogus", "x", "rfe-review")
+        assert open(path, encoding="utf-8").read() == self.LEGACY
+
+    def test_missing_file(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            append_frontmatter_field(str(tmp_path / "nope.md"), "type", "rfe", "rfe-review")
+
+
+class TestTypeForProbesTheTaskFrontmatter:
+    """_type_for: one non-provisional candidate wins without touching the disk; a provisional
+    id (only the Jira grammar admits it — an overridden project's key) is routed by the
+    `type:` its task file declares under the caller's artifacts dir; otherwise today's rule
+    (detect() else rfe) stands."""
+
+    def test_single_candidate_never_probes(self, tmp_dir, monkeypatch):
+        import artifact_utils
+
+        monkeypatch.setattr(
+            artifact_utils, "_declared_type", lambda path: pytest.fail(f"probed {path}")
+        )
+        for ident, owner in TestLookupsUseDetect.IDS:
+            if ident in ("RHAISTRAT-42", ""):
+                continue  # provisional / no candidate: probed (and unrouted) below
+            assert artifact_utils._type_for(ident).name == owner, ident
+
+    def test_provisional_id_is_routed_by_the_declared_type(self, tmp_dir):
+        import artifact_utils
+
+        _write(
+            "artifacts/initiatives/KONFLUX-1.md",
+            _task_fm("initiative_id", "KONFLUX-1", type="initiative"),
+        )
+        _write("artifacts/rfe-tasks/KONFLUX-2.md", _task_fm("rfe_id", "KONFLUX-2", type="rfe"))
+        found = _TYPES.candidates("KONFLUX-1")
+        assert found.provisional and found.names == ["rfe", "initiative"]
+        assert artifact_utils._type_for("KONFLUX-1").name == "initiative"
+        assert artifact_utils._type_for("KONFLUX-2").name == "rfe"
+        # No task file, or one that declares nothing: today's default.
+        assert artifact_utils._type_for("KONFLUX-3").name == "rfe"
+        _write("artifacts/initiatives/KONFLUX-4.md", _task_fm("initiative_id", "KONFLUX-4"))
+        assert artifact_utils._type_for("KONFLUX-4").name == "rfe"
+        # A declared type that is not the probed candidate's own is not a match.
+        _write(
+            "artifacts/initiatives/KONFLUX-5.md", _task_fm("initiative_id", "KONFLUX-5", type="rfe")
+        )
+        assert artifact_utils._type_for("KONFLUX-5").name == "rfe"
+
+    def test_probe_reads_under_the_callers_artifacts_dir(self, tmp_dir):
+        import artifact_utils
+
+        _write(
+            "elsewhere/initiatives/KONFLUX-1.md",
+            _task_fm("initiative_id", "KONFLUX-1", type="initiative"),
+        )
+        _write("elsewhere/initiative-reviews/KONFLUX-1-review.md", "---\nx: 1\n---\n")
+        _write("elsewhere/rfe-reviews/KONFLUX-1-review.md", "---\nx: 1\n---\n")
+        _write("elsewhere/initiatives/KONFLUX-1-removed-context.yaml", "blocks: []\n")
+        assert artifact_utils._type_for("KONFLUX-1", "elsewhere").name == "initiative"
+        assert artifact_utils._type_for("KONFLUX-1").name == "rfe"  # cwd artifacts/: nothing
+        assert find_review_file("elsewhere", "KONFLUX-1") == os.path.join(
+            "elsewhere", "initiative-reviews", "KONFLUX-1-review.md"
+        )
+        # find_removed_context_yaml routes the same way; the inner prefix test then applies
+        # (a KONFLUX- key carries neither of the initiative type's own prefixes).
+        assert find_removed_context_yaml("elsewhere", "KONFLUX-1") is None
+
+    def test_unparseable_or_missing_declaration_is_no_signal(self, tmp_dir):
+        import artifact_utils
+
+        _write("artifacts/initiatives/KONFLUX-1.md", "---\n: : :\n---\nbody\n")
+        assert artifact_utils._declared_type("artifacts/initiatives/KONFLUX-1.md") is None
+        assert artifact_utils._type_for("KONFLUX-1").name == "rfe"
+        _write("artifacts/initiatives/KONFLUX-2.md", "no frontmatter\n")
+        assert artifact_utils._declared_type("artifacts/initiatives/KONFLUX-2.md") is None
+        _write(
+            "artifacts/initiatives/KONFLUX-3.md", "---\ninitiative_id: KONFLUX-3\ntype: ''\n---\n"
+        )
+        assert artifact_utils._declared_type("artifacts/initiatives/KONFLUX-3.md") is None
+
+    def test_unreadable_declaration_is_no_signal(self, tmp_dir, monkeypatch):
+        """A probe path holding bytes no text reader accepts, or a file that cannot be opened,
+        must not raise out of _type_for (the routers reach the probe for any provisional id):
+        it is no routing signal and today's default applies."""
+        import artifact_utils
+
+        os.makedirs("artifacts/initiatives")
+        with open("artifacts/initiatives/KONFLUX-7.md", "wb") as f:
+            f.write(b"\xff\xfe")
+        with pytest.raises(UnicodeDecodeError):
+            artifact_utils.read_frontmatter("artifacts/initiatives/KONFLUX-7.md")
+        assert artifact_utils._declared_type("artifacts/initiatives/KONFLUX-7.md") is None
+        assert artifact_utils._type_for("KONFLUX-7").name == "rfe"
+        assert find_review_file("artifacts", "KONFLUX-7") is None
+        assert find_removed_context_yaml("artifacts", "KONFLUX-7") is None
+
+        def unreadable(path):
+            raise PermissionError(13, "Permission denied", path)
+
+        monkeypatch.setattr(artifact_utils, "read_frontmatter", unreadable)
+        assert artifact_utils._declared_type("artifacts/initiatives/KONFLUX-7.md") is None
+        assert artifact_utils._type_for("KONFLUX-7").name == "rfe"
+
+    def test_an_id_with_a_separator_is_never_probed(self, tmp_dir, monkeypatch):
+        import artifact_utils
+
+        monkeypatch.setattr(
+            artifact_utils, "_declared_type", lambda path: pytest.fail(f"probed {path}")
+        )
+        assert artifact_utils._type_for("RHAISTRAT-1/../x").name == "rfe"
+
+
+class TestFindTaskFileDescriptorForm:
+    """find_task_file_including_archived: the legacy (tasks_subdir, jira_prefix, local_prefix)
+    form is unchanged for generate_review_pdf; the descriptor form routes ownership through
+    Descriptor.owns() and agrees with it id for id."""
+
+    FILES = {
+        "artifacts/rfe-tasks/RFE-001.md": ("rfe_id", "RFE-001"),
+        "artifacts/rfe-tasks/RFE-002-some-slug.md": ("rfe_id", "RFE-002"),
+        "artifacts/rfe-tasks/RHAIRFE-1.md": ("rfe_id", "RHAIRFE-1"),
+        "artifacts/rfe-tasks/RHAIRFE-2-slug.md": ("rfe_id", "RHAIRFE-2"),
+        "artifacts/rfe-tasks/RFE-x.md": ("rfe_id", "RFE-x"),
+        "artifacts/initiatives/INIT-001.md": ("initiative_id", "INIT-001"),
+        "artifacts/initiatives/INIT-002-slug.md": ("initiative_id", "INIT-002"),
+        "artifacts/initiatives/RHOAIENG-1.md": ("initiative_id", "RHOAIENG-1"),
+        "artifacts/initiatives/RHAISTRAT-42.md": ("initiative_id", "RHAISTRAT-42"),
+    }
+    IDS = [
+        "RFE-001", "RFE-002", "RHAIRFE-1", "RHAIRFE-2", "RFE-x", "INIT-001", "INIT-002",
+        "RHOAIENG-1", "RHAISTRAT-42", "RFE-404", "",
+    ]  # fmt: skip
+
+    def _populate(self):
+        for path, (field, ident) in self.FILES.items():
+            _write(path, _task_fm(field, ident, status="Archived"))
+            _write(path.replace(".md", "-comments.md"), "comments\n")
+
+    def test_descriptor_form_equals_the_legacy_form_for_every_shipped_id(self, tmp_dir):
+        from artifact_utils import find_task_file_including_archived as find
+
+        self._populate()
+        expected = {
+            ("rfe", "RFE-001"): "artifacts/rfe-tasks/RFE-001.md",
+            ("rfe", "RFE-002"): "artifacts/rfe-tasks/RFE-002-some-slug.md",  # local: slug ok
+            ("rfe", "RHAIRFE-1"): "artifacts/rfe-tasks/RHAIRFE-1.md",
+            ("rfe", "RHAIRFE-2"): None,  # tracker key: exact name only
+            ("rfe", "RFE-x"): "artifacts/rfe-tasks/RFE-x.md",  # parity rung: local prefix
+            ("initiative", "INIT-001"): "artifacts/initiatives/INIT-001.md",
+            ("initiative", "INIT-002"): "artifacts/initiatives/INIT-002-slug.md",
+            ("initiative", "RHOAIENG-1"): "artifacts/initiatives/RHOAIENG-1.md",
+        }
+        for desc in (RFE, INITIATIVE):
+            bare = desc.dirs("bare")["tasks"]
+            for ident in self.IDS:
+                legacy = find("artifacts", ident, bare, desc.write_prefix, desc.local_prefix)
+                by_desc = find("artifacts", ident, desc=desc)
+                assert legacy == by_desc == expected.get((desc.name, ident)), (desc.name, ident)
+                assert (by_desc is not None) <= desc.owns(ident)
+            assert find("nowhere", "RFE-001", desc=desc) is None
+
+    def test_descriptor_form_takes_an_explicit_tasks_subdir(self, tmp_dir):
+        from artifact_utils import find_task_file_including_archived as find
+
+        _write("artifacts/archive/RFE-001.md", _task_fm("rfe_id", "RFE-001"))
+        assert find("artifacts", "RFE-001", "archive", desc=RFE) == "artifacts/archive/RFE-001.md"
+        assert find("artifacts", "RFE-001", desc=RFE) is None
+
+    def test_rfe_wrapper_is_the_descriptor_form(self, tmp_dir):
+        from artifact_utils import find_task_file_including_archived as find
+
+        self._populate()
+        for ident in self.IDS:
+            assert find_artifact_file_including_archived("artifacts", ident) == find(
+                "artifacts", ident, desc=RFE
+            ), ident
+
+
+class TestRenameStampsSelfDescribingFields:
+    """rename_to_tracker_key stamps `tracker_ref: <key>` (and `type: <name>` when the file has
+    none) on the task and review files it rewrites — appended after the existing fields, D7 —
+    and touches no companion file."""
+
+    def _draft(self, root="artifacts", with_type=False):
+        os.makedirs(f"{root}/rfe-tasks", exist_ok=True)
+        os.makedirs(f"{root}/rfe-reviews", exist_ok=True)
+        task = {"rfe_id": "RFE-001", "title": "T", "priority": "Major", "status": "Ready"}
+        review = {**VALID_REVIEW_FM, "rfe_id": "RFE-001"}
+        if with_type:
+            task["type"] = review["type"] = "rfe"
+        write_frontmatter(f"{root}/rfe-tasks/RFE-001.md", task, "rfe-task")
+        _write(f"{root}/rfe-tasks/RFE-001-comments.md", "comments\n")
+        _write(f"{root}/rfe-tasks/RFE-001-removed-context.yaml", "blocks: []\n")
+        write_frontmatter(f"{root}/rfe-reviews/RFE-001-review.md", review, "rfe-review")
+
+    def test_pre_migration_draft_gains_type_then_tracker_ref_appended(self, tmp_dir):
+        self._draft()
+        rename_to_jira_key("artifacts", "RFE-001", "RHAIRFE-3082")
+        with open("artifacts/rfe-tasks/RHAIRFE-3082.md") as f:
+            assert f.read() == (
+                "---\nrfe_id: RHAIRFE-3082\ntitle: T\npriority: Major\nstatus: Submitted\n"
+                "local_id: RFE-001\nsize: null\nparent_key: null\noriginal_labels: null\n"
+                "type: rfe\ntracker_ref: RHAIRFE-3082\n---\n"
+            )
+        with open("artifacts/rfe-reviews/RHAIRFE-3082-review.md") as f:
+            assert f.read() == (
+                "---\nrfe_id: RHAIRFE-3082\nscore: 8\npass: true\nrecommendation: submit\n"
+                "feasibility: feasible\nauto_revised: false\nneeds_attention: false\nscores:\n"
+                "  what: 2\n  why: 2\n  open_to_how: 2\n  not_a_task: 2\n  right_sized: 0\n"
+                "local_id: RFE-001\nerror: null\nbefore_score: null\n"
+                "needs_attention_reason: null\nbefore_scores: null\n"
+                "type: rfe\ntracker_ref: RHAIRFE-3082\n---\n"
+            )
+        # Companions are renamed, never rewritten.
+        with open("artifacts/rfe-tasks/RHAIRFE-3082-comments.md") as f:
+            assert f.read() == "comments\n"
+        with open("artifacts/rfe-tasks/RHAIRFE-3082-removed-context.yaml") as f:
+            assert f.read() == "blocks: []\n"
+
+    def test_stamped_draft_keeps_its_type_in_place_and_gains_tracker_ref(self, tmp_dir):
+        self._draft(with_type=True)
+        rename_to_jira_key("artifacts", "RFE-001", "RHAIRFE-3082")
+        with open("artifacts/rfe-tasks/RHAIRFE-3082.md") as f:
+            assert f.read() == (
+                "---\nrfe_id: RHAIRFE-3082\ntitle: T\npriority: Major\nstatus: Submitted\n"
+                "type: rfe\nlocal_id: RFE-001\nsize: null\nparent_key: null\n"
+                "original_labels: null\ntracker_ref: RHAIRFE-3082\n---\n"
+            )
+        review, _ = read_frontmatter("artifacts/rfe-reviews/RHAIRFE-3082-review.md")
+        assert list(review)[-1] == "tracker_ref" and review["tracker_ref"] == "RHAIRFE-3082"
+        # `type` stayed where the draft had it (after the agent's fields, before the schema
+        # defaults write_frontmatter appended); only tracker_ref was added, at the end.
+        assert list(review)[7:10] == ["scores", "type", "local_id"]
+
+    def test_a_declared_type_is_never_overwritten(self, tmp_dir):
+        # Not a shape the pipeline produces; the rename's contract is "type only when absent".
+        os.makedirs("artifacts/rfe-tasks")
+        _write("artifacts/rfe-tasks/RFE-001.md", _task_fm("rfe_id", "RFE-001", type="initiative"))
+        rename_to_tracker_key("artifacts", "RFE-001", "RHAIRFE-1", RFE)
+        data, _ = read_frontmatter("artifacts/rfe-tasks/RHAIRFE-1.md")
+        assert (data["type"], data["tracker_ref"]) == ("initiative", "RHAIRFE-1")
+
+    def test_initiative_rename_stamps_the_same_way(self, tmp_dir):
+        os.makedirs("artifacts/initiatives")
+        os.makedirs("artifacts/initiative-reviews")
+        write_frontmatter(
+            "artifacts/initiatives/INIT-001.md", VALID_INITIATIVE_TASK_FM.copy(), "initiative-task"
+        )
+        write_frontmatter(
+            "artifacts/initiative-reviews/INIT-001-review.md",
+            VALID_INITIATIVE_REVIEW_FM.copy(),
+            "initiative-review",
+        )
+        rename_initiative_to_jira_key("artifacts", "INIT-001", "RHOAIENG-1234")
+        for path in (
+            "artifacts/initiatives/RHOAIENG-1234.md",
+            "artifacts/initiative-reviews/RHOAIENG-1234-review.md",
+        ):
+            data, _ = read_frontmatter(path)
+            assert list(data)[-2:] == ["type", "tracker_ref"], path
+            assert (data["type"], data["tracker_ref"]) == ("initiative", "RHOAIENG-1234")
+            assert (data["initiative_id"], data["local_id"]) == ("RHOAIENG-1234", "INIT-001")
+
+    def test_renamed_files_validate_and_the_wrappers_agree_with_the_generic(self, tmp_dir):
+        self._draft("a")
+        self._draft("b")
+        rename_to_jira_key("a", "RFE-001", "RHAIRFE-7")
+        rename_to_tracker_key("b", "RFE-001", "RHAIRFE-7", RFE)
+        assert _snapshot("a") == _snapshot("b")
+        read_frontmatter_validated("a/rfe-tasks/RHAIRFE-7.md", "rfe-task")
+        read_frontmatter_validated("a/rfe-reviews/RHAIRFE-7-review.md", "rfe-review")
 
 
 class TestSchemasFollowTheRegistry:
