@@ -2893,6 +2893,37 @@ def _expected_stub(pipeline_type, rid, error):
     return artifact_utils.apply_defaults(stub, f"{pipeline_type}-review")
 
 
+class TestStallRetryCounters:
+    def test_malformed_persisted_counts_read_as_zero(self, tmp_dir):
+        """A hand-edited or truncated counter file must not make a stalled wave fail on
+        ``None < cap`` or buy/deny a retry: only a non-negative non-bool int counts."""
+        os.makedirs("tmp", exist_ok=True)
+        with open(ps.STALL_RETRIES_FILE, "w") as f:
+            f.write(
+                "ASSESS:RHAIRFE-1002:\n"  # null
+                "ASSESS:RHAIRFE-1003: '2'\n"  # string
+                "ASSESS:RHAIRFE-1004: true\n"  # bool
+                "ASSESS:RHAIRFE-1005: -3\n"  # negative
+                "ASSESS:RHAIRFE-1006: 1.5\n"  # float
+                "ASSESS:RHAIRFE-1007: 1\n"  # the only valid one
+                "7: 3\n"  # non-string key is dropped
+            )
+        assert ps._read_stall_retries() == {
+            "ASSESS:RHAIRFE-1002": 0,
+            "ASSESS:RHAIRFE-1003": 0,
+            "ASSESS:RHAIRFE-1004": 0,
+            "ASSESS:RHAIRFE-1005": 0,
+            "ASSESS:RHAIRFE-1006": 0,
+            "ASSESS:RHAIRFE-1007": 1,
+        }
+
+    def test_non_mapping_file_reads_as_empty(self, tmp_dir):
+        os.makedirs("tmp", exist_ok=True)
+        with open(ps.STALL_RETRIES_FILE, "w") as f:
+            f.write("- not\n- a\n- mapping\n")
+        assert ps._read_stall_retries() == {}
+
+
 class TestWaveStallPolicy:
     """WAVE_STALL_POLICY is keyed by pipeline phase and must classify every agent phase."""
 

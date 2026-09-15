@@ -198,6 +198,21 @@ failed: split_not_attempted: wave stalled ...`. After the run, the review's
   changes, and children a late split agent minted are left local, never
   split-submitted (`submit.py` Phase 1 skips the parent). The double window
   exists to make this rare.
+- A retried first attempt is not cancelled — the scripts have no handle on a
+  subagent — and the wave uses fixed artifact paths, so a first attempt that
+  was merely stuck and finishes *after* the retry's result was accepted
+  overwrites it. The retry policy makes that safe by construction for the
+  phases it admits: the stale write is the same agent over the same staged
+  input (assess result, dimension file, fetched task), so the artifact it
+  replaces is equivalent, and the phase that consumed the accepted artifact
+  has already read it. The one ordering that could matter is a REVIEW retry
+  whose stale first-pass review lands after the item was revised and
+  re-reviewed: the file would then carry a pre-revision verdict. It needs an
+  agent that is a full window (15 min) late and then finishes minutes later
+  still; the run report's `before_score` / `auto_revised` provenance makes it
+  visible after the fact. Attempt-scoped output paths, the real fence, change
+  the agents' output contract (prompt edits) and are a follow-up, not part of
+  this guard.
 - The guard bounds the barrier; it does not diagnose why the agent died.
   Look at the subagent transcript for that.
 

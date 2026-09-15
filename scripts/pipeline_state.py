@@ -1347,8 +1347,20 @@ def _clear_wave_progress():
 
 
 def _read_stall_retries():
+    """Per (phase, id) retry counters, normalized: only a non-negative non-bool int counts;
+    a missing, null, string, float, bool or negative value (a hand-edited or truncated file)
+    reads as 0, so a stalled wave can never fail on ``None < cap`` and a bogus value cannot
+    buy or deny a retry."""
     counts = _read_yaml_file(STALL_RETRIES_FILE)
-    return counts if isinstance(counts, dict) else {}
+    if not isinstance(counts, dict):
+        return {}
+    clean = {}
+    for key, value in counts.items():
+        if not isinstance(key, str):
+            continue
+        ok = isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        clean[key] = value if ok else 0
+    return clean
 
 
 def _write_stall_retries(counts):
