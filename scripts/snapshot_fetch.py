@@ -117,6 +117,12 @@ def _blank_negated_groups(jql):
         # A quoted literal is copied verbatim: a ``not (`` inside ``summary ~ "not (a"`` is
         # text, not a group, and must not swallow the clauses that follow it.
         if outer_quote is not None:
+            # A backslash escapes the next character inside a Jira text literal (``"a \" b"``):
+            # copy the pair so an escaped quote cannot close the literal early.
+            if ch == "\\" and i + 1 < len(jql):
+                out.extend((ch, jql[i + 1]))
+                i += 2
+                continue
             if ch == outer_quote:
                 outer_quote = None
             out.append(ch)
@@ -136,6 +142,9 @@ def _blank_negated_groups(jql):
         while j < len(jql):
             ch = jql[j]
             if quote:
+                if ch == "\\" and j + 1 < len(jql):
+                    j += 2  # escaped character inside the literal: never a delimiter
+                    continue
                 if ch == quote:
                     quote = None
             elif ch in "\"'":
