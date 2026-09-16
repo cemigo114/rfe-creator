@@ -1,3 +1,6 @@
+# GENERATED — do not edit by hand. Regenerate: python3 scripts/generate_eval_config.py
+# Sources: eval/config/skeleton.yaml (shared structure, checks and judge prose), types/initiative/eval/fragment.yaml
+# (typed prose) and types/initiative/type.yaml (identity, dirs, score fields, thresholds).
 name: initiative-speedrun
 description: End-to-end Initiative pipeline — create, review, auto-fix, split, and submit Initiatives
 
@@ -44,14 +47,14 @@ dataset:
         constraints, team context, scope, timeline, success criteria
 
     - annotations.yaml: Test metadata with fields:
-      - expected_scores (dict with what/why/scope/
-        open_to_how/right_sized, nullable floats)
+      - expected_scores (dict with what/why/scope/open_to_how/right_sized, nullable floats)
       - expected_total (nullable float, 0-10)
       - expected_pass (nullable bool)
       - expected_recommendation (nullable string: submit/revise/split/reject)
       - expected_feasibility (nullable string)
       - expected_alignment (nullable string: strong/partial/weak/not_assessed)
       - known_issues (list)
+      - score_tolerance (int, default 1)
       - tags (list): free-form labels; `revision-expected` marks a
         deliberately weak draft that the revision_coverage judge requires
         the pipeline to auto-revise (see eval/README.md)
@@ -73,8 +76,8 @@ inputs:
     - match: |
         Any interaction with Jira — whether via MCP tools
         (mcp__atlassian__*), Bash scripts calling the Jira REST API
-        (scripts/submit.py --type initiative, scripts/fetch_issue.py), or any
-        HTTP requests to a Jira server.
+        (scripts/submit.py, scripts/fetch_issue.py), or any HTTP
+        requests to a Jira server.
       prompt: |
         The skill runs with --dry-run so Jira writes are skipped.
         For reads/fetches: use input.yaml fields `prompt` and
@@ -104,8 +107,8 @@ outputs:
         {ID}-review.md: Main review with YAML frontmatter containing:
           initiative_id, score (0-10), pass (bool), recommendation
           (submit/revise/split/reject/autorevise_reject), feasibility
-          (feasible/infeasible/indeterminate), alignment
-          (strong/partial/weak/not_assessed), auto_revised (bool),
+          (feasible/infeasible/indeterminate), auto_revised (bool),
+          alignment (strong/partial/weak/not_assessed),
           needs_attention (bool), needs_attention_reason,
           scores.what/why/scope/open_to_how/right_sized (each 0-2),
           before_score, before_scores (pre-revision scores).
@@ -113,25 +116,29 @@ outputs:
           architecture context analysis, blockers, scope assessment.
         {ID}-alignment.md: Strategic alignment assessment against
           RHAISTRAT parent Outcome (if applicable).
+        {ID}-split-status.yaml: Written only for splits; contains
+          action (split/no-split), children list, reason.
       Body of review: Assessor Feedback, Technical Feasibility,
       Strategic Alignment, Execution Considerations, Revision History.
 
   - path: artifacts/initiative-originals
     batch_pattern: "INIT-{n:03d}"
     schema: |
-      Backup of original Initiative content before revisions. One file
-      per Initiative: {ID}.md containing the original body (no frontmatter).
-      Used for diffing and content preservation checks.
+      Backup of original Initiative content before revisions. One file per Initiative:
+      {ID}.md containing the original body (no frontmatter). Used for
+      diffing and content preservation checks.
 
   - path: artifacts/auto-fix-runs
     batch_pattern: "*"
     schema: |
       Timestamped run reports from the auto-fix pipeline.
-      initiative-run-YYYYMMDD-HHMMSS.yaml: Structured YAML with run_id,
-        started, completed timestamps, per_initiative list (each with id,
-        recommendation, alignment, feasibility, revision_cycles),
-        before_scores_avg, after_scores_avg, results
-        (passed/failed/split/errors).
+      initiative-run-YYYYMMDD-HHMMSS.yaml: Structured YAML with run_id, started,
+        completed timestamps, batch_size, per_initiative list (each with
+        id, recommendation, revision_cycles, alignment, feasibility, needs_attention),
+        before_scores_avg, after_scores_avg,
+        results (passed/failed/split/errors/retried/retry_successes).
+      initiative-run-YYYYMMDD-HHMMSS-report.html: Human-readable HTML companion
+        with diffs, scores, and revision analysis (scripts/generate_review_pdf.py).
 
 traces:
   stdout: true
@@ -159,8 +166,8 @@ judges:
   - name: frontmatter_valid
     description: |
       Verify review files have valid YAML frontmatter with required fields,
-      correct value ranges (scores 0-2, total 0-10), valid recommendation
-      and alignment enums, and consistent pass logic.
+      correct value ranges (scores 0-2, total 0-10), valid recommendation enum,
+      and consistent pass logic (pass=true iff score>=7 AND no criterion is 0).
     check: |
       import yaml
       files = outputs.get("files", {})
@@ -205,8 +212,7 @@ judges:
               has_zero = any(scores.get(c) == 0 for c in criteria)
               expected_pass = (total >= 7 and not has_zero)
               if fm.get('pass') != expected_pass:
-                  if not (fm.get('needs_attention') and fm.get('pass') != expected_pass):
-                      errors.append(f"{fname}: pass={fm['pass']} inconsistent (total={total}, has_zero={has_zero})")
+                  errors.append(f"{fname}: pass={fm['pass']} inconsistent (total={total}, has_zero={has_zero})")
       if checked == 0:
           return (False, "No review files to check")
       return (len(errors) == 0, "; ".join(errors[:5]) if errors else f"{checked} reviews valid")
@@ -216,11 +222,12 @@ judges:
       Verify the auto-fix pipeline generated a structured run report
       (YAML file in artifacts/auto-fix-runs/) with required fields.
     check: |
+      import os
       import yaml
       files = outputs.get("files", {})
       yamls = {k: v for k, v in files.items()
                if k.startswith("artifacts/auto-fix-runs/") and k.endswith(".yaml")
-               and "issue-snapshot" not in k}
+               and "-snapshot-" not in os.path.basename(k)}
       if not yamls:
           return (False, "No run report YAML found")
       fname = sorted(yamls.keys())[-1]
@@ -234,16 +241,16 @@ judges:
       for req in ['run_id', 'started', 'completed', 'per_initiative']:
           if req not in report:
               errors.append(f"Missing field: {req}")
-      per_init = report.get('per_initiative', [])
-      if not per_init:
+      entries = report.get('per_initiative', [])
+      if not entries:
           errors.append("per_initiative list is empty")
-      return (len(errors) == 0, "; ".join(errors) if errors else f"Report {fname}: {len(per_init)} Initiatives tracked")
+      return (len(errors) == 0, "; ".join(errors) if errors else f"Report {fname}: {len(entries)} Initiatives tracked")
 
   - name: recommendation_consistency
     description: |
       Cross-field semantic checks: pass/fail aligns with recommendation,
-      infeasible Initiatives are never recommended for submission,
-      weak alignment sets needs_attention.
+      infeasible Initiatives are never recommended for submission.
+      Type rule: alignment=weak requires needs_attention=true.
     check: |
       import yaml
       files = outputs.get("files", {})
@@ -262,7 +269,6 @@ judges:
           passed = fm.get('pass')
           rec = fm.get('recommendation', '')
           feas = fm.get('feasibility', '')
-          alignment = fm.get('alignment', '')
           if passed and rec in ('revise', 'reject', 'autorevise_reject'):
               if feas == 'infeasible' and rec == 'reject':
                   pass  # feasibility-based reject overrides rubric pass — valid
@@ -274,7 +280,7 @@ judges:
               errors.append(f"{fname}: pass=false but recommendation=submit")
           if feas == 'infeasible' and rec == 'submit':
               errors.append(f"{fname}: feasibility=infeasible but recommendation=submit")
-          if alignment == 'weak' and not fm.get('needs_attention'):
+          if fm.get('alignment', '') == 'weak' and not fm.get('needs_attention'):
               errors.append(f"{fname}: alignment=weak but needs_attention=false")
       return (len(errors) == 0, "; ".join(errors[:5]) if errors else f"{len(reviews)} reviews consistent")
 
@@ -610,13 +616,19 @@ judges:
   - name: pipeline_flow
     description: |
       Verify expected execution flow from stdout: all phases ran,
-      no fatal errors during execution.
+      no errors or unexpected file deletions during Phase 1.
+      Note: phase detection uses string matching on stdout, which is
+      inherently fragile — if log messages change, update the patterns
+      below. A future improvement would be to emit stable phase markers
+      from the skills (e.g. "## Phase: create") for reliable detection.
     check: |
       import re
       stdout = outputs.get("stdout", "")
       if not stdout:
           return (False, "No stdout captured")
       errors = []
+      # Only flag tracebacks that indicate real failures — skip non-fatal ones
+      # from tool interception (PermissionError, hook denials) or missing optionals
       fatal_tb_pattern = re.compile(
           r'Traceback \(most recent call last\):.*?(?:Error|Exception): .+',
           re.DOTALL
@@ -633,12 +645,15 @@ judges:
       for tb in fatal_tb_pattern.finditer(stdout):
           tb_text = tb.group()
           if not any(p.search(tb_text) for p in non_fatal_patterns):
+              # Extract last line (the actual error) for the rationale
               last_line = tb_text.strip().split('\n')[-1]
               errors.append(f"Fatal traceback: {last_line[:120]}")
+      if "rm artifacts/initiatives/" in stdout:
+          errors.append("Initiative task file deleted during execution")
       phases_found = []
-      if "initiative-create" in stdout.lower() or "Phase 1" in stdout:
+      if "Phase 1" in stdout or "Phase 1:" in stdout or "initiative-create" in stdout.lower():
           phases_found.append("create")
-      if "auto-fix" in stdout.lower() or "initiative-auto-fix" in stdout.lower():
+      if "auto-fix" in stdout.lower() or "AUTOFIX" in stdout or "Batch " in stdout:
           phases_found.append("auto-fix")
       if "submit" in stdout.lower() or "Phase 3" in stdout:
           phases_found.append("submit")
@@ -651,9 +666,13 @@ judges:
       Verify that every feasibility review was grounded in architecture
       context. Primary evidence is behavioral: the subagent transcript that
       wrote each feasibility file must show a successful Read/Grep/Glob of
-      .context/architecture-context — unless the review declares the
-      context not relevant, which Initiatives may legitimately do. Prose
-      matching is only a fallback for runs without transcript capture.
+      .context/architecture-context. Prose matching ("architecture context
+      was not available") is only a fallback for runs without transcript
+      capture — it both false-positives (an agent borrowing the phrase for
+      an unrelated note, e.g. a missing comments file) and false-negatives
+      (an agent that silently skipped the docs).
+      A review that declares the context not relevant — which Initiatives may
+      legitimately do — counts as grounded instead of failing.
     check: |
       import glob, json, os, re
       files = outputs.get("files", {})
@@ -667,7 +686,7 @@ judges:
           re.IGNORECASE
       )
       not_relevant_pattern = re.compile(
-          r'architecture context (was |is )?(not |un)relevant|no relevant architecture context|outside the scope of.*architecture context',
+          'architecture context (was |is )?(not |un)relevant|no relevant architecture context|outside the scope of.*architecture context',
           re.IGNORECASE
       )
       # Transcripts live at the run root in batch mode; per-case mode and
@@ -732,7 +751,7 @@ judges:
       not_relevant = 0
       for fname, content in sorted(feasibility.items()):
           base = os.path.basename(fname)
-          declared_irrelevant = bool(not_relevant_pattern.search(content))
+          declared_irrelevant = bool(not_relevant_pattern and not_relevant_pattern.search(content))
           if base in writer_hits:
               if writer_hits[base] > 0:
                   evidenced += 1
@@ -752,15 +771,14 @@ judges:
           msg += f", {assumed} assumed via prose fallback (no transcript)"
       if not_relevant:
           msg += f", {not_relevant} not relevant (ok)"
-      return (len(errors) == 0,
-              "; ".join(errors) if errors else msg)
+      return (len(errors) == 0, "; ".join(errors) if errors else msg)
 
   # --- LLM judges ---
 
   - name: initiative_quality
     description: |
-      Assess the quality of produced Initiative task files against the
-      rubric criteria and whether the pipeline's own scores are well-calibrated.
+      Assess the quality of produced Initiative task files against the 5 rubric
+      criteria and whether the pipeline's own scores are well-calibrated.
     score_range: [1, 5]
     prompt: |
       You are an independent evaluator assessing the quality of an automated
@@ -770,8 +788,8 @@ judges:
 
       {{ outputs }}
 
-      Assess the Initiative quality across these criteria, then provide a
-      single overall score 1-5.
+      Assess the Initiative quality across these criteria, then provide a single
+      overall score 1-5.
 
       **Quality criteria** (the Initiative should):
       - WHAT: Have a clear objective — specific, measurable, achievable
@@ -810,27 +828,26 @@ judges:
     score_range: [1, 5]
     prompt: |
       You are an independent evaluator assessing the quality of automated
-      Initiative revisions. The pipeline may have auto-revised some Initiatives
-      to improve their rubric scores.
+      Initiative revisions. The pipeline may have auto-revised some Initiatives to improve
+      their rubric scores.
 
       Here are the produced artifacts:
 
       {{ outputs }}
 
-      Compare the original Initiative (in artifacts/initiative-originals/)
-      against the revised version (in artifacts/initiatives/) and the
-      pipeline's review (in artifacts/initiative-reviews/).
+      Compare the original Initiative (in artifacts/initiative-originals/) against the
+      revised version (in artifacts/initiatives/) and the pipeline's review
+      (in artifacts/initiative-reviews/).
 
       First, check the review frontmatter for `auto_revised` and
       `before_score`/`score`. This tells you whether a revision happened
       and how scores changed.
 
       **If no revision was performed** (auto_revised: false or no originals
-      in artifacts/initiative-originals/): assess the pipeline's *decision*
-      not to revise. If the Initiative is already high quality (score ≥ 8)
-      and doesn't have critical issues, skipping revision is correct —
-      score 4-5. Only score low if the Initiative has clear problems the
-      pipeline should have fixed.
+      in artifacts/initiative-originals/): assess the pipeline's *decision* not to
+      revise. If the Initiative is already high quality (score ≥ 8) and doesn't
+      have critical issues, skipping revision is correct — score 4-5. Only
+      score low if the Initiative has clear problems the pipeline should have fixed.
 
       **If a revision was performed**: compare original vs revised and assess:
 
@@ -867,7 +884,7 @@ judges:
 
   - name: pairwise
     description: Blind A/B comparison of Initiative pipeline output quality across runs
-    prompt_file: eval/config/initiative-pairwise-judge.md
+    prompt_file: types/initiative/eval/pairwise-judge.md
 
 thresholds:
   files_exist:

@@ -30,6 +30,7 @@ import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
+import generate_eval_config  # noqa: E402
 import type_registry  # noqa: E402
 import validate_types  # noqa: E402
 import verify_phase  # noqa: E402
@@ -216,7 +217,13 @@ def _third_type(root, name="docs"):
     data["snapshot"] = {"prefix": "docs-snapshot-", "report_prefix": "docs-run-"}
     data["reporting"]["item_key"] = "per_doc"
     data["eval"]["mlflow_experiment"] = "docs-speedrun-eval"
+    # The quality judge is named <type>_quality (generate_eval_config); a copied rfe_quality
+    # threshold would be a gate-1 finding ("thresholds name judges the config does not define").
+    data["eval"]["thresholds"][f"{name}_quality"] = data["eval"]["thresholds"].pop("rfe_quality")
     _write_yaml(root / name / "type.yaml", data)
+    # The eval fragment and pairwise prompt are gate-1 inputs since PR-4 (the fragment renders
+    # with the shared skeleton; the in-sync check is CLI-only, so no committed config is needed).
+    shutil.copytree(TYPES_ROOT / "rfe" / "eval", root / name / "eval")
     return root
 
 
@@ -1594,3 +1601,69 @@ def test_gate1_ignores_malformed_dimension_names(tmp_path):
     msgs = validate_types.path_messages(desc, tmp_path)
     assert any("collides with an engine phase" in m for m in msgs)
     assert not any("declared twice" in m for m in msgs)
+
+
+# ── eval fragment gate (design §4.5, PR-4) ────────────────────────────────────────
+
+
+class TestEvalFragmentGate:
+    def test_shipped_fragments_pass(self):
+        assert _validate(TYPES_ROOT).ok
+
+    def test_missing_fragment_is_a_finding(self, types_copy):
+        (types_copy / "rfe" / "eval" / "fragment.yaml").unlink()
+        _assert_finding(_validate(types_copy), "eval fragment missing", "rfe")
+
+    def test_fragment_schema_violation_is_a_finding(self, types_copy):
+        path = types_copy / "initiative" / "eval" / "fragment.yaml"
+        data = _read_yaml(path)
+        data["not_a_slot"] = "x"
+        _write_yaml(path, data)
+        (hit,) = _assert_finding(_validate(types_copy), "eval fragment", "initiative")
+        assert "schema:" in hit.message and "not_a_slot" in hit.message
+
+    def test_fragment_that_cannot_render_is_a_finding(self, types_copy):
+        _mutate(
+            types_copy,
+            "rfe",
+            lambda d: d["eval"]["thresholds"].__setitem__("bogus_judge", {"min_mean": 1.0}),
+        )
+        (hit,) = _assert_finding(_validate(types_copy), "eval config cannot be generated", "rfe")
+        assert "bogus_judge" in hit.message
+
+    def test_quality_threshold_must_match_the_type_name(self, tmp_path):
+        extra = _third_type(tmp_path / "extra")
+        _mutate(
+            extra,
+            "docs",
+            lambda d: d["eval"]["thresholds"].__setitem__(
+                "rfe_quality", d["eval"]["thresholds"].pop("docs_quality")
+            ),
+        )
+        report = _validate(TYPES_ROOT, extra_roots=[extra])
+        (hit,) = _assert_finding(report, "eval config cannot be generated", "docs")
+        assert "rfe_quality" in hit.message
+
+    def test_in_sync_check_is_off_for_the_python_api_and_for_copies(self, types_copy):
+        # A copied root renders a different header (its fragment path), so the in-sync check
+        # applies only to descriptors under repo_root — and only when asked.
+        assert _validate(types_copy).ok
+        assert _validate(types_copy, eval_sync=True).ok
+        assert _cli("--root", str(types_copy)).returncode == 0
+
+    def test_in_sync_check_over_a_fake_repo_root(self, tmp_path):
+        repo = tmp_path / "repo"
+        (repo / "eval" / "config").mkdir(parents=True)
+        shutil.copy(REPO_ROOT / "eval" / "config" / "skeleton.yaml", repo / "eval" / "config")
+        root = _copy_types(repo / "types")
+        stale = _validate(root, repo_root=repo, eval_sync=True)
+        assert len(_find(stale, "is out of date")) == 2
+        assert not _find(_validate(root, repo_root=repo), "is out of date")
+        assert generate_eval_config.main(["--root", str(root), "--repo-root", str(repo)]) == 0
+        assert (repo / "eval.yaml").is_file() and (repo / "eval-initiative.yaml").is_file()
+        assert not _find(_validate(root, repo_root=repo, eval_sync=True), "is out of date")
+
+    def test_cli_defaults_to_in_sync_and_accepts_no_eval_sync(self):
+        assert _cli().returncode == 0
+        assert _cli("--no-eval-sync").returncode == 0
+        assert "--no-eval-sync" in _cli("--help").stdout

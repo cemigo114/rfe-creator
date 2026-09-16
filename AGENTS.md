@@ -142,7 +142,10 @@ python3 scripts/type_registry.py show rfe          # Full descriptor
 python3 scripts/type_registry.py get rfe conventions.labels.rubric_pass
 python3 scripts/validate_types.py                  # Descriptor lint (part of make lint)
 python3 scripts/lint_prefix_predicates.py          # Literal key-prefix predicates in scripts/
+python3 scripts/generate_eval_config.py --check    # Generated eval configs in sync (part of make lint)
 ```
+
+`eval.yaml` and `eval-initiative.yaml` are generated: `scripts/generate_eval_config.py` renders each type's config from `eval/config/skeleton.yaml` (shared structure, every check, shared judge prose), `types/<type>/eval/fragment.yaml` (typed prose) and the descriptor (identity, dirs, score fields, the authoritative `eval.thresholds`). Never edit a config by hand — change the skeleton or the fragment and rerun the generator; `--check` fails `make lint` and CI with the diff otherwise.
 
 Do not add new literal key-prefix predicates (`startswith("RHAIRFE-")`, `RFE-\d+` regexes, snapshot file prefixes) to `scripts/`: `lint_prefix_predicates.py` fails on any file whose count exceeds its baseline in `tests/data/prefix_predicate_baseline.json`, and the baseline only shrinks.
 

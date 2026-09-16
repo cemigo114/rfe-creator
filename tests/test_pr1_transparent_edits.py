@@ -787,8 +787,8 @@ STALE_ALLOW = [
     # Never existed; batch_summary.py --type initiative is the real command.
     "Bash(python3 scripts/initiative_batch_summary.py *)",
 ]
-# Allowlisted ahead of the script (design §10 item 4 ships it in PR-4).
-FORWARD_DECLARED = {"scripts/generate_eval_config.py"}
+# Scripts allowlisted ahead of shipping; empty since PR-4 landed generate_eval_config.py.
+FORWARD_DECLARED = set()
 
 
 class TestSettingsAllowlist:

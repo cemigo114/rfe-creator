@@ -41,11 +41,21 @@ descriptor value ("Deployment binding override" below).
 Follow "Adding a type" in [`types/README.md`](../types/README.md): copy `types/rfe/`, edit only the
 extension points, run `python3 scripts/validate_types.py` (gate 1) and, after
 `bash scripts/bootstrap-assess-rfe.sh`, `python3 scripts/validate_types.py --with-deps` (gate 2).
-Then meet the provider floor (design §3.4): a ≥16-case anonymized eval dataset with at least one
-sparse or adversarial case, populated `expected_*` annotations, explicit `eval.thresholds`, the
-committed eval config, one QUICK_MODE run on the PR, and a seed for the tracker emulator.
+Author the eval prose in `types/<name>/eval/fragment.yaml` (schema
+`types/_schema/eval-fragment.schema.json`) and `types/<name>/eval/pairwise-judge.md`, name the
+quality threshold `<name>_quality`, and let `python3 scripts/generate_eval_config.py --type <name>`
+write the committed config ("Generated eval configs" in `types/README.md`). Then meet the provider
+floor (design §3.4): a ≥16-case anonymized eval dataset with at least one sparse or adversarial
+case, populated `expected_*` annotations, explicit `eval.thresholds`, the committed eval config,
+one QUICK_MODE run on the PR, and a seed for the tracker emulator.
 
 Rules that are easy to trip:
+
+- **The eval config is generated.** Never edit `eval.config` by hand: the shared structure and
+  every check live in `eval/config/skeleton.yaml`, your type's prose in `eval/fragment.yaml`,
+  the facts and thresholds in `type.yaml`. `generate_eval_config.py --check` (gate 1, `make lint`,
+  CI) fails with the diff when the committed file is stale, and generation refuses an unused
+  fragment key, an unresolved slot or a threshold naming a judge the config does not define.
 
 - **Data only.** Nothing executable under a descriptor root — `validate_types.py` fails on any
   `*.py`/`*.sh`/`*.bash`/`*.zsh` or shebang file there. Scripts live in `scripts/` and are invoked

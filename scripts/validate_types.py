@@ -29,6 +29,13 @@ design-proposals/work-item-types-unified.md §3.3:
       agent wave validates against artifact_utils.SCHEMAS["<type>-review"]
       (the wait-for-wave deadlock guard: a stub the schema rejects is a
       barrier that never clears)
+    * the eval fragment types/<type>/eval/fragment.yaml exists, validates
+      against types/_schema/eval-fragment.schema.json and renders with
+      eval/config/skeleton.yaml (scripts/generate_eval_config.py: every slot
+      resolved, every key used, valid YAML, checks compile, thresholds name
+      judges); from the CLI the committed eval.config must also equal a fresh
+      render (design §4.5 regenerate-and-diff gate; --no-eval-sync skips it,
+      the Python API defaults to eval_sync=False)
     * cross-type invariants, evaluated on EFFECTIVE bindings (§3.2.1(b)):
       unique (tracker, project, issue_type); unique local_prefix,
       local_id_pattern, id_field; unique non-empty poll/state/report prefixes
@@ -84,9 +91,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 
 sys.path.insert(0, str(SCRIPT_DIR))
+import generate_eval_config  # noqa: E402
 import type_registry  # noqa: E402
 
 SCHEMA_RELPATH = Path("_schema") / "type.schema.json"
+FRAGMENT_SCHEMA_RELPATH = "_schema/eval-fragment.schema.json"
 DEFAULT_ASSESS_DIR = Path(".context") / "assess-rfe"
 
 # Q9: lint only that the ref is a plausible commit SHA; the value is documentary
@@ -192,21 +201,21 @@ def _load_jsonschema():
     return jsonschema
 
 
-def find_schema_file(root=None):
-    """Locate type.schema.json: <root>/_schema first, then the shipped types/_schema."""
+def find_schema_file(root=None, relpath=SCHEMA_RELPATH):
+    """Locate a schema file: <root>/_schema first, then the shipped types/_schema."""
     candidates = []
     if root is not None:
-        candidates.append(Path(root) / SCHEMA_RELPATH)
-    candidates.append(Path(type_registry.DEFAULT_ROOT) / SCHEMA_RELPATH)
+        candidates.append(Path(root) / relpath)
+    candidates.append(Path(type_registry.DEFAULT_ROOT) / relpath)
     for candidate in candidates:
         if candidate.is_file():
             return candidate
     return None
 
 
-def load_schema(root=None):
+def load_schema(root=None, relpath=SCHEMA_RELPATH):
     """Return (schema_dict, path) or (None, None) when no schema file exists."""
-    path = find_schema_file(root)
+    path = find_schema_file(root, relpath)
     if path is None:
         return None, None
     with open(path, encoding="utf-8") as fh:
@@ -293,6 +302,64 @@ def path_messages(desc, repo_root):
     missing("eval.config", _opt(desc, "eval.config"), want_file=True)
     missing("eval.dataset", _opt(desc, "eval.dataset"), want_file=False)
     return messages
+
+
+def _rel(path, repo_root):
+    try:
+        return Path(path).resolve().relative_to(Path(repo_root).resolve()).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def eval_fragment_messages(desc, fragment_schema, skeleton_text, repo_root, eval_sync=False):
+    """The eval single-sourcing gate (design §4.5).
+
+    The fragment must exist, validate against the fragment schema and render with the
+    skeleton; with ``eval_sync`` the committed ``eval.config`` must equal that render.
+    """
+    try:
+        path = generate_eval_config.fragment_path(desc)
+    except generate_eval_config.GenerateError as exc:
+        return [f"eval fragment: {exc}"]
+    rel = _rel(path, repo_root)
+    if not path.is_file():
+        return [f"eval fragment missing: {rel} (types/<type>/eval/fragment.yaml)"]
+    try:
+        fragment = generate_eval_config.load_fragment(desc)
+    except generate_eval_config.GenerateError as exc:
+        return [f"eval fragment: {exc}"]
+    if fragment_schema is not None:
+        jsonschema = _load_jsonschema()
+        validator = jsonschema.Draft202012Validator(fragment_schema)
+        errors = sorted(validator.iter_errors(fragment), key=lambda e: list(e.absolute_path))
+        if errors:
+            messages = []
+            for err in errors:
+                location = getattr(err, "json_path", None) or "$." + ".".join(
+                    str(p) for p in err.absolute_path
+                )
+                text = err.message if len(err.message) <= 300 else err.message[:297] + "..."
+                messages.append(f"eval fragment {rel}: schema: {location}: {text}")
+            return messages
+    if skeleton_text is None:
+        return [f"eval config skeleton missing: {generate_eval_config.SKELETON_RELPATH}"]
+    try:
+        rendered = generate_eval_config.render(desc, fragment, skeleton_text, repo_root)
+    except generate_eval_config.GenerateError as exc:
+        return [f"eval config cannot be generated: {exc}"]
+    # Only a descriptor shipped under repo_root has a committed config to compare with; a
+    # fixture copy or a drop-in root renders a different header by construction.
+    inside = Path(desc.path).resolve().is_relative_to(Path(repo_root).resolve())
+    if eval_sync and inside:
+        config = generate_eval_config.config_path(desc, repo_root)
+        committed = config.read_text(encoding="utf-8") if config.is_file() else None
+        if committed != rendered:
+            return [
+                f"eval config {_rel(config, repo_root)} is out of date with "
+                f"{generate_eval_config.SKELETON_RELPATH} + {rel}: run "
+                "python3 scripts/generate_eval_config.py and commit the result"
+            ]
+    return []
 
 
 def score_fields_messages(desc):
@@ -417,7 +484,15 @@ def error_stub_messages(desc, artifact_utils):
     ]
 
 
-def per_type_findings(desc, schema, repo_root, artifact_utils):
+def per_type_findings(
+    desc,
+    schema,
+    repo_root,
+    artifact_utils,
+    fragment_schema=None,
+    skeleton_text=None,
+    eval_sync=False,
+):
     messages = []
     declared = desc.data.get("type") if isinstance(desc.data, dict) else None
     if declared != desc.name:
@@ -431,6 +506,9 @@ def per_type_findings(desc, schema, repo_root, artifact_utils):
     messages.extend(alignment_labels_messages(desc))
     messages.extend(rubric_ref_messages(desc))
     messages.extend(error_stub_messages(desc, artifact_utils))
+    messages.extend(
+        eval_fragment_messages(desc, fragment_schema, skeleton_text, repo_root, eval_sync)
+    )
     return [Finding(desc.name, m, 1, frozenset({desc.name})) for m in messages]
 
 
@@ -714,13 +792,16 @@ def validate_all(
     assess_dir=None,
     only=None,
     repo_root=None,
+    eval_sync=False,
 ):
     """Run the gates and return a Report.
 
     root / extra_roots / env are forwarded to type_registry.load(); env is also
     what the cross-type lint reads the RFE_CREATOR_BINDING_* overrides from.
     `only` restricts the report to one type (gate 3, --verify). `repo_root`
-    overrides where repo-relative references are resolved (tests).
+    overrides where repo-relative references are resolved (tests). `eval_sync`
+    additionally requires each committed eval.config to equal a fresh render
+    (the CLI default; off here so fixture roots need no committed configs).
 
     Raises MissingDependencyError when jsonschema is not installed.
     """
@@ -770,11 +851,40 @@ def validate_all(
             )
             schema = None
 
+    fragment_schema, fragment_schema_path = load_schema(root, FRAGMENT_SCHEMA_RELPATH)
+    if fragment_schema is None:
+        findings.append(
+            Finding("*", f"eval fragment JSON Schema not found ({FRAGMENT_SCHEMA_RELPATH})")
+        )
+    else:
+        jsonschema = _load_jsonschema()
+        try:
+            jsonschema.Draft202012Validator.check_schema(fragment_schema)
+        except jsonschema.exceptions.SchemaError as exc:
+            findings.append(
+                Finding("*", f"{fragment_schema_path} is not a valid JSON Schema: {exc.message}")
+            )
+            fragment_schema = None
+    try:
+        skeleton_text = generate_eval_config.load_skeleton(repo_root)
+    except generate_eval_config.GenerateError:
+        skeleton_text = None
+
     artifact_utils = _load_artifact_utils()
     for desc in registry:
         if only is not None and desc.name != only:
             continue
-        findings.extend(per_type_findings(desc, schema, repo_root, artifact_utils))
+        findings.extend(
+            per_type_findings(
+                desc,
+                schema,
+                repo_root,
+                artifact_utils,
+                fragment_schema=fragment_schema,
+                skeleton_text=skeleton_text,
+                eval_sync=eval_sync,
+            )
+        )
 
     for finding in data_only_findings(registry):
         if only is None or only in finding.types:
@@ -820,6 +930,11 @@ def build_parser():
     )
     parser.add_argument("--type", help="type name for --verify")
     parser.add_argument("--json", action="store_true", help="machine-readable output")
+    parser.add_argument(
+        "--no-eval-sync",
+        action="store_true",
+        help="skip the committed-eval-config == fresh-render check (generate_eval_config --check)",
+    )
     return parser
 
 
@@ -846,6 +961,7 @@ def main(argv=None):
             with_deps=args.with_deps,
             assess_dir=args.assess_dir,
             only=args.type if args.verify else None,
+            eval_sync=not args.no_eval_sync,
         )
     except MissingDependencyError as exc:
         print(f"ERROR *: {exc}", file=sys.stderr)

@@ -1,0 +1,79 @@
+# Typed prose for the generated eval config (eval.yaml). The structure, the shared judges and
+# every check live in eval/config/skeleton.yaml; identity, dirs, score fields and thresholds
+# come from type.yaml. Schema: types/_schema/eval-fragment.schema.json.
+# Regenerate with: python3 scripts/generate_eval_config.py
+schema_version: 1
+entity_long: RFE (Request for Enhancement)
+execution:
+  skill: rfe.speedrun
+  create_skill: rfe.create
+  timeout_note: 2 hours — opus with 20 cases + splits needs ~60 min
+dataset:
+  prompt: Concise problem statement (1-2 sentences)
+  clarifying_context: |
+    - clarifying_context (string): Extended business context with
+      customer segments, justification, scope, success criteria
+inputs:
+  questions_context: |
+    clarifying questions during rfe.create (customer segment,
+    business impact, problem definition, distinctness, success metrics).
+  questions_answer: |
+    Use the 'clarifying_context' field for customer segments,
+    business justification, and scope details.
+    Use the 'prompt' field for the core problem statement.
+outputs:
+  task_fields: |
+    rfe_id, title, priority (Blocker/Critical/Major/Normal/Minor),
+    size (S/M/L/XL), status (Draft/Ready/Submitted/Archived),
+    parent_key (for split children), original_labels.
+  task_sections: |
+    Body sections: Summary, Problem Statement, Affected Customers,
+    Business Justification, Acceptance Criteria, Success Criteria.
+  review_files: |
+    {ID}-feasibility.md: Technical feasibility assessment with
+      blockers, strategy considerations, scope assessment.
+  review_body: |
+    Body of review: Assessor Feedback table (Criterion, Score, Notes),
+    Verdict, Feedback, Technical Feasibility, Strategy Considerations,
+    Revision History.
+architecture_context:
+  # RFEs always get architecture-grounded feasibility reviews: no "not relevant" carve-out.
+  not_relevant_pattern: null
+  not_relevant_note: ""
+quality:
+  criteria: |
+    - Describe a clear business need (WHAT) — user-centric, not task-like
+    - Be justified with evidence (WHY) — named customers, revenue impact
+    - Not prescribe implementation (no HOW) — platform vocabulary is OK,
+      but "must use X" is not
+    - Describe a need, not an activity (Not a Task)
+    - Be right-sized for a single strategy feature
+  extra_checks: ""
+revision:
+  assessments: |
+    **Revision quality**: Did revisions genuinely improve the RFE?
+    Clarified requirements, strengthened justification, reframed
+    prescriptive content? Or just cosmetic/lateral changes?
+
+    **Content fidelity**: Was important business content preserved?
+    Customer names, requirements, justification data intact?
+    Or was critical content lost during revision?
+
+    **Reframing quality**: When prescriptive/HOW content was reframed,
+    was the intent preserved while removing implementation bias?
+    Or was it simply deleted without reframing the underlying need?
+threshold_notes:
+  revision_coverage: |
+    with 25 cases of which 5 are tagged revision-expected,
+    3 of 5 revised leaves 2 failures -> 23/25 = 0.92 (pass); 2 of 5 revised
+    leaves 3 failures -> 22/25 = 0.88 (fail). The 2-failure slack is shared:
+    a tagged draft the create step repairs on its own, a tagged draft the
+    first review rejects or splits instead of revising (correct pipeline
+    behaviour, but it never enters the revise path and leaves no evidence),
+    and any case without a review file each consume one failure. Calibrated on
+    two live 5-case runs (2026-09-07): drafts weak only by wording were
+    repaired at create time in 4 of 5; drafts with an in-character "no
+    customer evidence, do not pad" anchor were revised in 5 of 5. A multi-item run with
+    zero revisions fails every case (0.0) on any dataset. Single-item runs
+    (Harbor tasks, execution.mode: case) skip the run-level check and are
+    decided by the tag alone. Untagged cases otherwise always pass.

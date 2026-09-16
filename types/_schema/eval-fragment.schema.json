@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/opendatahub-io/rfe-creator/types/_schema/eval-fragment.schema.json",
+  "title": "Work item type eval fragment",
+  "description": "types/<type>/eval/fragment.yaml: the typed prose scripts/generate_eval_config.py splices into eval/config/skeleton.yaml to produce the type's committed eval config (design work-item-types-unified.md section 4.5). Every key is a slot the skeleton references as ${fragment.<dotted>}; identity, dirs, score fields and thresholds are read from type.yaml, never restated here. A `line` is one line of prose; a `block` is a multi-line text inserted at the slot's indentation (an empty block removes the slot line).",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "entity_long",
+    "execution",
+    "dataset",
+    "inputs",
+    "outputs",
+    "architecture_context",
+    "quality",
+    "revision"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": 1},
+    "entity_long": {
+      "$ref": "#/$defs/line",
+      "description": "The entity name as the quality judge introduces it, e.g. \"RFE (Request for Enhancement)\"."
+    },
+    "execution": {
+      "type": "object",
+      "required": ["skill", "create_skill", "timeout_note"],
+      "additionalProperties": false,
+      "properties": {
+        "skill": {
+          "$ref": "#/$defs/line",
+          "description": "The speedrun skill the harness invokes (execution.skill)."
+        },
+        "create_skill": {
+          "$ref": "#/$defs/line",
+          "description": "The create skill's name; the pipeline_flow judge accepts it in stdout as the Phase 1 marker."
+        },
+        "timeout_note": {
+          "$ref": "#/$defs/line",
+          "description": "Trailing comment on execution.timeout explaining the calibration (the value itself is eval.timeout in type.yaml)."
+        }
+      }
+    },
+    "dataset": {
+      "type": "object",
+      "required": ["prompt", "clarifying_context"],
+      "additionalProperties": false,
+      "properties": {
+        "prompt": {
+          "$ref": "#/$defs/line",
+          "description": "What input.yaml's `prompt` holds for this type."
+        },
+        "clarifying_context": {
+          "$ref": "#/$defs/block",
+          "description": "The full `- clarifying_context (string): ...` list item of the dataset schema, wrapped as it should appear."
+        }
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "required": ["questions_context", "questions_answer"],
+      "additionalProperties": false,
+      "properties": {
+        "questions_context": {
+          "$ref": "#/$defs/block",
+          "description": "Continuation of the AskUserQuestion interception matcher: which clarifying questions the create skill asks."
+        },
+        "questions_answer": {
+          "$ref": "#/$defs/block",
+          "description": "How the interceptor should answer them from input.yaml (the shared default line follows)."
+        }
+      }
+    },
+    "outputs": {
+      "type": "object",
+      "required": ["task_fields", "task_sections", "review_files", "review_body"],
+      "additionalProperties": false,
+      "properties": {
+        "task_fields": {
+          "$ref": "#/$defs/block",
+          "description": "Task frontmatter fields as prose (the harness shows it to the judges)."
+        },
+        "task_sections": {
+          "$ref": "#/$defs/block",
+          "description": "The `Body sections: ...` line(s) of the task schema."
+        },
+        "review_files": {
+          "$ref": "#/$defs/block",
+          "description": "Per-dimension review companions ({ID}-feasibility.md, ...); {ID}-review.md and {ID}-split-status.yaml are shared."
+        },
+        "review_body": {
+          "$ref": "#/$defs/block",
+          "description": "The `Body of review: ...` line(s) of the review schema."
+        }
+      }
+    },
+    "architecture_context": {
+      "type": "object",
+      "required": ["not_relevant_pattern", "not_relevant_note"],
+      "additionalProperties": false,
+      "properties": {
+        "not_relevant_pattern": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "description": "Case-insensitive regex; a feasibility review matching it counts as grounded even when its writer never read .context/architecture-context. null: no carve-out, every review must be grounded."
+        },
+        "not_relevant_note": {
+          "$ref": "#/$defs/block",
+          "description": "Sentence(s) appended to the architecture_context_used judge description explaining the carve-out; empty when not_relevant_pattern is null."
+        }
+      }
+    },
+    "quality": {
+      "type": "object",
+      "required": ["criteria", "extra_checks"],
+      "additionalProperties": false,
+      "properties": {
+        "criteria": {
+          "$ref": "#/$defs/block",
+          "description": "The quality judge's bullet list of rubric criteria (one bullet per score field, in rubric order)."
+        },
+        "extra_checks": {
+          "$ref": "#/$defs/block",
+          "description": "Optional paragraph of extra verdicts the quality judge cross-checks (feasibility, alignment, ...); empty for none."
+        }
+      }
+    },
+    "revision": {
+      "type": "object",
+      "required": ["assessments"],
+      "additionalProperties": false,
+      "properties": {
+        "assessments": {
+          "$ref": "#/$defs/block",
+          "description": "The revision_quality judge's **Revision quality** / **Content fidelity** / ... paragraphs, blank-line separated."
+        }
+      }
+    },
+    "threshold_notes": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/block"},
+      "description": "Map judge name -> calibration note rendered as a comment above that judge's threshold entry. Keys must be judges of eval.thresholds in type.yaml."
+    }
+  },
+  "$defs": {
+    "line": {"type": "string", "minLength": 1, "pattern": "^[^\\n]*$"},
+    "block": {"type": "string"}
+  }
+}

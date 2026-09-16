@@ -37,7 +37,7 @@ suggested_judges:
     description: "Compare originals vs revised; judge revision quality, content fidelity, reframing"
   - name: pairwise
     type: llm
-    description: "Blind A/B comparison vs --baseline run (eval/config/pairwise-judge.md)"
+    description: "Blind A/B comparison vs --baseline run (types/rfe/eval/pairwise-judge.md)"
 ---
 
 # rfe.speedrun Evaluation Analysis

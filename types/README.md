@@ -89,6 +89,7 @@ itself is fine — `resolve()` follows the link).
 | `fetch_issue.py` | `--fetch-all` layout (`dirs.{tasks,originals}`, `identity.id_field`, the comments companion and its request gated on `companions.comments`), new `--type` (registry choices, default `rfe`; the no-`--type` invocation is byte-identical); the effective `identity.jira.{project,issue_type}` (`Descriptor.binding(env)`) that `--fetch-all` verifies the fetched issue's `(project, issuetype)` against before writing anything | PR-2c; PR-3c (1/3): `--fetch-all` appends `type:` and `tracker_ref:` to the task file it writes; `status=Ready` and the `Major` priority fallback stay literal (shared pipeline vocabulary, not type facts); PR-3c (2/3): post-fetch verification ("Fetch verification" below) — the initiative fetch agent now calls `--fetch-all --type initiative` instead of `--fields` (D10) |
 | `filter_for_revision.py` | prefix sniff → `detect()` | PR-2a |
 | `frontmatter.py` | `_detect_schema_type` path table (`_SCHEMA_BY_DIR`), `schema` / `--schema-type` choices through `SCHEMAS`; frontmatter `type:` chooses the schema when present, the path table is the fallback; `set` refuses an explicit `--schema-type` (or `type=`) that contradicts a known directory's type | PR-2b; PR-3c (1/3) |
+| `generate_eval_config.py` | renders each type's committed `eval.config` from `eval/config/skeleton.yaml` + `types/<t>/eval/fragment.yaml` + the descriptor (`display.*`, `dirs.*`, `identity.{local_prefix,id_field}`, `key_prefixes[0]`, `schema.review.{score_fields,extra_fields,extra_rules}`, `reporting.{item_key,run_report.extra_entry_fields}`, `snapshot.report_prefix`, `eval.*` — `eval.thresholds` verbatim); `--check` is the regenerate-and-diff gate ("Generated eval configs" below) | PR-4 |
 | `generate_review_pdf.py` | `REPORT_CONFIG`, `--type` choices; the Jira link target is the task's `tracker_ref:` (key-prefix-union fallback for pre-migration artifacts) and the split-child predicate is `Descriptor.owns` | PR-2a; PR-3c (1/3) |
 | `generate_run_report.py` | `TYPE_CONFIG` (`scan_tasks` bound to `artifact_utils.scan_tasks(desc)`), `--type` choices; the report's `binding:` header from the resolved type's effective binding at report time | PR-2a, PR-2b; PR-3c (1/3): `tracker_ref`/`role` projected from frontmatter, prefix-union fallback for pre-migration artifacts; PR-3c (3/3): the additive `binding:` header (`tracker`, `project`, `issue_type`, `source`; D11 — the snapshot header keys are a deferred follow-up); the layout / id-grammar table stays descriptor-valued (those fields are not overridable) |
 | `jql_query.py` | default exclusion wrapper, `--project` choices | PR-2a |
@@ -116,10 +117,16 @@ itself is fine — `resolve()` follows the link).
 3. `python3 scripts/validate_types.py` (gate 1); after `bash scripts/bootstrap-assess-rfe.sh`,
    `python3 scripts/validate_types.py --with-deps` (gate 2). Inspect with
    `python3 scripts/type_registry.py show <name>` / `binding <name>`.
-4. Meet the provider floor (§3.4): a ≥16-case anonymized eval dataset with at least one sparse or
+4. Author the eval prose: `types/<name>/eval/fragment.yaml` (schema
+   `_schema/eval-fragment.schema.json`; the copied rfe one is a complete starting point) and
+   `types/<name>/eval/pairwise-judge.md`; name the quality threshold `<name>_quality` in
+   `eval.thresholds`; then `python3 scripts/generate_eval_config.py --type <name>` writes the
+   committed config at `eval.config` (gate 1 renders it, `--check` keeps it in sync — "Generated
+   eval configs" below).
+5. Meet the provider floor (§3.4): a ≥16-case anonymized eval dataset with at least one sparse or
    adversarial case, populated `expected_*` annotations, explicit `eval.thresholds`, the committed
    eval config, one QUICK_MODE run on the PR, and a seed for the tracker emulator.
-5. Need a key the schema lacks? Tiers, in order: descriptor data → declarative rule → a companion
+6. Need a key the schema lacks? Tiers, in order: descriptor data → declarative rule → a companion
    skill in your own repo consuming the declared-stable script CLIs → core PR. New vocabulary is
    promoted only on the **second requester**.
 
@@ -145,7 +152,7 @@ asserts that every differing or one-sided leaf falls under one of these keys:
 | Schema | `schema.task.extra_fields` (rfe adds `size`), `schema.review.{score_fields,extra_fields,extra_rules}` |
 | Pipeline | `pipeline.{poll_prefix,state_prefix,scorer_agent}`, `pipeline.prompts.*`, `pipeline.dimensions[]` (name/prompt/blocking/condition/skip_stub), `pipeline.rubric.{ref,path,export}`, `pipeline.context_sources[].args` (the `--type` argument) |
 | Reporting | `reporting.{item_key,criterion_labels,criterion_short_labels,before_score_name_map,pdf.extra_fields,run_report.extra_entry_fields}` |
-| Eval | `eval.{config,dataset,mlflow_experiment,timeout,thresholds,annotations_extra}` (the quality judge is named per type) |
+| Eval | `eval.{config,dataset,mlflow_experiment,timeout,thresholds,annotations_extra}` (the quality judge is named `<type>_quality`) and the typed prose in `types/<t>/eval/{fragment.yaml,pairwise-judge.md}`; the config at `eval.config` is generated from them ("Generated eval configs" below) |
 
 Identical in both files — shared machinery, **not** extension points: `schema_version`, `kind`,
 `identity.tracker`, `identity.jira.{split_link_type,state_map}`, `companions.removed_context`,
@@ -493,13 +500,55 @@ over it (same line, same exit, decided after argument parsing and before the cre
 results directory or any snapshot are read); it also cross-checks each run report's `type:` against
 `--type` and refuses a report of another type; a legacy report without `type:` is read as today.
 
+## Generated eval configs (§4.5, PR-4)
+
+`eval.yaml` and `eval-initiative.yaml` are the one piece of generated data in the repo — do not
+edit them by hand. `python3 scripts/generate_eval_config.py` renders each type's `eval.config`
+from three sources and `--check` (in `make lint`, lint.yml and gate 1) fails with the diff when a
+committed config is stale:
+
+| Source | Holds | Change it when |
+|---|---|---|
+| `eval/config/skeleton.yaml` | The structure, every deterministic check, the shared judge prose and the placeholder slots — once | A judge or check should change for every type |
+| `types/<t>/eval/fragment.yaml` | The typed prose only (schema `types/_schema/eval-fragment.schema.json`): what the inputs and outputs are, the quality criteria, the revision-quality paragraphs, the calibration notes, the architecture-context carve-out (`not_relevant_pattern`, `null` for rfe) | The type's judgement wording changes |
+| `types/<t>/type.yaml` | Identity, `dirs`, `score_fields`, `extra_fields` / `extra_rules`, report keys and `eval.thresholds` (verbatim, authoritative) | A type fact or a threshold changes |
+
+The template language is deliberately tiny (the script's docstring is the reference):
+`${type.<dotted>}` / `${fragment.<dotted>}` / `${gen.<name>}` inline, a placeholder alone on its
+line is a block slot rendered at that indentation (an empty value removes the line), `#@` lines
+are skeleton-only. Generation fails — and writes nothing — on an unresolved placeholder, an
+unused fragment key, invalid YAML, a `check:` that does not compile, or a threshold naming a judge
+the config does not define (so a copied `rfe_quality` threshold under a new type is caught).
+Derived values (`${gen.*}`) are projections of the descriptor: `<type>-speedrun`,
+`<local_prefix>{n:03d}`, the score-field list, `<type>_quality`, the extra-field enum checks and
+the `extra_rules` consistency check, the `annotations_extra` lines, the run-report entry fields,
+`types/<t>/eval/pairwise-judge.md`, and the thresholds block with the fragment's notes as comments.
+
+**Dispositions applied at the first regeneration** (design §4.5: every silent drift became an
+explicit entry or was reverted). Reverted in the initiative config: the dropped rm-artifacts
+check, the weakened phase-detection markers, and the `needs_attention` pass-logic escape (it
+tolerated any pass/total inconsistency; no producer rule ever justified it — the design's §8 sketch
+had foreseen an explicit entry, reverting was the safer reading). Kept as an explicit fragment
+entry: the initiative `not_relevant` carve-out (`architecture_context.not_relevant_pattern`, with
+its 0.85 threshold in `type.yaml`); the shared judge now carries the switch, inert for rfe. Fixed
+in both: `run_report_exists` excludes any `-snapshot-` file (both copies excluded the rfe prefix
+only), the never-produced `artifacts/review-report.html` output is gone (submit.py writes the HTML
+companion beside the run report under `auto-fix-runs/`, now documented there together with
+`batch_size` and the retry counters), `{ID}-split-status.yaml` and `score_tolerance` are
+documented for both, and `revision_quality` points the judge at `before_score`/`score` (the
+review frontmatter has no `revision_cycles`). `tests/test_generate_eval_config.py::TestDispositions`
+pins each of these.
+
 ## Lint gates (§3.3)
 
 1. **Gate 1 — lint time** (`python3 scripts/validate_types.py`, in `make lint` and CI): at least one
    descriptor is discovered (an empty root fails, never a vacuous pass); JSON Schema; `kind` is
    `work-item`; every repo-relative reference exists (`pipeline.prompts.*`, `dimensions[].prompt`,
    `eval.config`, `eval.dataset`); `score_fields` non-empty and the review schema accepts the
-   `verify_phase` error stub; no executable code under a descriptor root; cross-type: unique
+   `verify_phase` error stub; the eval fragment exists, validates against
+   `_schema/eval-fragment.schema.json` and renders with the skeleton, and (CLI, `--no-eval-sync`
+   to skip) the committed `eval.config` equals a fresh render; no executable code under a
+   descriptor root; cross-type: unique
    effective `(tracker, project, issue_type)`, unique `local_prefix`, `local_id_pattern`,
    `id_field`, poll/state prefixes (empty allowed for `rfe` only), snapshot prefixes non-empty and
    pairwise not prefix-of-each-other, `report_prefix` non-empty except `rfe`, no `local_prefix`
