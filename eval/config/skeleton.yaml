@@ -206,7 +206,7 @@ judges:
               has_zero = any(scores.get(c) == 0 for c in criteria)
               expected_pass = (total >= 7 and not has_zero)
               if fm.get('pass') != expected_pass:
-                  errors.append(f"{fname}: pass={fm['pass']} inconsistent (total={total}, has_zero={has_zero})")
+                  errors.append(f"{fname}: pass={fm.get('pass')} inconsistent (total={total}, has_zero={has_zero})")
       if checked == 0:
           return (False, "No review files to check")
       return (len(errors) == 0, "; ".join(errors[:5]) if errors else f"{checked} reviews valid")

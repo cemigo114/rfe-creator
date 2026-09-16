@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import keyword
 import os
 import re
 import sys
@@ -55,6 +56,11 @@ FRAGMENT_SCHEMA_VERSION = 1
 SKELETON_COMMENT = "#@"
 
 PLACEHOLDER = re.compile(r"\$\{([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*)\}")
+# Descriptor values are spliced verbatim into the skeleton, some of them inside the Python of
+# a check: nothing that could close a string literal or an f-string field is allowed there.
+_CODE_UNSAFE = re.compile(r"""['"\\{}\n\r]""")
+# Text that may sit inside a generated f-string / message verbatim.
+_PLAIN_TEXT = re.compile(r"^[A-Za-z0-9_./= -]+$")
 BLOCK_LINE = re.compile(r"^(?P<indent>[ \t]*)\$\{(?P<name>[a-z][a-z0-9_.]*)\}[ \t]*$")
 
 # Fragment keys the generator consumes outside the placeholder walk.
@@ -224,20 +230,32 @@ def derived_values(desc, fragment_flat, repo_root=None):
     if not write_prefix:
         raise GenerateError(f"{desc.name}: no tracker key prefix to derive the fetched naming")
 
+    # Generated Python never embeds a descriptor value raw: field names and rule values go
+    # through repr() (a proper literal, whatever they contain), a field is a local variable
+    # only when it is a plain identifier, and message text that is not plain falls back to a
+    # quoted literal outside the f-string.
     extra_fields = _review_extra_fields(desc)
     review_extra = []
     enum_checks = []
-    for name, spec in extra_fields.items():
+    for index, (name, spec) in enumerate(extra_fields.items()):
+        name = str(name)
         spec = spec if isinstance(spec, dict) else {}
         enum = spec.get("enum")
         if enum:
             review_extra.append(f"{name} ({'/'.join(str(v) for v in enum)})")
+            local = name if name.isidentifier() and not keyword.iskeyword(name) else None
+            local = local or f"_extra_field_{index}"
+            allowed = f"valid_{local}s" if local == name else f"_allowed_{index}"
+            if _PLAIN_TEXT.match(name):
+                message = f"f\"{{fname}}: invalid {name} '{{{local}}}'\""
+            else:
+                message = f'f"{{fname}}: invalid " + {name!r} + f" \'{{{local}}}\'"'
             enum_checks.extend(
                 [
-                    f"{name} = fm.get('{name}')",
-                    f"valid_{name}s = {[str(v) for v in enum]!r}",
-                    f"if {name} and {name} not in valid_{name}s:",
-                    f"    errors.append(f\"{{fname}}: invalid {name} '{{{name}}}'\")",
+                    f"{local} = fm.get({name!r})",
+                    f"{allowed} = {[str(v) for v in enum]!r}",
+                    f"if {local} and {local} not in {allowed}:",
+                    f"    errors.append({message})",
                 ]
             )
         else:
@@ -246,8 +264,13 @@ def derived_values(desc, fragment_flat, repo_root=None):
     rule_lines = []
     rule_desc = []
     for field, equals, then in _extra_rules(desc):
-        rule_lines.append(f"if fm.get('{field}', '') == '{equals}' and not fm.get('{then}'):")
-        rule_lines.append(f'    errors.append(f"{{fname}}: {field}={equals} but {then}=false")')
+        field, then = str(field), str(then)
+        rule_lines.append(f"if fm.get({field!r}, '') == {equals!r} and not fm.get({then!r}):")
+        text = f"{field}={equals} but {then}=false"
+        if _PLAIN_TEXT.match(text):
+            rule_lines.append(f'    errors.append(f"{{fname}}: {text}")')
+        else:
+            rule_lines.append(f'    errors.append(f"{{fname}}: " + {text!r})')
         rule_desc.append(f"Type rule: {field}={equals} requires {then}=true.")
 
     annotations = []
@@ -355,7 +378,13 @@ class _Resolver:
     def __call__(self, name):
         namespace, _, rest = name.partition(".")
         if namespace == "type" and rest:
-            return _desc_get(self.desc, rest)
+            value = _desc_get(self.desc, rest)
+            if isinstance(value, str) and _CODE_UNSAFE.search(value):
+                raise GenerateError(
+                    f"{self.desc.name}: descriptor value {rest} ({value!r}) contains a quote, "
+                    "backslash, brace or newline; the skeleton splices it into check code"
+                )
+            return value
         if namespace == "fragment" and rest:
             if rest not in self.fragment:
                 raise GenerateError(f"{self.desc.name}: fragment has no key {rest!r}")

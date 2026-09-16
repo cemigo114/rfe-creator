@@ -281,6 +281,52 @@ class TestDerivedValues:
         )
         assert d["arch.not_relevant_pattern_def"].startswith("not_relevant_pattern = re.compile(")
 
+    def test_generated_code_quotes_descriptor_values(self):
+        # CodeRabbit on #189: field names and rule values never reach the check code raw.
+        def mutate(d):
+            d["schema"]["review"]["extra_fields"] = {
+                "risk-level": {"type": "string", "enum": ["low", "it's high"]},
+                "class": {"type": "string", "enum": ["a"]},
+                "owner": {"type": "string", "enum": ["x"]},
+                "it's": {"type": "string", "enum": ["y"]},
+            }
+            d["schema"]["review"]["extra_rules"] = [
+                {"when": {"field": "risk-level", "equals": "it's high"}, "then": "needs_attention"}
+            ]
+
+        d = gen.derived_values(_desc(mutate=mutate), gen.flatten(_fragment()))
+        checks = d["checks.extra_enum_fields"].split("\n")
+        assert checks[0] == "_extra_field_0 = fm.get('risk-level')"
+        assert checks[1] == "_allowed_0 = ['low', \"it's high\"]"
+        # A hyphenated name is plain text: it may sit in the message verbatim.
+        assert checks[3] == "    errors.append(f\"{fname}: invalid risk-level '{_extra_field_0}'\")"
+        assert checks[4] == "_extra_field_1 = fm.get('class')"  # keyword: not a local name
+        assert checks[8] == "owner = fm.get('owner')" and checks[9] == "valid_owners = ['x']"
+        # A quote in the name: the message falls back to a literal outside the f-string.
+        assert checks[12] == '_extra_field_3 = fm.get("it\'s")'
+        assert (
+            checks[15]
+            == '    errors.append(f"{fname}: invalid " + "it\'s" + f" \'{_extra_field_3}\'")'
+        )
+        rules = d["checks.extra_rules"].split("\n")
+        assert (
+            rules[0]
+            == "if fm.get('risk-level', '') == \"it's high\" and not fm.get('needs_attention'):"
+        )
+        assert (
+            rules[1]
+            == '    errors.append(f"{fname}: " + "risk-level=it\'s high but needs_attention=false")'
+        )
+        body = "def _check():\n    fm = {}\n    errors = []\n    fname = 'f'\n" + "".join(
+            f"    {ln}\n" for ln in checks + rules
+        )
+        compile(body, "<generated>", "exec")
+
+    def test_descriptor_values_spliced_into_code_are_guarded(self):
+        desc = _mini_desc(lambda d: d["display"].__setitem__("entity", 'R"FE'))
+        with pytest.raises(gen.GenerateError, match="contains a quote"):
+            _render_mini(desc=desc)
+
     def test_invalid_not_relevant_regex_is_an_error(self):
         frag = _fragment("initiative")
         frag["architecture_context"]["not_relevant_pattern"] = "("
@@ -432,6 +478,13 @@ class TestDispositions:
             check = self.judges[t]["frontmatter_valid"]["check"]
             assert "if fm.get('pass') != expected_pass:\n            errors.append(" in check
             assert "fm.get('needs_attention') and fm.get('pass')" not in check
+
+    def test_missing_pass_field_is_an_error_not_a_crash(self):
+        # CodeRabbit on #189: fm['pass'] raised KeyError once the missing-field error was
+        # already recorded; fm.get('pass') lets the check return its findings.
+        for t in TYPES:
+            check = self.judges[t]["frontmatter_valid"]["check"]
+            assert "pass={fm.get('pass')} inconsistent" in check and "fm['pass']" not in check
 
     def test_rm_artifacts_check_and_phase_markers_shared(self):
         for t in TYPES:
