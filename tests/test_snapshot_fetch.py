@@ -1214,6 +1214,10 @@ class TestJqlBindingCheck:
             'summary ~ "not (a" AND project = RHOAIENG',
             "summary ~ 'NOT (x' AND project = RHOAIENG",
             'text ~ "foo not (bar) baz" AND issuetype = Epic',
+            # escaped quotes inside the literal must not close it early (Jira text search
+            # supports them): the conflicting clause after the literal must still be read
+            'summary ~ "\\"not (a\\"" AND project = RHOAIENG',
+            'NOT (summary ~ "a\\") b") AND issuetype = Epic',
         ],
     )
     def test_a_quoted_not_paren_is_text_not_a_negated_group(self, jql):
