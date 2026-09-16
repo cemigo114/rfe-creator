@@ -488,8 +488,15 @@ class TestSystemicClassification:
             server.shutdown()
 
         assert r.returncode == 5, r.stderr + r.stdout
-        assert "systemic Jira failure" in r.stderr
-        # Conflict check (1) + discovery (1): far below a per-child fan-out.
+        # The parent verification is the first request; its 401 is classified systemic and
+        # stops the run there (fail closed), so discovery is never reached. jira_utils prints
+        # its own ``HTTP 401`` diagnostic line first.
+        assert (
+            "Error: parent verification failed for RHAIRFE-1000: HTTPError: "
+            "HTTP Error 401: Unauthorized\n"
+        ) in r.stderr
+        assert "Checking submission state" not in r.stdout
+        # The parent verification alone: far below a per-child fan-out.
         assert counter["n"] <= 4, f"{counter['n']} requests"
 
 
@@ -787,9 +794,14 @@ class TestParentBindingIsVerifiedBeforeAnyWrite:
         for cid in ("RFE-001", "RFE-002"):
             _write(f"{art_dir}/rfe-tasks/{cid}.md", CHILD_TASK.format(child_id=cid, title=cid))
 
-    def _assert_untouched(self, jira, art_dir, r):
+    UNVERIFIED = (
+        "Error: parent verification failed for RHAIRFE-1000: UnicodeDecodeError: 'utf-8' codec "
+        "can't decode byte 0xff in position 0: invalid start byte\n"
+    )
+
+    def _assert_untouched(self, jira, art_dir, r, refusal=None):
         assert r.returncode == split_submit.EXIT_PER_PARENT
-        assert r.stderr == self.REFUSAL
+        assert r.stderr == (refusal or self.REFUSAL)
         assert "Checking submission state" not in r.stdout and "Phase 1:" not in r.stdout
         assert get_comments(jira.url, "admin", "admin", PARENT_KEY) == []
         fields = ["labels", "status", "issuelinks"]
@@ -809,6 +821,18 @@ class TestParentBindingIsVerifiedBeforeAnyWrite:
         # on their own and the refusal is the same.
         self._epic_parent(jira, art_dir, original=False)
         self._assert_untouched(jira, art_dir, _run_split(art_dir, jira.url))
+
+    def test_an_unreadable_original_fails_closed_and_untouched(self, art_dir, jira):
+        # A Feature Request parent — nothing wrong with it in Jira — whose original is not valid
+        # UTF-8: the conflict check raises before its fetch, and the split stops there with the
+        # per-parent code instead of proceeding against an unverified parent. No comment, label
+        # or link on the parent, no child created.
+        _setup_parent(jira, art_dir)
+        with open(f"{art_dir}/rfe-originals/{PARENT_KEY}.md", "wb") as f:
+            f.write(b"\xff\xfe not utf-8")
+        r = _run_split(art_dir, jira.url)
+        self._assert_untouched(jira, art_dir, r, self.UNVERIFIED)
+        assert _search_keys(jira.url, "project = RHAIRFE") == [PARENT_KEY]
 
     def test_a_feature_request_parent_without_an_original_is_split(self, art_dir, jira):
         _setup_parent(jira, art_dir)

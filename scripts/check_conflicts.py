@@ -20,9 +20,11 @@ Usage:
 Exit codes:
     0  No conflicts — safe to submit
     1  Conflicts detected — submission should be blocked
-    2  Error (missing env vars, API failure, a type whose tracker binding is
-       malformed, not its own or sourced from the JIRA_PROJECT / JIRA_ISSUE_TYPE
-       shorthand, a task whose tracker_ref another type owns)
+    2  Error (missing env vars, API failure — a fetch that fails for any item
+       stops the run there, with no CONFLICT_COUNT for the partial result — a
+       type whose tracker binding is malformed, not its own or sourced from the
+       JIRA_PROJECT / JIRA_ISSUE_TYPE shorthand, a task whose tracker_ref
+       another type owns)
 
 Output:
     CONFLICT_COUNT=N
@@ -206,8 +208,11 @@ def main():
                 server, user, token, issue_key, original_path, extra_fields=["project", "issuetype"]
             )
         except Exception as e:
-            print(f"Warning: could not fetch {item_id}: {e}", file=sys.stderr)
-            continue
+            # Fail closed: an item whose fetch failed is unverified, and a CONFLICT_COUNT over
+            # the rest would read as a clean verdict to the caller. The documented API-failure
+            # exit, no count for a partial result, nothing else fetched.
+            print(f"Error: could not fetch {item_id}: {e}", file=sys.stderr)
+            sys.exit(2)
         # The binding verdict first: an issue that is not this type's is not this run's to
         # update whatever its description says.
         mismatch = _binding_mismatch(fields, type_name, binding, issue_key)

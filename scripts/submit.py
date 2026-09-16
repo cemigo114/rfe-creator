@@ -1157,20 +1157,13 @@ def main():
                     jira_status = issue_fields.get("status", {}).get("name")
                 if issue_fields is None:
                     # No original to compare with: the conflict check made no request, so the
-                    # two witnesses are fetched on their own. A transport failure here is not a
-                    # verdict — the update below reports it once, as it always did — so it
-                    # leaves issue_fields None and the binding check is skipped silently.
-                    try:
-                        issue_fields = _fetch_witnesses()
-                    except Exception:
-                        issue_fields = None
-                if issue_fields is not None:
-                    mismatch = _binding_skip_reason(
-                        item_id, issue_fields, type_name, binding, jira_key
-                    )
-                    if mismatch:
-                        plan.append(_binding_skip(mismatch, jira_status))
-                        continue
+                    # two witnesses are fetched on their own (a failure propagates to the
+                    # handler below: an issue that cannot be verified is not written).
+                    issue_fields = _fetch_witnesses()
+                mismatch = _binding_skip_reason(item_id, issue_fields, type_name, binding, jira_key)
+                if mismatch:
+                    plan.append(_binding_skip(mismatch, jira_status))
+                    continue
                 if has_conflict:
                     plan.append(
                         {
@@ -1193,7 +1186,17 @@ def main():
                     )
                     continue
             except Exception as e:
-                print(f"Warning: conflict check failed for {item_id}: {e}", file=sys.stderr)
+                # Fail closed, like split_submit's parent check: an existing issue whose binding
+                # could not be verified (a dead instance, a 404, an unreadable original) is not
+                # written; it is skipped, left unprocessed, and the next run retries it.
+                plan.append(
+                    _binding_skip(
+                        f"could not verify {jira_key} against the {type_name} binding — "
+                        f"{type(e).__name__}: {e}",
+                        jira_status,
+                    )
+                )
+                continue
 
         # For existing items, check if content has changed
         if is_existing:

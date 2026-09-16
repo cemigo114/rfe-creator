@@ -309,10 +309,13 @@ class TestMain:
 
     @pytest.mark.parametrize("type_name", ["rfe", "initiative"])
     def test_conflicts_are_reported_per_item(self, jira, monkeypatch, capsys, tmp_path, type_name):
+        # Every fetch succeeds: one line per conflicting id, in scan order, with both conflict
+        # reasons — a modified description and a binding mismatch — and an archived item is
+        # never fetched.
         _, _, _, _, jira_id = LAYOUT[type_name]
         prefix = jira_id.rsplit("-", 1)[0] + "-"
-        same, changed, archived, gone = (f"{prefix}{n}" for n in (9001, 9002, 9003, 9005))
-        for item in (same, changed, gone):
+        same, changed, archived, foreign = (f"{prefix}{n}" for n in (9001, 9002, 9003, 9005))
+        for item in (same, changed, foreign):
             _task(tmp_path, type_name, item)
             _original(tmp_path, type_name, item)
         _task(tmp_path, type_name, archived, status="Archived")
@@ -323,7 +326,7 @@ class TestMain:
         outcomes = {
             same: (False, _fields(project, issue_type)),
             changed: (True, _fields(project, issue_type)),
-            gone: RuntimeError("HTTP Error 404: Not Found"),
+            foreign: (False, _fields(project, "Epic")),
         }
         monkeypatch.setattr(
             check_conflicts, "check_description_conflict", _fake_check(outcomes, seen)
@@ -332,20 +335,52 @@ class TestMain:
         out = capsys.readouterr()
         assert code == 1
         assert out.out == (
-            f"CONFLICT_COUNT=1\nCONFLICT: {changed} — modified in Jira since last fetch\n"
+            "CONFLICT_COUNT=2\n"
+            f"CONFLICT: {changed} — modified in Jira since last fetch\n"
+            f"CONFLICT: {foreign} — is ({project}, Epic) in Jira but the resolved type "
+            f"{type_name} binds ({project}, {issue_type})\n"
         )
-        assert out.err == (
-            f"TYPE RESOLVED: {type_name} (--type)\n"
-            f"Warning: could not fetch {gone}: HTTP Error 404: Not Found\n"
-        )
+        assert out.err == f"TYPE RESOLVED: {type_name} (--type)\n"
         originals_dir = LAYOUT[type_name][1]
         # The one fetch requests the project and issuetype witnesses (D9) for the verdict.
         witnesses = ["project", "issuetype"]
         assert seen == [
             (same, originals_dir, witnesses),
             (changed, originals_dir, witnesses),
-            (gone, originals_dir, witnesses),
+            (foreign, originals_dir, witnesses),
         ]
+
+    @pytest.mark.parametrize("type_name", ["rfe", "initiative"])
+    def test_a_fetch_failure_fails_closed(self, jira, monkeypatch, capsys, tmp_path, type_name):
+        # A fetch that fails leaves its item unverified: the run stops there with the documented
+        # API-failure exit — no CONFLICT_COUNT over the partial result (a caller reading 0 would
+        # submit), no OK line — and the items after it are never fetched.
+        _, _, _, _, jira_id = LAYOUT[type_name]
+        prefix = jira_id.rsplit("-", 1)[0] + "-"
+        same, gone, changed = (f"{prefix}{n}" for n in (9001, 9002, 9003))
+        for item in (same, gone, changed):
+            _task(tmp_path, type_name, item)
+            _original(tmp_path, type_name, item)
+
+        seen = []
+        project, issue_type = _pair(type_name)
+        outcomes = {
+            same: (False, _fields(project, issue_type)),
+            gone: RuntimeError("HTTP Error 404: Not Found"),
+            changed: (True, _fields(project, issue_type)),
+        }
+        monkeypatch.setattr(
+            check_conflicts, "check_description_conflict", _fake_check(outcomes, seen)
+        )
+        code = self._main(monkeypatch, "--type", type_name, "--artifacts-dir", str(tmp_path))
+        out = capsys.readouterr()
+        assert code == 2
+        assert out.out == ""
+        assert out.err == (
+            f"TYPE RESOLVED: {type_name} (--type)\n"
+            f"Error: could not fetch {gone}: HTTP Error 404: Not Found\n"
+        )
+        assert [key for key, _, _ in seen] == [same, gone]
 
     def test_no_conflicts_exits_zero(self, jira, monkeypatch, capsys, tmp_path):
         _task(tmp_path, "rfe", "RHAIRFE-1")

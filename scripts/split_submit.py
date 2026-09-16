@@ -1113,7 +1113,6 @@ def main():
     if not args.dry_run:
         originals_dir = config["originals_dir"]
         original_path = os.path.join(args.artifacts_dir, originals_dir, f"{args.parent_key}.md")
-        has_conflict, parent_fields = False, None
         try:
             has_conflict, parent_fields = check_description_conflict(
                 server,
@@ -1129,16 +1128,23 @@ def main():
                 )
                 parent_fields = issue.get("fields") or {}
         except Exception as e:
-            print(f"Warning: conflict check failed for {args.parent_key}: {e}", file=sys.stderr)
+            # Fail closed: a parent that could not be verified — an unreadable or non-UTF-8
+            # original, a failed fetch — is never written against. Classified like every
+            # other escaped failure: per parent for a local problem or a 4xx on this key,
+            # systemic for dead auth or an unreachable instance.
+            print(
+                f"Error: parent verification failed for {args.parent_key}: {type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+            sys.exit(_classify_exit(e))
         # The binding verdict first: a parent that is not this type's is not this run's to
         # touch whatever its description says — refused per parent, before any write.
-        if parent_fields is not None:
-            refusal = _parent_binding_refusal(
-                args.parent_key, parent_fields, resolution.desc, resolution.binding
-            )
-            if refusal:
-                print(f"Error: {refusal}", file=sys.stderr)
-                sys.exit(EXIT_PER_PARENT)
+        refusal = _parent_binding_refusal(
+            args.parent_key, parent_fields, resolution.desc, resolution.binding
+        )
+        if refusal:
+            print(f"Error: {refusal}", file=sys.stderr)
+            sys.exit(EXIT_PER_PARENT)
         if has_conflict:
             print(
                 f"Error: {args.parent_key} description was modified "

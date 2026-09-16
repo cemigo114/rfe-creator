@@ -1003,3 +1003,118 @@ class TestParentBindingRefusal:
             "(KONFLUX, Feature Request) or, for a pre-override key, (RHAIRFE, Feature Request); "
             "refusing to split — nothing written"
         )
+
+
+class TestParentVerificationFailsClosed:
+    """The pre-split verification of the parent (PR-3c) fails CLOSED: when the conflict check
+    or the witness fetch raises — an original that is not valid UTF-8, a local error, a Jira
+    error — main() prints one ``Error:`` line, exits with ``_classify_exit``'s verdict (per
+    parent for a local problem or a 4xx on this key, systemic for auth / 5xx / network) and
+    never reaches discovery or a write. ``--dry-run`` never verifies the parent at all."""
+
+    # Everything main() could call past the verification: discovery and every write helper.
+    JIRA_CALLS = (
+        "discover_state",
+        "get_issue",
+        "get_comments",
+        "search_issues",
+        "add_comment",
+        "add_labels",
+        "create_issue",
+        "create_issue_link",
+        "do_transition",
+    )
+
+    def _tree(self, art_dir):
+        _write(f"{art_dir}/rfe-tasks/RHAIRFE-1000.md", PARENT_TASK)
+        _write(f"{art_dir}/rfe-originals/RHAIRFE-1000.md", "Original parent content.\n")
+        for i in (1, 2):
+            _write(f"{art_dir}/rfe-tasks/RFE-{i:03d}.md", CHILD_TASK.format(num=i))
+
+    def _arm(self, monkeypatch, credentials=True):
+        for var in list(os.environ):
+            if var.startswith(type_registry.BINDING_ENV_PREFIX):
+                monkeypatch.delenv(var)
+        for var in ("JIRA_PROJECT", "JIRA_ISSUE_TYPE"):
+            monkeypatch.delenv(var, raising=False)
+        for var, value in (("JIRA_SERVER", "https://jira.example.com"), ("JIRA_USER", "u")):
+            monkeypatch.setenv(var, value if credentials else "")
+        monkeypatch.setenv("JIRA_TOKEN", "t" if credentials else "")
+        for name in self.JIRA_CALLS:
+            monkeypatch.setattr(
+                split_submit, name, lambda *a, _n=name, **k: pytest.fail(f"{_n} was called")
+            )
+
+    def _run(self, monkeypatch, art_dir, *extra):
+        monkeypatch.setattr(
+            sys, "argv", ["split_submit.py", "RHAIRFE-1000", "--artifacts-dir", art_dir, *extra]
+        )
+        try:
+            split_submit.main()
+        except SystemExit as exc:
+            return exc.code
+        return 0  # main() returns normally on success
+
+    @pytest.mark.parametrize(
+        ("exc", "expected"),
+        [
+            (UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), EXIT_PER_PARENT),
+            (RuntimeError("boom"), EXIT_PER_PARENT),
+            (_http_error(404), EXIT_PER_PARENT),
+            (_http_error(401), EXIT_SYSTEMIC),
+            (urllib.error.URLError("no route"), EXIT_SYSTEMIC),
+        ],
+        ids=["utf8", "generic", "http-404", "http-401", "urlerror"],
+    )
+    def test_a_failed_verification_exits_classified_before_any_write(
+        self, art_dir, monkeypatch, capsys, exc, expected
+    ):
+        self._tree(art_dir)
+        self._arm(monkeypatch)
+
+        def raising(*a, **k):
+            raise exc
+
+        monkeypatch.setattr(split_submit, "check_description_conflict", raising)
+        code = self._run(monkeypatch, art_dir)
+        out = capsys.readouterr()
+        assert code == expected == _classify_exit(exc)
+        assert out.err == (
+            f"Error: parent verification failed for RHAIRFE-1000: {type(exc).__name__}: {exc}\n"
+        )
+        assert "Checking submission state" not in out.out and "Phase 1:" not in out.out
+
+    def test_the_witness_fetch_fallback_fails_closed_too(self, art_dir, monkeypatch, capsys):
+        # No original: the conflict check makes no request and the witnesses are fetched on
+        # their own — a failure there is the same refusal, classified the same way.
+        self._tree(art_dir)
+        os.remove(f"{art_dir}/rfe-originals/RHAIRFE-1000.md")
+        self._arm(monkeypatch)
+
+        def denied(*a, **k):
+            raise _http_error(403)
+
+        monkeypatch.setattr(split_submit, "get_issue", denied)
+        code = self._run(monkeypatch, art_dir)
+        out = capsys.readouterr()
+        assert code == EXIT_SYSTEMIC
+        assert out.err == (
+            "Error: parent verification failed for RHAIRFE-1000: HTTPError: HTTP Error 403: err\n"
+        )
+        assert "Checking submission state" not in out.out
+
+    def test_dry_run_never_verifies_the_parent(self, art_dir, monkeypatch, capsys):
+        # The verification block is non-dry-run only: a plan is printed without a fetch, so an
+        # unreadable original cannot turn a dry run into a refusal.
+        self._tree(art_dir)
+        self._arm(monkeypatch, credentials=False)
+        monkeypatch.setattr(
+            split_submit,
+            "check_description_conflict",
+            lambda *a, **k: pytest.fail("the parent was verified under --dry-run"),
+        )
+        code = self._run(monkeypatch, art_dir, "--dry-run")
+        out = capsys.readouterr()
+        assert code == 0
+        assert out.err == ""
+        assert "Would create RHAIRFE ticket for child 1/2: Child RFE 1" in out.out

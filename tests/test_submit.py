@@ -1904,6 +1904,8 @@ class TestPreUpdateVerification:
             calls.append(("conflict", key, list(extra_fields or [])))
             if conflict is None:
                 raise AssertionError("check_description_conflict must not be reached")
+            if isinstance(conflict, Exception):
+                raise conflict
             return conflict
 
         def fake_get_issue(server, user, token, key, fields=None):
@@ -2073,21 +2075,37 @@ class TestPreUpdateVerification:
         assert rc == 0 and writes == []
         assert not [c for c in calls if c[0] in ("get_issue", "conflict")]
 
-    def test_a_failed_witness_fetch_is_silent_and_the_update_proceeds(
+    def test_a_failed_witness_fetch_skips_the_item_and_writes_nothing(
         self, monkeypatch, art_dir, capsys
     ):
-        # No original: the witness fetch is the only read. A transport failure there is not a
-        # verdict — the binding check is skipped without a line and the update goes ahead, so
-        # a dead instance costs the one terminal ERROR the update raises, not a warning first.
+        # No original: the witness fetch is the only read. A transport failure there means the
+        # binding cannot be verified, so — like split_submit's parent check — the item is
+        # skipped, left unprocessed for the next run, and nothing is written.
         self._existing(art_dir, original=False)
         rc, writes, _ = self._run_main(
             monkeypatch, art_dir, conflict=(False, None), issue=RuntimeError("HTTP 503")
         )
         out = capsys.readouterr()
         assert rc == 0
-        assert "HTTP 503" not in out.err and "Warning: conflict check failed" not in out.err
-        assert "binding" not in out.err and "binding" not in out.out
-        assert [name for name, _ in writes] == ["update_issue", "swap_labels"]
+        assert writes == []
+        assert "could not verify RHAIRFE-1234 against the rfe binding" in out.out
+        assert "RuntimeError: HTTP 503" in out.out
+        assert "Warning: conflict check failed" not in out.err
+
+    def test_a_failed_conflict_check_skips_the_item_and_writes_nothing(
+        self, monkeypatch, art_dir, capsys
+    ):
+        # With an original present the conflict check IS the witness fetch; if it raises, the
+        # same fail-closed skip applies (main used to warn and update anyway).
+        self._existing(art_dir, original=True)
+        rc, writes, _ = self._run_main(
+            monkeypatch, art_dir, conflict=RuntimeError("HTTP Error 404: Not Found")
+        )
+        out = capsys.readouterr()
+        assert rc == 0
+        assert writes == []
+        assert "could not verify RHAIRFE-1234 against the rfe binding" in out.out
+        assert "Warning: conflict check failed" not in out.err
 
     def test_the_remote_key_is_the_tracker_ref(self, monkeypatch, art_dir, capsys):
         # rfe_id RHAIRFE-1 with tracker_ref RHAIRFE-2: ONE remote key — the fetch, the update

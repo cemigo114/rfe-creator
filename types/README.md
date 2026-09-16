@@ -100,7 +100,7 @@ itself is fine — `resolve()` follows the link).
 | `split_collect.py` | `_TYPE_CONFIG`, `_set_revise` defaults, `--type` choices | PR-2a |
 | `split_submit.py` | `SPLIT_CONFIG` (descriptor projection over `names()`: `identity.jira.{project,issue_type}`, `conventions.{comment_prefix,label_prefix}`, `display.{entity,entity_plural}`, `id_field`, `dirs`, `index.enabled`, alignment labels; `scan_fn` / `rename_fn` / `parse_child_fn` bound to the `artifact_utils` generics, `find_review_fn` = `find_review_file`), the split link type and the close-superseded transition / resolution from `identity.jira.{split_link_type,state_map.close_superseded}`, `--type` choices; `main()` re-projects `SPLIT_CONFIG` for the resolved type over its effective binding (`project`, `issue_type`, the `<PROJECT>-DRY` sentinel) after `resolve` + `assert_registered_binding`, and `_TRACKER` is keyed by type name | PR-2d; PR-3c (3/3) ("Effective binding in the writers" below; D12); the feasibility set, the split-child marker and every phase label are still composed from `conventions.label_prefix`; the durable-store comment grammar and the `<PROJECT>-DRY` sentinel are composition, pinned by source form |
 | `submit.py` | `TYPE_CONFIGS` (descriptor projection over `names()`), `--type` choices, task scan / rename via `artifact_utils.scan_tasks` / `rename_to_tracker_key(desc)`, approve target from `identity.jira.state_map.approved`; `main()` resolves the type (`resolve`; the D3 line on stderr only for an explicit `--type`), proves the binding (`assert_registered_binding`, then `assert_not_shorthand`: a shorthand-sourced binding is refused) and overlays its `project`, `issue_type` and write prefix on the resolved entry — `is_existing` is the task's `tracker_ref` owned by that binding, else key-prefix-union membership, and that `tracker_ref` (else the id) is the one remote key every Jira call names; an update first verifies the issue's `(project, issuetype)` (the descriptor pair is accepted for a key carrying a descriptor prefix); the dry-run key is `<PROJECT>-DRY` | PR-2d; PR-3c (3/3) ("Effective binding in the writers" below); grandfathered: the rfe `snapshot_prefix` `''` sentinel and the `split_type_arg` / report `--type` argv convention (no `--type` for rfe); the `auto-created` / `auto-revised` / `needs-attention` / `split-quarantine` labels are still composed from `conventions.label_prefix` |
-| `validate_batch_input.py` | `ALLOWED_PRIORITIES` / `KNOWN_FIELDS` / `PARENT_KEY_PATTERN` per type (`schema.task.priority.enum`, base ∪ `batch.extra_fields`, `Descriptor.parent_key_pattern` — the task schema's join, Q14 reconciled), `--type` choices; the batch root through `type_registry.read_batch`, the type through `resolve` | PR-2a; PR-3b (batch forms, per-type rules) |
+| `validate_batch_input.py` | `ALLOWED_PRIORITIES` / `KNOWN_FIELDS` / `PARENT_KEY_PATTERN` per type (`schema.task.priority.enum`, base ∪ `batch.extra_fields`, `Descriptor.parent_key_pattern_effective` — the task schema's join, `Descriptor.parent_key_pattern` under a malformed override, Q14 reconciled), `--type` choices; the batch root through `type_registry.read_batch`, the type through `resolve` | PR-2a; PR-3b (batch forms, per-type rules) |
 | `verify_phase.py` | phase tables, `_TYPE_CONFIG`, error-stub score tail, `--type` choices; the error stub carries `type=<t>` and review files are stamped `type:` after the review barrier (D8) as one appended line (`artifact_utils.append_frontmatter_field`, never a `frontmatter.py set` re-dump) | PR-2a; PR-3c (1/3) |
 | `check_autofix_complete.py` | `--type` validated through `type_registry.parse_type_arg` (unknown → exit 2 with the registered list); `_TYPE_CONFIG` literal, pinned | PR-3a (validation); table pending |
 | `check_content_preservation.py` | inline dir branch | pending |
@@ -389,10 +389,15 @@ The rules are `resolve`'s, so the two scripts cannot drift from the ladder:
   main's stdout and adds exactly one stderr line: both speedrun bodies pass theirs (`--type rfe` /
   `--type initiative`), which is what rejects a mapping `type:` of the other type (D1) before any
   id is allocated or any agent runs.
-- **Parent keys per type.** The batch rule for `parent_key` is `Descriptor.parent_key_pattern`
-  (`'^(' + '|'.join(conventions.parent_key_patterns) + ')$'`), the same string `artifact_utils`
-  puts on the `<type>-task` schema (PR-1 checklist Q14 reconciled by construction), applied only
-  when the type lists `parent_key` in `batch.extra_fields`: an initiative batch accepts
+- **Parent keys per type.** The batch rule for `parent_key` is
+  `Descriptor.parent_key_pattern_effective`: the descriptor join
+  (`'^(' + '|'.join(conventions.parent_key_patterns) + ')$'`, `Descriptor.parent_key_pattern`)
+  with the effective write prefix's `<PROJECT>-\d+` joined first when a project override is set
+  — under `RFE_CREATOR_BINDING_INITIATIVE_PROJECT=KONFLUX` an initiative batch also accepts a
+  `KONFLUX-1` parent — and `Descriptor.parent_key_pattern` itself when the override is malformed
+  (the validator takes the type verdict only). It is the same string `artifact_utils` puts on
+  the `<type>-task` schema (PR-1 checklist Q14 reconciled by construction), applied only when
+  the type lists `parent_key` in `batch.extra_fields`: an initiative batch accepts
   `RHAISTRAT-`, `RHOAIENG-` and — new in PR-3b — `INIT-` parents, and the error text is rendered
   from the patterns (`'parent_key' must match one of RHAISTRAT-\d+, RHOAIENG-\d+, INIT-\d+`); an
   rfe entry carrying `parent_key` gets the unknown-field warning, never a pattern error (before

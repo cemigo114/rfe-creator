@@ -168,12 +168,13 @@ overridable, and every other type keeps its own binding.
   with `type: rfe` and `tracker_ref: KONFLUX-N`, plus the original and the comments companion),
   `snapshot_fetch.py` / `bootstrap_snapshot.py` accept a `project = KONFLUX` JQL and refuse one
   naming `RHAIRFE`.
-- **Writes** (`submit.py`, `split_submit.py`, `check_conflicts.py`) create under `KONFLUX` with
-  the effective issue type, treat a task as an existing issue when its `tracker_ref` starts with
-  `KONFLUX-` — or `RHAIRFE-`, the descriptor prefix kept as a read prefix: an item submitted
-  before the override is still updated in place, its `(RHAIRFE, Feature Request)` pair being
-  accepted by the pre-update check for a key that carries the descriptor prefix
-  (`Descriptor.accepted_pairs`), while a `KONFLUX-N` whose issue type is not the binding's is
+- **Writes** (`submit.py`, `split_submit.py`) create under `KONFLUX` with the effective issue
+  type, treat a task as an existing issue when its `tracker_ref` starts with `KONFLUX-` — or
+  `RHAIRFE-`, the descriptor prefix kept as a read prefix: an item submitted before the override
+  is still updated in place, its `(RHAIRFE, Feature Request)` pair being accepted by the
+  pre-update check for a key that carries the descriptor prefix (`Descriptor.accepted_pairs`;
+  `check_conflicts.py`, which only reads and reports, applies the same ownership rule and the
+  same check ahead of a submit), while a `KONFLUX-N` whose issue type is not the binding's is
   skipped — split a parent only after the same check on it, rename a submitted draft to
   `KONFLUX-N`, use `KONFLUX-DRY` as the dry-run key and record the effective binding in the run
   report (`binding: {tracker: jira, project: KONFLUX, issue_type: Feature Request, source: env}`).
