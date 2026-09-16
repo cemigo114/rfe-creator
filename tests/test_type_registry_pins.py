@@ -2256,6 +2256,23 @@ class TestSkillLayer:
             f"{ctx.pp}feasibility"
         ]("X")
 
+    def test_speedrun_forwards_clarifying_context_to_create(self, ctx):
+        """The batch entry's clarifying_context reaches the create agent only if the launch
+        line says so: the 2026-09-15 eval run on #187 saw an orchestrator drop it for 26 of 27
+        entries (the weak drafts lost their honest 'no evidence' anchors, no item was revised,
+        revision_coverage 0.0) with a body that named only <prompt>. Both twins must spell it
+        out verbatim in every launch line and forbid paraphrase."""
+        text = skill(ctx.t, "speedrun")
+        block = text.split("For each entry, launch an Agent")[1].split("```")[1]
+        launch_lines = [ln for ln in block.splitlines() if "<prompt>" in ln]
+        assert len(launch_lines) == 3, launch_lines
+        for ln in launch_lines:
+            assert ln.rstrip().endswith(
+                "Clarifying context: <clarifying_context>" + ('")' if ctx.t == "rfe" else "")
+            ), ln
+        assert "verbatim" in text.split("For each entry, launch an Agent")[1].split("```")[0]
+        assert "Never summarize or paraphrase it." in text
+
     def test_speedrun_batch_format_and_barrier(self, ctx):
         # rows: 232 — rfe.speedrun/SKILL.md:48-106; initiative-speedrun/SKILL.md:49-91; PR-3b:
         # the example stays the legacy bare list (the eval harness feeds that form) and the

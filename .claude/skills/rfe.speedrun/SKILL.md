@@ -87,14 +87,16 @@ Persist the pre-allocated IDs before launching any agents — the Phase 1 barrie
 python3 scripts/state.py write-ids tmp/speedrun-all-ids.txt <all_IDs>
 ```
 
-For each entry, launch an Agent to invoke `/rfe.create`. Pass the pre-assigned ID so each Agent knows which ID to use:
+For each entry, launch an Agent to invoke `/rfe.create`. Pass the pre-assigned ID so each Agent knows which ID to use, and pass the entry's `clarifying_context` verbatim after the prompt whenever the entry has one — it carries the requester's own context (customer evidence, or the honest statement that there is none) and the create agent has no other way to see it:
 
 ```
-Agent(prompt: "/rfe.create --headless --rfe-id RFE-001 [--priority <priority>] <prompt>")
-Agent(prompt: "/rfe.create --headless --rfe-id RFE-002 [--priority <priority>] <prompt>")
+Agent(prompt: "/rfe.create --headless --rfe-id RFE-001 [--priority <priority>] <prompt>\n\nClarifying context: <clarifying_context>")
+Agent(prompt: "/rfe.create --headless --rfe-id RFE-002 [--priority <priority>] <prompt>\n\nClarifying context: <clarifying_context>")
 ...
-Agent(prompt: "/rfe.create --headless --rfe-id RFE-<N> [--priority <priority>] <prompt>")
+Agent(prompt: "/rfe.create --headless --rfe-id RFE-<N> [--priority <priority>] <prompt>\n\nClarifying context: <clarifying_context>")
 ```
+
+Omit the `Clarifying context:` part only for an entry that has no `clarifying_context`. Never summarize or paraphrase it.
 
 Each entry is a single business need — `/rfe.create` must produce exactly one RFE per invocation. Launch all N Agents in a single message so they run concurrently. Your next Bash call after that message MUST be the Phase 1 barrier — a blocking check that reads the task files on disk:
 

@@ -81,14 +81,16 @@ Count entries and pre-allocate all IDs upfront:
 python3 scripts/next_rfe_id.py --prefix INIT --dir artifacts/initiatives --from-batch <input_file>
 ```
 
-For each entry, launch an Agent to invoke `/initiative-create`. Pass the pre-assigned ID so each Agent knows which ID to use:
+For each entry, launch an Agent to invoke `/initiative-create`. Pass the pre-assigned ID so each Agent knows which ID to use, and pass the entry's `clarifying_context` verbatim after the prompt whenever the entry has one — it carries the requester's own context (evidence, or the honest statement that there is none) and the create agent has no other way to see it:
 
 ```
-Agent for entry 1:  /initiative-create --headless --initiative-id INIT-001 [--priority <priority>] [--parent <parent_key>] <prompt>
-Agent for entry 2:  /initiative-create --headless --initiative-id INIT-002 [--priority <priority>] [--parent <parent_key>] <prompt>
+Agent for entry 1:  /initiative-create --headless --initiative-id INIT-001 [--priority <priority>] [--parent <parent_key>] <prompt>\n\nClarifying context: <clarifying_context>
+Agent for entry 2:  /initiative-create --headless --initiative-id INIT-002 [--priority <priority>] [--parent <parent_key>] <prompt>\n\nClarifying context: <clarifying_context>
 ...
-Agent for entry N:  /initiative-create --headless --initiative-id INIT-<N> [--priority <priority>] [--parent <parent_key>] <prompt>
+Agent for entry N:  /initiative-create --headless --initiative-id INIT-<N> [--priority <priority>] [--parent <parent_key>] <prompt>\n\nClarifying context: <clarifying_context>
 ```
+
+Omit the `Clarifying context:` part only for an entry that has no `clarifying_context`. Never summarize or paraphrase it.
 
 Each entry is a single objective — `/initiative-create` must produce exactly one Initiative per invocation. Wait for all N agents to complete. You must have exactly N Initiative IDs — if fewer were created, retry the missing entries. **Never delete or re-create task files during Phase 1** — quality issues are addressed in Phase 2 (Auto-fix).
 
