@@ -131,7 +131,7 @@ Automated evaluation of the `initiative-speedrun` pipeline using the [agent-eval
 
 ## How it works
 
-The evaluation runs the `initiative-speedrun` skill headlessly against 16 test cases derived from real RHOAIENG Jira initiatives. Each test case provides an objective (prompt + clarifying context), and the pipeline creates, reviews (with assessment, feasibility, and strategic alignment), auto-fixes, and (dry-run) submits Initiatives.
+The evaluation runs the `initiative-speedrun` skill headlessly against 20 test cases: 16 derived from real RHOAIENG Jira initiatives and four deliberately weak drafts. Each test case provides an objective (prompt + clarifying context), and the pipeline creates, reviews (with assessment, feasibility, and strategic alignment), auto-fixes, and (dry-run) submits Initiatives.
 
 ### Configuration
 
@@ -143,7 +143,7 @@ The evaluation runs the `initiative-speedrun` skill headlessly against 16 test c
 
 ### Dataset
 
-`eval/initiative-dataset/cases/` contains 16 test cases, each with:
+`eval/initiative-dataset/cases/` contains 20 test cases, each with:
 
 | File | Purpose |
 |------|---------|
@@ -151,6 +151,12 @@ The evaluation runs the `initiative-speedrun` skill headlessly against 16 test c
 | `annotations.yaml` | Expected scores, feasibility/recommendation/alignment expectations, test tags |
 
 One case (`case-012`, tagged `sparse-input`) provides minimal context to test sparse-input handling.
+
+#### Weak-draft cases
+
+Cases `case-017` through `case-020` are deliberately weak drafts (`difficulty: hard`) that the pipeline is expected to auto-revise, the initiative counterpart of the RFE cases `case-021` to `case-025` above. Their `annotations.yaml` carries `tags: [weak-draft, revision-expected, <mode>...]`, where `<mode>` names the flaw: `why-missing` (the requester insists the only problem statement is "the platform does not have it" — the rubric's circular-justification 0), `prescriptive-how` (technology choices dictated as closed decisions, with an instruction not to soften them — the rubric's mandate 0) and `scope-missing` (no boundaries at all). Each flaw targets a criterion the rubric scores 0, protected by an in-character "do not add / do not soften" anchor, because the first calibration run (2026-09-17) showed that anything softer is repaired at create time: an honest "we have no data but suspect" earned WHY 1, an enumerated list of open scope questions earned Scope 1, and the drafts passed at 9; only the case with neither evidence nor boundaries failed first review. Target at most two zeros per case: the review contract routes three or more zeros to `reject`, which never enters the revise path (case-019 frames the work as implementation steps to keep WHAT thin, but its targeted zero is Open to HOW alone). The second calibration run confirmed all four: first reviews of 8, 8, 7 and 6 on the targeted criterion, all four revised, coverage 1.0. `expected_pass: false` and `expected_recommendation: revise` describe the first review. The revise agent then either adds evidence or, when there is none to add, flags the section with `[NEEDS: ...]` and sets `needs_attention`; the judge looks at neither marker, only at the revision itself — the same eight evidence signals as for RFEs (`auto_revised: true`, a moved score, a body that differs from the original, a companion artifact, a run-report revision, a non-empty Revision History). A flagged section is a body change, so an honest "no evidence" revision still counts.
+
+Without these cases the initiative gate rested on the run-level rule alone, and passed only because `case-012` happened to be revised while the pipeline dropped the requester context; once #188 forwarded that context, a full run revised nothing and `revision_coverage` scored 0.0.
 
 ### Judges
 
@@ -161,7 +167,7 @@ One case (`case-012`, tagged `sparse-input`) provides minimal context to test sp
 | `run_report_exists` | check | Initiative run report YAML with required fields |
 | `recommendation_consistency` | check | pass/fail aligns with recommendation, infeasible != submit, weak alignment sets needs_attention |
 | `revision_flag_consistency` | check | `auto_revised` agrees with revision evidence (state file, history, moved score, removed-context) |
-| `revision_coverage` | check | Revise path exercised (16 cases, no tagged weak drafts yet, so 0.92 allows one failing case): untagged-but-revised cases count; every case fails when a multi-item run revised nothing (single-item runs: tag alone decides) |
+| `revision_coverage` | check | Revise path exercised (20 cases, 4 tagged weak drafts; 0.92 allows one failing case): untagged-but-revised cases count; every case fails when a multi-item run revised nothing (single-item runs: tag alone decides) |
 | `pipeline_flow` | check | All three phases (create, auto-fix, submit) detected in stdout, no fatal tracebacks, no Phase 1 deletions |
 | `architecture_context_used` | check | Every feasibility file's writer transcript read `.context/architecture-context` (or the review declares the context not relevant); the prose fallback applies only to runs without transcript capture |
 | `initiative_quality` | LLM | Initiative quality (WHAT/WHY/Scope/HOW/Right-sized) + calibration accuracy |

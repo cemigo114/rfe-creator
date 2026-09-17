@@ -14,6 +14,7 @@ to the case directory and ``annotations`` loaded from the dataset case's
 
 import os
 import textwrap
+from pathlib import Path
 
 import pytest
 import yaml
@@ -125,17 +126,57 @@ def test_both_configs_identical():
     )
 
 
+def _dataset(path):
+    """(case count, revision-expected count, [(case, annotations)]) for a dataset dir."""
+    cases = sorted(p for p in (Path(REPO_ROOT) / path).iterdir() if p.is_dir())
+    rows = []
+    for case in cases:
+        assert (case / "input.yaml").is_file(), case
+        ann = yaml.safe_load((case / "annotations.yaml").read_text(encoding="utf-8"))
+        rows.append((case.name, ann))
+    tagged = [c for c, a in rows if "revision-expected" in (a.get("tags") or [])]
+    return len(rows), tagged, rows
+
+
 def test_threshold_arithmetic():
-    # Same value in both configs, different denominators. RFE: 25 cases, 5 tagged
-    # revision-expected, 3 of 5 revised must pass and 2 of 5 must fail.
-    # Initiative: 16 cases, none tagged, one failing case allowed. Guard the float
-    # boundary as well as the configured value.
+    # Same value in both configs, different denominators, derived from the shipped
+    # datasets so the calibration notes cannot drift from the case counts. RFE: 25
+    # cases, 5 tagged revision-expected, 3 of 5 revised must pass and 2 of 5 must
+    # fail. Initiative: 20 cases, 4 tagged (case-017..020, since the gate had passed
+    # only on incidental revisions), 3 of 4 must pass and 2 of 4 must fail. Guard
+    # the float boundary as well as the configured value.
     for path in (EVAL_YAML, EVAL_INITIATIVE_YAML):
         assert _config(path)["thresholds"][JUDGE]["min_pass_rate"] == 0.92
-    assert (25 - 2) / 25 >= 0.92  # 3 revised -> 2 failures -> pass
-    assert (25 - 3) / 25 < 0.92  # 2 revised -> 3 failures -> fail
-    assert (16 - 1) / 16 >= 0.92  # one failing initiative case -> pass
-    assert (16 - 2) / 16 < 0.92  # two failing initiative cases -> fail
+    n_rfe, tagged_rfe, _ = _dataset("eval/dataset/cases")
+    n_init, tagged_init, _ = _dataset("eval/initiative-dataset/cases")
+    assert (n_rfe, len(tagged_rfe)) == (25, 5)
+    assert (n_init, len(tagged_init)) == (20, 4)
+    assert tagged_init == [
+        "case-017-workbench-idle-culling",
+        "case-018-pipeline-artifact-retention",
+        "case-019-serving-cold-start-baseline",
+        "case-020-cluster-health-digest",
+    ]
+    assert (n_rfe - 2) / n_rfe >= 0.92  # 3 of 5 revised -> 2 failures -> pass
+    assert (n_rfe - 3) / n_rfe < 0.92  # 2 of 5 revised -> 3 failures -> fail
+    assert (n_init - 1) / n_init >= 0.92  # 3 of 4 revised -> 1 failure -> pass
+    assert (n_init - 2) / n_init < 0.92  # 2 of 4 revised -> 2 failures -> fail
+
+
+def test_tagged_cases_are_annotated_as_weak_drafts():
+    for path in ("eval/dataset/cases", "eval/initiative-dataset/cases"):
+        _, tagged, rows = _dataset(path)
+        for case, ann in rows:
+            tags = ann.get("tags") or []
+            if case in tagged:
+                # The amended provider floor (design §3.4): a revision-expected draft states
+                # that its first review fails and recommends revise; a submit / split /
+                # reject expectation would contradict the tag.
+                assert "weak-draft" in tags and ann.get("difficulty") == "hard", case
+                assert ann.get("expected_pass") is False, case
+                assert ann.get("expected_recommendation") == "revise", case
+            else:
+                assert "weak-draft" not in tags, case
 
 
 # --- Run-level gate: zero revisions anywhere fails every case ----------------
@@ -195,8 +236,8 @@ def test_missing_annotations_treated_as_untagged():
 
 
 def test_untagged_but_revised_counts_towards_coverage():
-    # The initiative dataset has no revision-expected tags; a revised item must
-    # still open the run-level gate for itself and (via the report) for others.
+    # An untagged case that was revised anyway must still open the run-level gate
+    # for itself and (via the report) for others.
     passed, msg = _run(
         {
             f"{INIT_REVIEWS}/INIT-4-review.md": _review(

@@ -1,17 +1,19 @@
 difficulty: hard
+expected_alignment: not_assessed
 expected_feasibility: null
 expected_pass: false
 expected_recommendation: revise
 expected_scores:
-  not_a_task: null
-  open_to_how: null
-  right_sized: null
   what: null
-  why: null
+  why: 1
+  scope: null
+  open_to_how: 0
+  right_sized: null
 expected_total: null
 known_issues: []
 score_tolerance: 1
 tags:
 - weak-draft
 - revision-expected
-- internal-team-request
+- prescriptive-how
+- why-missing
