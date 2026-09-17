@@ -5,12 +5,12 @@ clarifying_context: 'What the team would deliver: a culling policy for workbench
   not opt in.
 
 
-  Honest status on the problem side: we do not have data. Nobody has measured how many workbenches sit idle, for how long, or
-  what that costs in GPU or node hours; there is no ticket from a customer or an internal team asking for this; and we have
-  not looked at what other platforms do. It came out of a conversation between two of us on the dashboard team who suspect
-  the number is large. If the problem statement has to say that the evidence is not collected yet, say exactly that and leave
-  it there. Please do not fill it in with generic claims about cloud cost or "teams have reported" — we would rather the gap
-  be visible to whoever reviews this than have it read as if we had numbers.
+  On the problem side there is nothing. Nobody has reported idle workbenches as a problem, nobody has measured anything, no
+  customer or internal team has asked, we have not looked at other platforms, and we do not have a theory about waste that
+  we would stand behind. The only honest problem statement is that the platform does not have this feature. If the write-up
+  needs a problem statement, write exactly that sentence — "The platform has no idle culling policy for workbenches." — and
+  stop there. Do not add a belief about GPU cost, do not say the team suspects anything, do not propose measuring first;
+  none of that is ours to claim, and we would rather a reviewer flag the missing rationale than have one written for us.
 
 
   Boundaries as far as we have them: workbenches only, not model servers or pipeline pods; stop, never delete; no per-user
@@ -18,5 +18,5 @@ clarifying_context: 'What the team would deliver: a culling policy for workbench
   controller; we have no preference on how the idle signal is detected and would leave that to whoever picks it up.'
 priority: Normal
 prompt: Add an admin-configurable idle culling policy for workbenches so that notebooks nobody is using get stopped after a
-  set window. We think a lot of GPU time is going to idle workbenches but we have not measured it yet, so this is filed on
-  a hunch.
+  set window. There is no problem we can point to — nobody asked, nothing is measured — the platform simply does not have
+  it, so this is filed as "we want the feature".

@@ -13,6 +13,6 @@ expected_total: null
 known_issues: []
 score_tolerance: 1
 tags:
-  - weak-draft
-  - revision-expected
-  - why-missing
+- weak-draft
+- revision-expected
+- why-missing

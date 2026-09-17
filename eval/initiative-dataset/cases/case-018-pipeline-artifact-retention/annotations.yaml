@@ -6,13 +6,13 @@ expected_recommendation: revise
 expected_scores:
   what: null
   why: null
-  scope: 0
-  open_to_how: null
+  scope: null
+  open_to_how: 0
   right_sized: null
 expected_total: null
 known_issues: []
 score_tolerance: 1
 tags:
-  - weak-draft
-  - revision-expected
-  - scope-missing
+- weak-draft
+- revision-expected
+- prescriptive-how

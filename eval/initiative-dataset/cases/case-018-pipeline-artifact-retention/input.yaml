@@ -2,21 +2,22 @@ clarifying_context: 'The problem is real and we have the numbers. The pipelines 
   grew from 4 TB to 19 TB over the last two quarters with the number of active users flat; a sample of 500 runs older than
   90 days showed that nobody had opened any of their artifacts through the UI or the API since they were written. Two
   platform teams have had to ask their storage admins for emergency quota bumps this year, and one of them told us they
-  now delete run folders by hand with a script they do not trust. So: retention for pipeline run artifacts, with a policy an
-  admin can set and a way for a user to pin a run they want kept.
+  now delete run folders by hand with a script they do not trust.
 
 
-  What we have not decided, and I want to be upfront that it is undecided: the scope. We have not agreed whether this covers
-  only the artifacts in the object store or also the run metadata in the database, whether cached-execution outputs that other
-  runs may still reference are in or out, whether logs count as artifacts, whether it applies retroactively to the 19 TB or
-  only to new runs, or whether the retention clock is per project, per pipeline or per user. Each of those has a different
-  owner and a different blast radius and the team has not sat down on it yet. Please write the scope as open — do not pick
-  answers for us or invent an in/out list, because a reviewer seeing a tidy boundary here would think the decision was made.
-  We would rather be told the scope is missing.
+  What we will deliver: retention for pipeline run artifacts. In scope: a time-based retention rule an administrator sets
+  per project, automatic removal of the object-store artifacts of runs past that age, and a per-run pin a user can set to
+  exempt a run. Out of scope: the run metadata rows in the database, execution logs, cached-execution outputs, retroactive
+  cleanup of the existing 19 TB, and anything per user rather than per project.
 
 
-  No constraints on approach; we are not attached to any particular garbage-collection mechanism or storage layout.'
+  How it will be built is decided, and I want it written as decided, not as options. The architecture group voted on it
+  last month: retention is implemented as bucket lifecycle rules in the object store, one rule per project namespace;
+  expiry is enforced by a nightly Kubernetes CronJob that rewrites those rules from the admin settings; pins are stored as
+  a Redis set keyed by run id that the CronJob consults before touching a prefix; and the admin settings live in a new
+  table in the pipelines PostgreSQL database. Please use "will use" and "is implemented as" for all four — do not soften
+  them into "could use" or "one approach would be", and do not add alternatives; those decisions are closed.'
 priority: Major
-prompt: Introduce retention for pipeline run artifacts, with an admin-set policy and a way for users to pin runs. Storage
-  on our biggest cluster has grown almost fivefold in two quarters, but we have not yet decided how far the retention
-  should reach, so the scope is genuinely open.
+prompt: Introduce per-project retention for pipeline run artifacts with user-settable pins. Storage on our biggest cluster
+  grew almost fivefold in two quarters. The implementation is already decided — object-store lifecycle rules driven by a
+  nightly CronJob, pins in Redis, settings in PostgreSQL — so write those as the design, not as suggestions.
