@@ -57,6 +57,7 @@ import check_autofix_complete  # noqa: E402
 import check_conflicts  # noqa: E402
 import check_review_progress  # noqa: E402
 import compare_review_outputs  # noqa: E402
+import generate_eval_config  # noqa: E402
 import generate_review_pdf  # noqa: E402
 import generate_run_report  # noqa: E402
 import jira_utils  # noqa: E402
@@ -2244,8 +2245,12 @@ class TestSkillLayer:
         assert f"artifacts/auto-fix-runs/{rp}<timestamp>.yaml" in skill(ctx.t, "speedrun")
         outputs = {o["path"]: o for o in eval_config(ctx)["outputs"]}
         assert f"{rp}YYYYMMDD-HHMMSS.yaml" in outputs["artifacts/auto-fix-runs"]["schema"]
+        # submit.py writes the HTML companion beside the YAML (report_companion_path); the
+        # generated configs document it there, and the never-produced
+        # artifacts/<poll_prefix>review-report.html output is gone (PR-4).
+        assert f"{rp}YYYYMMDD-HHMMSS-report.html" in outputs["artifacts/auto-fix-runs"]["schema"]
         html = f"artifacts/{generate_review_pdf.REPORT_CONFIG[ctx.t]['default_output']}"
-        assert (html in outputs) is (ctx.t == "rfe")  # UNMAPPED shape difference, pinned as is
+        assert html not in outputs
         assert ("<timestamp>-report.html" in skill(ctx.t, "speedrun")) is (ctx.t == "rfe")
 
     def test_alignment_dimension_skill_text(self, ctx):
@@ -2463,7 +2468,15 @@ class TestSkillLayer:
 
 
 class TestEvalConfigs:
-    # rows: 199-212
+    # rows: 199-212. Since PR-4 both configs are GENERATED (scripts/generate_eval_config.py:
+    # eval/config/skeleton.yaml + types/<t>/eval/fragment.yaml + the descriptor), so the pins
+    # below hold by construction; they stay as the readable statement of what the skeleton
+    # derives from which descriptor field.
+
+    def test_generated_and_in_sync(self, ctx):
+        path, rendered, committed, diff = generate_eval_config.compare(ctx.desc)
+        assert committed == rendered, diff
+        assert committed.startswith("# GENERATED")
 
     def test_top_level(self, ctx):
         # rows: 199 — eval.yaml:1-36 / eval-initiative.yaml:1-36
@@ -2491,7 +2504,7 @@ class TestEvalConfigs:
         for extra in ctx.ev["annotations_extra"]:
             assert f"- {extra} (" in prose, extra
         assert ("expected_alignment" in prose) is ("alignment" in ctx.dims)
-        assert ("score_tolerance" in prose) is (ctx.t == "rfe")  # rfe-only, no consumer
+        assert "score_tolerance" in prose  # shared dataset-schema line (no consumer)
 
     def test_outputs(self, ctx):
         # rows: 201 — eval.yaml:86-139; eval-initiative.yaml:87-134
@@ -2516,7 +2529,8 @@ class TestEvalConfigs:
             and f"{ctx.snap['report_prefix']}YYYYMMDD-HHMMSS.yaml" in runs["schema"]
         )
         assert ("{ID}-alignment.md" in outputs[1]["schema"]) is ("alignment" in ctx.dims)
-        assert ("{ID}-split-status.yaml" in outputs[1]["schema"]) is (ctx.t == "rfe")
+        # pipeline_state.py writes the split status for every type (shared skeleton line).
+        assert "{ID}-split-status.yaml" in outputs[1]["schema"]
 
     def test_files_exist_judge(self, ctx):
         # rows: 202 — eval.yaml:150-162; eval-initiative.yaml:145-157
@@ -2544,41 +2558,48 @@ class TestEvalConfigs:
         assert f"total >= {PASS_THRESHOLD}" in check
 
     def test_run_report_exists_judge(self, ctx):
-        # rows: 204 — eval.yaml:214-240; the snapshot exclusion literal is the rfe prefix in BOTH
-        # files
-        # (initiative copy does not exclude initiative-snapshot- — latent drift, pinned visibly)
+        # rows: 204 — the snapshot exclusion is the shared "-snapshot-" union (as in the two-type
+        # judges), no longer the rfe prefix literal both copies carried before PR-4
         check = judges(ctx)["run_report_exists"]["check"]
         assert f"for req in ['run_id', 'started', 'completed', '{ctx.rep['item_key']}']:" in check
-        rfe_stem = _ctx("rfe").snap["prefix"].rstrip("-")
-        assert f'"{rfe_stem}" not in k' in check
-        assert "initiative-snapshot" not in check
+        assert '"-snapshot-" not in os.path.basename(k)' in check
+        assert "issue-snapshot" not in check and "initiative-snapshot" not in check
 
     def test_recommendation_consistency_extra_rule(self, ctx):
         # rows: 205 — eval-initiative.yaml:277-278 == schema.review.extra_rules[0] (Q22: unpinned as
         # a
         # descriptor value, but the judge line is derived from it here)
-        check = judges(ctx)["recommendation_consistency"]["check"]
+        judge = judges(ctx)["recommendation_consistency"]
+        check = judge["check"]
         rules = ctx.schema["review"]["extra_rules"]
         for rule in rules:
             when, then = rule["when"], rule["then"]
-            line = f"if {when['field']} == '{when['equals']}' and not fm.get('{then}'):"
+            line = (
+                f"if fm.get('{when['field']}', '') == '{when['equals']}' and not fm.get('{then}'):"
+            )
             assert line in check, line
+            assert (
+                f"Type rule: {when['field']}={when['equals']} requires {then}=true."
+                in (judge["description"])
+            )
         assert ("alignment" in check) is bool(rules)
 
     def test_pipeline_flow_judge(self, ctx):
-        # rows: 206 — eval.yaml:641 rm-check literal (absent in the initiative copy); phase markers
-        # use skill names
+        # rows: 206 — the rm-check and the phase markers are shared since PR-4 (the initiative
+        # copy had dropped the rm-check and weakened the auto-fix markers); the create marker
+        # is the fragment's execution.create_skill
         check = judges(ctx)["pipeline_flow"]["check"]
-        assert (f'"rm {ctx.dirs["tasks"]}/" in stdout' in check) is (ctx.t == "rfe")
+        assert f'"rm {ctx.dirs["tasks"]}/" in stdout' in check
         assert f'"{ctx.sk}create"' in check
-        if ctx.t == "initiative":
-            assert f'"{ctx.sk}auto-fix"' in check
+        assert '"AUTOFIX" in stdout or "Batch " in stdout' in check
 
     def test_architecture_context_judge(self, ctx):
-        # rows: 207 — eval.yaml:654-750; eval-initiative.yaml:649-756 (not_relevant carve-out
-        # initiative-only)
+        # rows: 207 — one shared judge; the not_relevant carve-out is switched per type by the
+        # fragment's architecture_context.not_relevant_pattern (null for rfe)
         check = judges(ctx)["architecture_context_used"]["check"]
-        assert ("not_relevant" in check) is (ctx.t == "initiative")
+        assert "declared_irrelevant = bool(not_relevant_pattern and" in check
+        assert ("not_relevant_pattern = None" in check) is (ctx.t == "rfe")
+        assert ("not_relevant_pattern = re.compile(" in check) is (ctx.t == "initiative")
         assert ctx.ev["thresholds"]["architecture_context_used"]["min_pass_rate"] == (
             1.0 if ctx.t == "rfe" else 0.85
         )
@@ -2596,7 +2617,8 @@ class TestEvalConfigs:
             assert f"{ctx.dirs[key]}/" in js["revision_quality"]["prompt"], key
 
     def test_pairwise_prompt_file_exists(self, ctx):
-        # rows: 209 — no descriptor field; literals eval/config/{,initiative-}pairwise-judge.md
+        # rows: 209 — types/<t>/eval/pairwise-judge.md by convention (generate_eval_config)
+        assert judges(ctx)["pairwise"]["prompt_file"] == f"types/{ctx.t}/eval/pairwise-judge.md"
         assert (REPO_ROOT / judges(ctx)["pairwise"]["prompt_file"]).is_file()
 
     def test_thresholds_verbatim(self, ctx):

@@ -46,9 +46,14 @@ The evaluation runs the `rfe.speedrun` skill headlessly against 25 test cases: 2
 
 ### Configuration
 
-- **`eval.yaml`** — defines the skill, dataset, outputs, judges, and thresholds.
+- **`eval.yaml`** — defines the skill, dataset, outputs, judges, and thresholds. **Generated** —
+  do not edit it by hand: `python3 scripts/generate_eval_config.py` renders it from
+  `eval/config/skeleton.yaml` (the shared structure, every check and the shared judge prose),
+  `types/rfe/eval/fragment.yaml` (the RFE-specific prose) and `types/rfe/type.yaml` (identity,
+  directories, score fields and the authoritative thresholds). Change those and regenerate;
+  `--check` (part of `make lint` and CI) fails with the diff when the committed file is stale.
 - **`eval.md`** — cached skill analysis (auto-generated, tracks SKILL.md hash for freshness).
-- **`eval/config/pairwise-judge.md`** — prompt for blind A/B comparison across runs.
+- **`types/rfe/eval/pairwise-judge.md`** — prompt for blind A/B comparison across runs.
 
 ### Dataset
 
@@ -131,7 +136,10 @@ The evaluation runs the `initiative-speedrun` skill headlessly against 16 test c
 ### Configuration
 
 - **`eval-initiative.yaml`** — defines the skill, dataset, outputs, judges, and thresholds.
-- **`eval/config/initiative-pairwise-judge.md`** — prompt for blind A/B comparison across runs.
+  **Generated** from the same `eval/config/skeleton.yaml` as `eval.yaml`, with
+  `types/initiative/eval/fragment.yaml` and `types/initiative/type.yaml`; the two configs can
+  no longer drift apart silently (see the RFE section above for how to change and regenerate).
+- **`types/initiative/eval/pairwise-judge.md`** — prompt for blind A/B comparison across runs.
 
 ### Dataset
 

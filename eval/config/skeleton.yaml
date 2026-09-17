@@ -1,15 +1,22 @@
-# GENERATED — do not edit by hand. Regenerate: python3 scripts/generate_eval_config.py
-# Sources: eval/config/skeleton.yaml (shared structure, checks and judge prose), types/rfe/eval/fragment.yaml
-# (typed prose) and types/rfe/type.yaml (identity, dirs, score fields, thresholds).
-name: rfe-speedrun
-description: End-to-end RFE pipeline — create, review, auto-fix, split, and submit RFEs
+#@ Shared eval-config skeleton (design work-item-types-unified.md section 4.5).
+#@ scripts/generate_eval_config.py renders one committed config per work item type from this
+#@ file, the type's descriptor (types/<t>/type.yaml) and its prose fragment
+#@ (types/<t>/eval/fragment.yaml). Lines starting with "#@" are skeleton-only and dropped.
+#@
+#@ Placeholders: ${type.<dotted>} reads the descriptor, ${fragment.<dotted>} the fragment,
+#@ ${gen.<name>} a value the generator derives (see DERIVED in the script). A placeholder
+#@ alone on its line is a block slot: the value's lines are inserted at that indentation and
+#@ an empty value removes the line. Every placeholder must resolve and every fragment key
+#@ must be used, or generation fails.
+name: ${gen.name}
+description: End-to-end ${type.display.entity} pipeline — create, review, auto-fix, split, and submit ${type.display.entity_plural}
 
 # Execution — how the skill processes test cases (runner-agnostic)
 execution:
   mode: batch
-  skill: rfe.speedrun
+  skill: ${fragment.execution.skill}
   arguments: --headless --dry-run --input batch.yaml
-  timeout: 7200          # 2 hours — opus with 20 cases + splits needs ~60 min
+  timeout: ${type.eval.timeout}          # ${fragment.execution.timeout_note}
   max_budget_usd: 100.0  # Per-invocation cost cap
 
 # Runner — agent harness + runner-specific knobs
@@ -33,25 +40,25 @@ permissions:
 
 # MLflow logging target
 mlflow:
-  experiment: rfe-speedrun-eval
+  experiment: ${type.eval.mlflow_experiment}
 
 dataset:
-  path: eval/dataset/cases
+  path: ${type.eval.dataset}
   schema: |
     Each case directory contains 2 files:
 
     - input.yaml: Test input with fields:
-      - prompt (string): Concise problem statement (1-2 sentences)
+      - prompt (string): ${fragment.dataset.prompt}
       - priority (string): Blocker/Critical/Major/Normal/Minor
-      - clarifying_context (string): Extended business context with
-        customer segments, justification, scope, success criteria
+      ${fragment.dataset.clarifying_context}
 
     - annotations.yaml: Test metadata with fields:
-      - expected_scores (dict with what/why/open_to_how/not_a_task/right_sized, nullable floats)
+      - expected_scores (dict with ${gen.score_fields_slash}, nullable floats)
       - expected_total (nullable float, 0-10)
       - expected_pass (nullable bool)
       - expected_recommendation (nullable string: submit/revise/split/reject)
       - expected_feasibility (nullable string)
+      ${gen.annotations_extra}
       - known_issues (list)
       - score_tolerance (int, default 1)
       - tags (list): free-form labels; `revision-expected` marks a
@@ -63,13 +70,10 @@ inputs:
   tools:
     - match: |
         Questions asked to the user via AskUserQuestion — typically
-        clarifying questions during rfe.create (customer segment,
-        business impact, problem definition, distinctness, success metrics).
+        ${fragment.inputs.questions_context}
       prompt: |
         Answer based on the test case context in input.yaml.
-        Use the 'clarifying_context' field for customer segments,
-        business justification, and scope details.
-        Use the 'prompt' field for the core problem statement.
+        ${fragment.inputs.questions_answer}
         Default: pick the first option or answer "yes" for confirmations.
 
     - match: |
@@ -87,42 +91,37 @@ inputs:
 
 
 outputs:
-  - path: artifacts/rfe-tasks
-    batch_pattern: "RFE-{n:03d}"
+  - path: ${type.dirs.tasks}
+    batch_pattern: "${gen.batch_pattern}"
     schema: |
-      RFE task files in Markdown with YAML frontmatter.
-      Naming: RFE-NNN.md (new, pre-submission) or RHAIRFE-NNNN.md (fetched).
+      ${type.display.entity} task files in Markdown with YAML frontmatter.
+      Naming: ${type.identity.local_prefix}NNN.md (new, pre-submission) or ${gen.write_prefix}NNNN.md (fetched).
       Frontmatter fields (validated by scripts/frontmatter.py):
-        rfe_id, title, priority (Blocker/Critical/Major/Normal/Minor),
-        size (S/M/L/XL), status (Draft/Ready/Submitted/Archived),
-        parent_key (for split children), original_labels.
-      Body sections: Summary, Problem Statement, Affected Customers,
-      Business Justification, Acceptance Criteria, Success Criteria.
+        ${fragment.outputs.task_fields}
+      ${fragment.outputs.task_sections}
 
-  - path: artifacts/rfe-reviews
-    batch_pattern: "RFE-{n:03d}"
+  - path: ${type.dirs.reviews}
+    batch_pattern: "${gen.batch_pattern}"
     schema: |
-      Review and assessment files for each RFE.
-      Files per RFE:
+      Review and assessment files for each ${type.display.entity}.
+      Files per ${type.display.entity}:
         {ID}-review.md: Main review with YAML frontmatter containing:
-          rfe_id, score (0-10), pass (bool), recommendation
+          ${type.identity.id_field}, score (0-10), pass (bool), recommendation
           (submit/revise/split/reject/autorevise_reject), feasibility
           (feasible/infeasible/indeterminate), auto_revised (bool),
+          ${gen.review_extra_fields}
           needs_attention (bool), needs_attention_reason,
-          scores.what/why/open_to_how/not_a_task/right_sized (each 0-2),
+          scores.${gen.score_fields_slash} (each 0-2),
           before_score, before_scores (pre-revision scores).
-        {ID}-feasibility.md: Technical feasibility assessment with
-          blockers, strategy considerations, scope assessment.
+        ${fragment.outputs.review_files}
         {ID}-split-status.yaml: Written only for splits; contains
           action (split/no-split), children list, reason.
-      Body of review: Assessor Feedback table (Criterion, Score, Notes),
-      Verdict, Feedback, Technical Feasibility, Strategy Considerations,
-      Revision History.
+      ${fragment.outputs.review_body}
 
-  - path: artifacts/rfe-originals
-    batch_pattern: "RFE-{n:03d}"
+  - path: ${type.dirs.originals}
+    batch_pattern: "${gen.batch_pattern}"
     schema: |
-      Backup of original RFE content before revisions. One file per RFE:
+      Backup of original ${type.display.entity} content before revisions. One file per ${type.display.entity}:
       {ID}.md containing the original body (no frontmatter). Used for
       diffing and content preservation checks.
 
@@ -130,12 +129,12 @@ outputs:
     batch_pattern: "*"
     schema: |
       Timestamped run reports from the auto-fix pipeline.
-      YYYYMMDD-HHMMSS.yaml: Structured YAML with run_id, started,
-        completed timestamps, batch_size, per_rfe list (each with
-        id, recommendation, revision_cycles, needs_attention),
+      ${type.snapshot.report_prefix}YYYYMMDD-HHMMSS.yaml: Structured YAML with run_id, started,
+        completed timestamps, batch_size, ${type.reporting.item_key} list (each with
+        ${gen.run_report_entry_fields}),
         before_scores_avg, after_scores_avg,
         results (passed/failed/split/errors/retried/retry_successes).
-      YYYYMMDD-HHMMSS-report.html: Human-readable HTML companion
+      ${type.snapshot.report_prefix}YYYYMMDD-HHMMSS-report.html: Human-readable HTML companion
         with diffs, scores, and revision analysis (scripts/generate_review_pdf.py).
 
 traces:
@@ -152,13 +151,13 @@ judges:
       Verify the pipeline produced a task file and review file.
     check: |
       files = outputs.get("files", {})
-      tasks = [k for k in files if k.startswith("artifacts/rfe-tasks/") and k.endswith(".md")]
-      reviews = [k for k in files if k.startswith("artifacts/rfe-reviews/") and k.endswith("-review.md")]
+      tasks = [k for k in files if k.startswith("${type.dirs.tasks}/") and k.endswith(".md")]
+      reviews = [k for k in files if k.startswith("${type.dirs.reviews}/") and k.endswith("-review.md")]
       errors = []
       if not tasks:
-          errors.append("No task files in artifacts/rfe-tasks/")
+          errors.append("No task files in ${type.dirs.tasks}/")
       if not reviews:
-          errors.append("No review files in artifacts/rfe-reviews/")
+          errors.append("No review files in ${type.dirs.reviews}/")
       return (len(errors) == 0, "; ".join(errors) if errors else f"{len(tasks)} tasks, {len(reviews)} reviews")
 
   - name: frontmatter_valid
@@ -185,14 +184,14 @@ judges:
               errors.append(f"{fname}: invalid YAML: {e}")
               continue
           checked += 1
-          for req in ['rfe_id', 'score', 'pass', 'recommendation', 'scores']:
+          for req in ['${type.identity.id_field}', 'score', 'pass', 'recommendation', 'scores']:
               if req not in fm:
                   errors.append(f"{fname}: missing {req}")
           score = fm.get('score')
           if score is not None and not (0 <= score <= 10):
               errors.append(f"{fname}: score {score} out of range")
           scores = fm.get('scores', {})
-          criteria = ['what', 'why', 'open_to_how', 'not_a_task', 'right_sized']
+          criteria = ${gen.score_fields_py}
           for c in criteria:
               s = scores.get(c)
               if s is not None and s not in (0, 1, 2):
@@ -201,6 +200,7 @@ judges:
           valid_recs = ['submit', 'revise', 'split', 'reject', 'autorevise_reject']
           if rec and rec not in valid_recs:
               errors.append(f"{fname}: invalid recommendation '{rec}'")
+          ${gen.checks.extra_enum_fields}
           if all(scores.get(c) is not None for c in criteria) and score is not None:
               total = sum(scores.get(c, 0) for c in criteria)
               has_zero = any(scores.get(c) == 0 for c in criteria)
@@ -232,18 +232,19 @@ judges:
       if not report:
           return (False, f"{fname} is empty")
       errors = []
-      for req in ['run_id', 'started', 'completed', 'per_rfe']:
+      for req in ['run_id', 'started', 'completed', '${type.reporting.item_key}']:
           if req not in report:
               errors.append(f"Missing field: {req}")
-      entries = report.get('per_rfe', [])
+      entries = report.get('${type.reporting.item_key}', [])
       if not entries:
-          errors.append("per_rfe list is empty")
-      return (len(errors) == 0, "; ".join(errors) if errors else f"Report {fname}: {len(entries)} RFEs tracked")
+          errors.append("${type.reporting.item_key} list is empty")
+      return (len(errors) == 0, "; ".join(errors) if errors else f"Report {fname}: {len(entries)} ${type.display.entity_plural} tracked")
 
   - name: recommendation_consistency
     description: |
       Cross-field semantic checks: pass/fail aligns with recommendation,
-      infeasible RFEs are never recommended for submission.
+      infeasible ${type.display.entity_plural} are never recommended for submission.
+      ${gen.checks.extra_rules_desc}
     check: |
       import yaml
       files = outputs.get("files", {})
@@ -273,6 +274,7 @@ judges:
               errors.append(f"{fname}: pass=false but recommendation=submit")
           if feas == 'infeasible' and rec == 'submit':
               errors.append(f"{fname}: feasibility=infeasible but recommendation=submit")
+          ${gen.checks.extra_rules}
       return (len(errors) == 0, "; ".join(errors[:5]) if errors else f"{len(reviews)} reviews consistent")
 
   - name: revision_flag_consistency
@@ -639,10 +641,10 @@ judges:
               # Extract last line (the actual error) for the rationale
               last_line = tb_text.strip().split('\n')[-1]
               errors.append(f"Fatal traceback: {last_line[:120]}")
-      if "rm artifacts/rfe-tasks/" in stdout:
-          errors.append("RFE task file deleted during execution")
+      if "rm ${type.dirs.tasks}/" in stdout:
+          errors.append("${type.display.entity} task file deleted during execution")
       phases_found = []
-      if "Phase 1" in stdout or "Phase 1:" in stdout or "rfe.create" in stdout.lower():
+      if "Phase 1" in stdout or "Phase 1:" in stdout or "${fragment.execution.create_skill}" in stdout.lower():
           phases_found.append("create")
       if "auto-fix" in stdout.lower() or "AUTOFIX" in stdout or "Batch " in stdout:
           phases_found.append("auto-fix")
@@ -662,6 +664,7 @@ judges:
       capture — it both false-positives (an agent borrowing the phrase for
       an unrelated note, e.g. a missing comments file) and false-negatives
       (an agent that silently skipped the docs).
+      ${fragment.architecture_context.not_relevant_note}
     check: |
       import glob, json, os, re
       files = outputs.get("files", {})
@@ -674,7 +677,7 @@ judges:
           r'architecture context was not available|no architecture context was available',
           re.IGNORECASE
       )
-      not_relevant_pattern = None  # this type never declares architecture context irrelevant
+      ${gen.arch.not_relevant_pattern_def}
       # Transcripts live at the run root in batch mode; per-case mode and
       # batch runs with traces.events route (copies of) them into
       # cases/<id>/subagents/. Search both, dedupe by filename (routing
@@ -761,129 +764,84 @@ judges:
 
   # --- LLM judges ---
 
-  - name: rfe_quality
+  - name: ${gen.quality_judge}
     description: |
-      Assess the quality of produced RFE task files against the 5 rubric
+      Assess the quality of produced ${type.display.entity} task files against the ${gen.criteria_count} rubric
       criteria and whether the pipeline's own scores are well-calibrated.
     score_range: [1, 5]
     prompt: |
       You are an independent evaluator assessing the quality of an automated
-      RFE (Request for Enhancement) creation pipeline.
+      ${fragment.entity_long} creation pipeline.
 
       Here are the produced artifacts:
 
       {{ outputs }}
 
-      Assess the RFE quality across these criteria, then provide a single
+      Assess the ${type.display.entity} quality across these criteria, then provide a single
       overall score 1-5.
 
-      **Quality criteria** (the RFE should):
-      - Describe a clear business need (WHAT) — user-centric, not task-like
-      - Be justified with evidence (WHY) — named customers, revenue impact
-      - Not prescribe implementation (no HOW) — platform vocabulary is OK,
-        but "must use X" is not
-      - Describe a need, not an activity (Not a Task)
-      - Be right-sized for a single strategy feature
+      **Quality criteria** (the ${type.display.entity} should):
+      ${fragment.quality.criteria}
 
       **Calibration** — check the pipeline's own rubric scores in the review
-      file (scores.what/why/open_to_how/not_a_task/right_sized, each 0-2).
-      Do they match what the RFE content warrants?
+      file (scores.${gen.score_fields_slash}, each 0-2).
+      Do they match what the ${type.display.entity} content warrants?
+
+      ${fragment.quality.extra_checks}
 
       Score 1-5:
-      - **5**: Exemplary RFE — all criteria strong, pipeline scores accurate
+      - **5**: Exemplary ${type.display.entity} — all criteria strong, pipeline scores accurate
       - **4**: Good — meets most criteria, pipeline scores within ±1
       - **3**: Adequate — noticeable quality issues or pipeline miscalibration
       - **2**: Below standard — multiple quality issues or scores systematically off
-      - **1**: Poor — fails basic RFE standards or pipeline scores unreliable
+      - **1**: Poor — fails basic ${type.display.entity} standards or pipeline scores unreliable
 
   - name: revision_quality
     description: |
-      Assess whether auto-revisions improved the RFE without losing content.
-      Compares original (artifacts/rfe-originals/) vs revised (artifacts/rfe-tasks/).
+      Assess whether auto-revisions improved the ${type.display.entity} without losing content.
+      Compares original (${type.dirs.originals}/) vs revised (${type.dirs.tasks}/).
     score_range: [1, 5]
     prompt: |
       You are an independent evaluator assessing the quality of automated
-      RFE revisions. The pipeline may have auto-revised some RFEs to improve
+      ${type.display.entity} revisions. The pipeline may have auto-revised some ${type.display.entity_plural} to improve
       their rubric scores.
 
       Here are the produced artifacts:
 
       {{ outputs }}
 
-      Compare the original RFE (in artifacts/rfe-originals/) against the
-      revised version (in artifacts/rfe-tasks/) and the pipeline's review
-      (in artifacts/rfe-reviews/).
+      Compare the original ${type.display.entity} (in ${type.dirs.originals}/) against the
+      revised version (in ${type.dirs.tasks}/) and the pipeline's review
+      (in ${type.dirs.reviews}/).
 
       First, check the review frontmatter for `auto_revised` and
       `before_score`/`score`. This tells you whether a revision happened
       and how scores changed.
 
       **If no revision was performed** (auto_revised: false or no originals
-      in artifacts/rfe-originals/): assess the pipeline's *decision* not to
-      revise. If the RFE is already high quality (score ≥ 8) and doesn't
+      in ${type.dirs.originals}/): assess the pipeline's *decision* not to
+      revise. If the ${type.display.entity} is already high quality (score ≥ 8) and doesn't
       have critical issues, skipping revision is correct — score 4-5. Only
-      score low if the RFE has clear problems the pipeline should have fixed.
+      score low if the ${type.display.entity} has clear problems the pipeline should have fixed.
 
       **If a revision was performed**: compare original vs revised and assess:
 
-      **Revision quality**: Did revisions genuinely improve the RFE?
-      Clarified requirements, strengthened justification, reframed
-      prescriptive content? Or just cosmetic/lateral changes?
-
-      **Content fidelity**: Was important business content preserved?
-      Customer names, requirements, justification data intact?
-      Or was critical content lost during revision?
-
-      **Reframing quality**: When prescriptive/HOW content was reframed,
-      was the intent preserved while removing implementation bias?
-      Or was it simply deleted without reframing the underlying need?
+      ${fragment.revision.assessments}
 
       Score 1-5:
-      - **5**: Excellent — revision substantially improved the RFE (or
-        correctly skipped for an already-excellent RFE)
+      - **5**: Excellent — revision substantially improved the ${type.display.entity} (or
+        correctly skipped for an already-excellent ${type.display.entity})
       - **4**: Good — beneficial changes with minor content shifts (or
-        correctly skipped for a strong RFE with only minor gaps)
+        correctly skipped for a strong ${type.display.entity} with only minor gaps)
       - **3**: Mixed — some improvements but also introduced issues or lost specificity
       - **2**: Marginal — cosmetic changes, no real quality improvement, or minor content loss
-      - **1**: Harmful — revision made the RFE worse, lost critical information
+      - **1**: Harmful — revision made the ${type.display.entity} worse, lost critical information
 
   # --- Pairwise (used with --baseline) ---
 
   - name: pairwise
-    description: Blind A/B comparison of RFE pipeline output quality across runs
-    prompt_file: types/rfe/eval/pairwise-judge.md
+    description: Blind A/B comparison of ${type.display.entity} pipeline output quality across runs
+    prompt_file: ${gen.pairwise_prompt_file}
 
 thresholds:
-  files_exist:
-    min_pass_rate: 1.0
-  frontmatter_valid:
-    min_pass_rate: 1.0
-  run_report_exists:
-    min_pass_rate: 1.0
-  recommendation_consistency:
-    min_pass_rate: 1.0
-  revision_flag_consistency:
-    min_pass_rate: 1.0
-  # revision_coverage: with 25 cases of which 5 are tagged revision-expected,
-  # 3 of 5 revised leaves 2 failures -> 23/25 = 0.92 (pass); 2 of 5 revised
-  # leaves 3 failures -> 22/25 = 0.88 (fail). The 2-failure slack is shared:
-  # a tagged draft the create step repairs on its own, a tagged draft the
-  # first review rejects or splits instead of revising (correct pipeline
-  # behaviour, but it never enters the revise path and leaves no evidence),
-  # and any case without a review file each consume one failure. Calibrated on
-  # two live 5-case runs (2026-09-07): drafts weak only by wording were
-  # repaired at create time in 4 of 5; drafts with an in-character "no
-  # customer evidence, do not pad" anchor were revised in 5 of 5. A multi-item run with
-  # zero revisions fails every case (0.0) on any dataset. Single-item runs
-  # (Harbor tasks, execution.mode: case) skip the run-level check and are
-  # decided by the tag alone. Untagged cases otherwise always pass.
-  revision_coverage:
-    min_pass_rate: 0.92
-  pipeline_flow:
-    min_pass_rate: 1.0
-  architecture_context_used:
-    min_pass_rate: 1.0
-  rfe_quality:
-    min_mean: 3.5
-  revision_quality:
-    min_mean: 3.5
+  ${gen.thresholds}

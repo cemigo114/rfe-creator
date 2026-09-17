@@ -42,6 +42,8 @@ lint: ## Run skillsaw, ruff, shellcheck, work item type lints, and pytest
 	fi
 	@echo "Validating work item type descriptors..."
 	@python3 scripts/validate_types.py
+	@echo "Checking the generated eval configs are in sync with the skeleton and fragments..."
+	@python3 scripts/generate_eval_config.py --check
 	@echo "Checking for new literal key-prefix predicates in scripts/..."
 	@python3 scripts/lint_prefix_predicates.py
 	@$(MAKE) test
