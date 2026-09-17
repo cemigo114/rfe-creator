@@ -141,8 +141,12 @@ def test_tagged_cases_are_annotated_as_weak_drafts():
         for case, ann in rows:
             tags = ann.get("tags") or []
             if case in tagged:
+                # The amended provider floor (design §3.4): a revision-expected draft states
+                # that its first review fails and recommends revise; a submit / split /
+                # reject expectation would contradict the tag.
                 assert "weak-draft" in tags and ann.get("difficulty") == "hard", case
-                assert ann.get("expected_pass") in (None, False), case
+                assert ann.get("expected_pass") is False, case
+                assert ann.get("expected_recommendation") == "revise", case
             else:
                 assert "weak-draft" not in tags, case
 

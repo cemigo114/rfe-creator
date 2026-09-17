@@ -1,7 +1,7 @@
 difficulty: hard
 expected_feasibility: null
-expected_pass: null
-expected_recommendation: null
+expected_pass: false
+expected_recommendation: revise
 expected_scores:
   not_a_task: null
   open_to_how: null
