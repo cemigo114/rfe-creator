@@ -46,8 +46,11 @@ Author the eval prose in `types/<name>/eval/fragment.yaml` (schema
 quality threshold `<name>_quality`, and let `python3 scripts/generate_eval_config.py --type <name>`
 write the committed config ("Generated eval configs" in `types/README.md`). Then meet the provider
 floor (design §3.4): a ≥16-case anonymized eval dataset with at least one sparse or adversarial
-case, populated `expected_*` annotations, explicit `eval.thresholds`, the committed eval config,
-one QUICK_MODE run on the PR, and a seed for the tracker emulator.
+case and at least four `revision-expected`-tagged weak-draft cases (each an honest evidence or
+scope gap the create step cannot repair, so the first review fails and the revise path runs — see
+"Weak-draft cases" in `eval/README.md`; without them the `revision_coverage` gate passes only by
+accident), populated `expected_*` annotations, explicit `eval.thresholds`, the committed eval
+config, one QUICK_MODE run on the PR, and a seed for the tracker emulator.
 
 Rules that are easy to trip:
 

@@ -1,0 +1,16 @@
+clarifying_context: 'This is about the time between a model server being created or scaled from zero and the first successful
+  inference. We want it to be lower. That is as precise as we can be right now, and I want the description to stay that
+  imprecise rather than pretend otherwise: we have no target because we have no baseline. Nobody has measured cold-start
+  time per runtime or per model size on our clusters, we do not know how much of it is image pull versus model download
+  versus runtime warm-up, and we have not asked users whether it bothers them. There is no customer case, no support
+  ticket, no SLO that this violates, and no comparison with other serving platforms that we could cite. Two people on the
+  serving team think it is slow. Please do not put a percentage, a seconds figure or a "users have reported" sentence in;
+  if the objective has to say "faster, target to be set once measured", that is the truthful version and the one we want.
+
+
+  What is settled: it is the serving team''s work, it is about single-model servers on the standard runtimes we ship, and it
+  is one effort — we are not bundling in autoscaling policy or multi-model serving, which are separate. Anything from
+  pre-pulling images to keeping warm pools is on the table; we are not asking for any particular mechanism.'
+priority: Normal
+prompt: Reduce cold-start time for model servers on the platform. We do not have a baseline measurement or a target yet, and
+  no user has formally complained, so this is a "we think it is slow" initiative until someone measures it.

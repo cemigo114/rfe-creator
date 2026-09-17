@@ -124,8 +124,14 @@ itself is fine — `resolve()` follows the link).
    committed config at `eval.config` (gate 1 renders it, `--check` keeps it in sync — "Generated
    eval configs" below).
 5. Meet the provider floor (§3.4): a ≥16-case anonymized eval dataset with at least one sparse or
-   adversarial case, populated `expected_*` annotations, explicit `eval.thresholds`, the committed
-   eval config, one QUICK_MODE run on the PR, and a seed for the tracker emulator.
+   adversarial case **and at least four `revision-expected`-tagged weak-draft cases** (the
+   `revision_coverage` gate fails every case of a multi-item run that revised nothing, so an untagged
+   dataset passes only by accident; author each tagged draft with an in-character "no data yet, do
+   not pad" evidence or scope gap the create step cannot repair, annotate `expected_pass: false` /
+   `expected_recommendation: revise`, and record the 0.92-against-tagged-count arithmetic in the
+   fragment's `threshold_notes.revision_coverage` — `eval/README.md` "Weak-draft cases"), populated
+   `expected_*` annotations, explicit `eval.thresholds`, the committed eval config, one QUICK_MODE
+   run on the PR, and a seed for the tracker emulator.
 6. Need a key the schema lacks? Tiers, in order: descriptor data → declarative rule → a companion
    skill in your own repo consuming the declared-stable script CLIs → core PR. New vocabulary is
    promoted only on the **second requester**.

@@ -1,0 +1,22 @@
+clarifying_context: 'The problem is real and we have the numbers. The pipelines object store on our largest internal cluster
+  grew from 4 TB to 19 TB over the last two quarters with the number of active users flat; a sample of 500 runs older than
+  90 days showed that nobody had opened any of their artifacts through the UI or the API since they were written. Two
+  platform teams have had to ask their storage admins for emergency quota bumps this year, and one of them told us they
+  now delete run folders by hand with a script they do not trust. So: retention for pipeline run artifacts, with a policy an
+  admin can set and a way for a user to pin a run they want kept.
+
+
+  What we have not decided, and I want to be upfront that it is undecided: the scope. We have not agreed whether this covers
+  only the artifacts in the object store or also the run metadata in the database, whether cached-execution outputs that other
+  runs may still reference are in or out, whether logs count as artifacts, whether it applies retroactively to the 19 TB or
+  only to new runs, or whether the retention clock is per project, per pipeline or per user. Each of those has a different
+  owner and a different blast radius and the team has not sat down on it yet. Please write the scope as open — do not pick
+  answers for us or invent an in/out list, because a reviewer seeing a tidy boundary here would think the decision was made.
+  We would rather be told the scope is missing.
+
+
+  No constraints on approach; we are not attached to any particular garbage-collection mechanism or storage layout.'
+priority: Major
+prompt: Introduce retention for pipeline run artifacts, with an admin-set policy and a way for users to pin runs. Storage
+  on our biggest cluster has grown almost fivefold in two quarters, but we have not yet decided how far the retention
+  should reach, so the scope is genuinely open.

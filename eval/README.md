@@ -131,7 +131,7 @@ Automated evaluation of the `initiative-speedrun` pipeline using the [agent-eval
 
 ## How it works
 
-The evaluation runs the `initiative-speedrun` skill headlessly against 16 test cases derived from real RHOAIENG Jira initiatives. Each test case provides an objective (prompt + clarifying context), and the pipeline creates, reviews (with assessment, feasibility, and strategic alignment), auto-fixes, and (dry-run) submits Initiatives.
+The evaluation runs the `initiative-speedrun` skill headlessly against 20 test cases: 16 derived from real RHOAIENG Jira initiatives and four deliberately weak drafts. Each test case provides an objective (prompt + clarifying context), and the pipeline creates, reviews (with assessment, feasibility, and strategic alignment), auto-fixes, and (dry-run) submits Initiatives.
 
 ### Configuration
 
@@ -143,7 +143,7 @@ The evaluation runs the `initiative-speedrun` skill headlessly against 16 test c
 
 ### Dataset
 
-`eval/initiative-dataset/cases/` contains 16 test cases, each with:
+`eval/initiative-dataset/cases/` contains 20 test cases, each with:
 
 | File | Purpose |
 |------|---------|
@@ -151,6 +151,12 @@ The evaluation runs the `initiative-speedrun` skill headlessly against 16 test c
 | `annotations.yaml` | Expected scores, feasibility/recommendation/alignment expectations, test tags |
 
 One case (`case-012`, tagged `sparse-input`) provides minimal context to test sparse-input handling.
+
+#### Weak-draft cases
+
+Cases `case-017` through `case-020` are deliberately weak drafts (`difficulty: hard`) that the pipeline is expected to auto-revise, the initiative counterpart of the RFE cases `case-021` to `case-025` above. Their `annotations.yaml` carries `tags: [weak-draft, revision-expected, <mode>...]`, where `<mode>` names the flaw: `why-missing` (the requester states there is no evidence and asks that none be invented), `scope-missing` (the boundaries are explicitly undecided) or `what-vague` (no target because there is no baseline). Each gap is an honest absence the create step cannot fill, which is what makes the first review fail — the calibration of the RFE cases showed that drafts weak only in wording are repaired at create time. `expected_pass: false` and `expected_recommendation: revise` describe the first review; the revision then either adds evidence or flags the section with `[NEEDS: ...]` and `needs_attention`, either of which is revision evidence. The same eight evidence signals as for RFEs apply.
+
+Without these cases the initiative gate rested on the run-level rule alone, and passed only because `case-012` happened to be revised while the pipeline dropped the requester context; once #188 forwarded that context, a full run revised nothing and `revision_coverage` scored 0.0.
 
 ### Judges
 
@@ -161,7 +167,7 @@ One case (`case-012`, tagged `sparse-input`) provides minimal context to test sp
 | `run_report_exists` | check | Initiative run report YAML with required fields |
 | `recommendation_consistency` | check | pass/fail aligns with recommendation, infeasible != submit, weak alignment sets needs_attention |
 | `revision_flag_consistency` | check | `auto_revised` agrees with revision evidence (state file, history, moved score, removed-context) |
-| `revision_coverage` | check | Revise path exercised (16 cases, no tagged weak drafts yet, so 0.92 allows one failing case): untagged-but-revised cases count; every case fails when a multi-item run revised nothing (single-item runs: tag alone decides) |
+| `revision_coverage` | check | Revise path exercised (20 cases, 4 tagged weak drafts; 0.92 allows one failing case): untagged-but-revised cases count; every case fails when a multi-item run revised nothing (single-item runs: tag alone decides) |
 | `pipeline_flow` | check | Phases ran, no fatal tracebacks |
 | `architecture_context_used` | check | Feasibility files used architecture context |
 | `initiative_quality` | LLM | Initiative quality (WHAT/WHY/Scope/HOW/Right-sized) + calibration accuracy |
