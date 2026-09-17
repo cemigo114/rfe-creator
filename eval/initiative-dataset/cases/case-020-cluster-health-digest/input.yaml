@@ -1,0 +1,20 @@
+clarifying_context: 'Idea from a hallway conversation after a demo, so please treat everything below as thin and keep it
+  thin in the write-up. The gist: some kind of periodic digest — an email or a dashboard card — telling a project owner how
+  their part of the platform is doing. Which signals go into it, we have not decided: could be failed pipeline runs, could be
+  serving errors, could be quota use, could be stale workbenches, could be all of those or two of them. Whether it is per
+  project, per user or per cluster is also undecided, as is whether admins get a roll-up. I am not going to guess at an in
+  and out of scope list and I do not want one invented for me; the honest state is that the boundaries do not exist yet.
+
+
+  On why: we have nothing to cite. No one has asked for this, we have no data on how project owners find out about problems
+  today, no incident that this would have prevented, and no competitor feature we are chasing. If the problem statement ends
+  up saying that the motivation is anecdotal and unmeasured, that is accurate. Do not pad it with "teams struggle to" or
+  "visibility is a common request" — nobody has established either.
+
+
+  The only firm things: it is one piece of work owned by the dashboard team, it is read-only (it reports, it does not act),
+  and we have no opinion on how it is built or delivered.'
+priority: Minor
+prompt: A periodic health digest for project owners summarising what is going on in their projects. Which signals, which
+  audience and what boundaries are all undecided, and we have no evidence anyone needs it — filing it so the idea is not
+  lost.

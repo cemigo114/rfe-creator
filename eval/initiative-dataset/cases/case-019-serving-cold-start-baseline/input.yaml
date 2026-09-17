@@ -1,0 +1,17 @@
+clarifying_context: 'Here is the plan the serving team agreed on, and the initiative is the plan; there is no separate outcome
+  statement and I would rather you did not write one. Three things get done: (1) a DaemonSet pre-pulls every shipped
+  runtime image onto every GPU node at cluster start and after each runtime upgrade; (2) each shipped runtime keeps two
+  warm pods per namespace at all times, so a new model server is scheduled onto an already-running pod; (3) model
+  downloads move from per-pod fetches to a shared read-only PVC that a nightly job populates from the registry. That is
+  the deliverable — those three mechanisms, as described, using those components; they are decisions, not candidates, so
+  please do not turn them into "could" or "such as", and do not add a goal, a metric or a target above them. We have no
+  measurement of cold-start time today, no target, no user complaint, no customer case and no SLO; if the write-up needs a
+  problem statement, say that cold starts have not been measured and leave it there.
+
+
+  It is the serving team''s work, single-model servers on the shipped runtimes only, one effort. Autoscaling policy and
+  multi-model serving are separate and not part of this.'
+priority: Normal
+prompt: Serving cold-start work — a DaemonSet that pre-pulls runtime images, two warm pods per runtime per namespace, and
+  a shared read-only PVC for model downloads. Those three mechanisms are the initiative; there is no measured baseline,
+  no target and no outcome statement beyond doing them.

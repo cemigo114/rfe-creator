@@ -1,0 +1,22 @@
+clarifying_context: 'What the team would deliver: a culling policy for workbenches. An administrator sets an idle window per
+  project or cluster-wide, a workbench that has had no kernel activity and no open browser session for that long is stopped
+  (not deleted — the PVC and the image selection stay), and the owner gets a notice in the dashboard the next time they open
+  it, with a one-click restart. Admins can exempt a workbench, and the default is off so nothing changes for anyone who does
+  not opt in.
+
+
+  On the problem side there is nothing. Nobody has reported idle workbenches as a problem, nobody has measured anything, no
+  customer or internal team has asked, we have not looked at other platforms, and we do not have a theory about waste that
+  we would stand behind. The only honest problem statement is that the platform does not have this feature. If the write-up
+  needs a problem statement, write exactly that sentence — "The platform has no idle culling policy for workbenches." — and
+  stop there. Do not add a belief about GPU cost, do not say the team suspects anything, do not propose measuring first;
+  none of that is ours to claim, and we would rather a reviewer flag the missing rationale than have one written for us.
+
+
+  Boundaries as far as we have them: workbenches only, not model servers or pipeline pods; stop, never delete; no per-user
+  quotas or chargeback, which is a different conversation. The policy engine should sit behind the existing notebook
+  controller; we have no preference on how the idle signal is detected and would leave that to whoever picks it up.'
+priority: Normal
+prompt: Add an admin-configurable idle culling policy for workbenches so that notebooks nobody is using get stopped after a
+  set window. There is no problem we can point to — nobody asked, nothing is measured — the platform simply does not have
+  it, so this is filed as "we want the feature".
