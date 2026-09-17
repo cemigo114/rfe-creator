@@ -528,6 +528,18 @@ class TestDispositions:
             assert "{ID}-split-status.yaml" in self.cfg[t]["outputs"][1]["schema"]
             assert "score_tolerance (int, default 1)" in self.cfg[t]["dataset"]["schema"]
 
+    def test_pr4b_judge_tightenings(self):
+        # Replayed over six runs (3 rfe, 3 initiative, 127 cases): the two tightenings
+        # changed no verdict; the placeholder normalisation removed exactly the two
+        # "None (first pass)." false positives of #190's first calibration run.
+        for t in TYPES:
+            flow = self.judges[t]["pipeline_flow"]["check"]
+            assert "if len(phases_found) < 3:" in flow and "< 2" not in flow
+            arch = self.judges[t]["architecture_context_used"]["check"]
+            assert "elif transcripts:" in arch and "no writer transcript among" in arch
+            cov = self.judges[t]["revision_coverage"]["check"]
+            assert "EMPTY_HISTORY_PREFIX = re.compile(" in cov
+
     def test_pairwise_prompts_live_with_their_type(self):
         for t in TYPES:
             assert self.judges[t]["pairwise"]["prompt_file"] == f"types/{t}/eval/pairwise-judge.md"

@@ -537,7 +537,11 @@ companion beside the run report under `auto-fix-runs/`, now documented there tog
 `batch_size` and the retry counters), `{ID}-split-status.yaml` and `score_tolerance` are
 documented for both, and `revision_quality` points the judge at `before_score`/`score` (the
 review frontmatter has no `revision_cycles`). `tests/test_generate_eval_config.py::TestDispositions`
-pins each of these.
+pins each of these. **PR-4b** (from the #189 review) then tightened three shared judges in the
+skeleton: `pipeline_flow` requires all three phases (it accepted two), `architecture_context_used`
+takes the prose fallback only when no transcript was captured, and `revision_coverage` treats a
+decorated placeholder ("None (first pass).") as empty history — replayed over six eval runs, the
+first two changed no verdict and the third removed exactly two false positives.
 
 ## Lint gates (§3.3)
 

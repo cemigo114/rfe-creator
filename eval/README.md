@@ -77,7 +77,7 @@ Cases `case-021` through `case-025` are deliberately weak drafts (`difficulty: h
 5. a removed-context companion (`{id}-removed-context.yaml` or `.md`)
 6. a leftover `{id}-review-state.json` (a re-review cycle ran)
 7. the shared run report recording a revision for the item (`revision_cycles > 0`, `auto_revised: true`, or `before_score != after_score`)
-8. a non-empty Revision History section (anything other than the template's `none` placeholder)
+8. a non-empty Revision History section (anything other than the template's `none` placeholder or a decorated variant of it such as "None (first pass)." or "No revisions yet")
 
 Without these cases every draft passed first review at 8-10, so the revise/reassess path was never exercised: `revision_quality` scored the decision not to revise 4-5 and `revision_flag_consistency` passed vacuously.
 
@@ -101,8 +101,8 @@ The 0.92 value was calibrated on two live 5-case runs on 2026-09-07 (claude-opus
 | `recommendation_consistency` | check | pass/fail aligns with recommendation, infeasible != submit |
 | `revision_flag_consistency` | check | `auto_revised` agrees with revision evidence (state file, history, moved score, removed-context) |
 | `revision_coverage` | check | Revise path exercised: `revision-expected` cases were revised; every case fails when a multi-item run revised nothing (single-item runs: tag alone decides) |
-| `pipeline_flow` | check | Phases ran, no tracebacks, no Phase 1 deletions |
-| `architecture_context_used` | check | Feasibility files must not indicate missing architecture context |
+| `pipeline_flow` | check | All three phases (create, auto-fix, submit) detected in stdout, no fatal tracebacks, no Phase 1 deletions |
+| `architecture_context_used` | check | Every feasibility file's writer transcript read `.context/architecture-context`; the prose fallback applies only to runs without transcript capture |
 | `rfe_quality` | LLM | RFE quality (WHAT/WHY/HOW/task/scope) + calibration accuracy |
 | `revision_quality` | LLM | Revision improvement + content preservation |
 | `pairwise` | LLM | Blind A/B comparison (only with `--baseline`) |
@@ -162,8 +162,8 @@ One case (`case-012`, tagged `sparse-input`) provides minimal context to test sp
 | `recommendation_consistency` | check | pass/fail aligns with recommendation, infeasible != submit, weak alignment sets needs_attention |
 | `revision_flag_consistency` | check | `auto_revised` agrees with revision evidence (state file, history, moved score, removed-context) |
 | `revision_coverage` | check | Revise path exercised (16 cases, no tagged weak drafts yet, so 0.92 allows one failing case): untagged-but-revised cases count; every case fails when a multi-item run revised nothing (single-item runs: tag alone decides) |
-| `pipeline_flow` | check | Phases ran, no fatal tracebacks |
-| `architecture_context_used` | check | Feasibility files used architecture context |
+| `pipeline_flow` | check | All three phases (create, auto-fix, submit) detected in stdout, no fatal tracebacks, no Phase 1 deletions |
+| `architecture_context_used` | check | Every feasibility file's writer transcript read `.context/architecture-context` (or the review declares the context not relevant); the prose fallback applies only to runs without transcript capture |
 | `initiative_quality` | LLM | Initiative quality (WHAT/WHY/Scope/HOW/Right-sized) + calibration accuracy |
 | `revision_quality` | LLM | Revision improvement + content preservation |
 | `pairwise` | LLM | Blind A/B comparison (only with `--baseline`) |
