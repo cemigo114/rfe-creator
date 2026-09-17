@@ -4,8 +4,8 @@ expected_feasibility: null
 expected_pass: false
 expected_recommendation: revise
 expected_scores:
-  what: 0
-  why: 0
+  what: null
+  why: 1
   scope: null
   open_to_how: 0
   right_sized: null
@@ -15,6 +15,5 @@ score_tolerance: 1
 tags:
 - weak-draft
 - revision-expected
-- vague-what
 - prescriptive-how
 - why-missing
