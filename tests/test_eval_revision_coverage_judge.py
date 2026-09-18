@@ -94,7 +94,16 @@ def _other_revised():
 
 @pytest.mark.parametrize(
     "history",
-    ["none", "None (first pass).", "none — first pass", "No revisions yet.", "- N/A", "_none_"],
+    [
+        "none",
+        "None (first pass).",
+        "none — first pass",
+        "No revisions yet.",
+        "- N/A",
+        "_none_",
+        "None (initial review)",
+        "none: not yet revised",
+    ],
 )
 def test_decorated_placeholder_is_empty_history(history):
     # PR-4b: review agents decorate the template's "none" ("None (first pass)."), which
@@ -107,7 +116,12 @@ def test_decorated_placeholder_is_empty_history(history):
 
 @pytest.mark.parametrize(
     "history",
-    ["- Cycle 1: strengthened WHY with metrics", "None of the HOW content survived; rewrote it"],
+    [
+        "- Cycle 1: strengthened WHY with metrics",
+        "None of the HOW content survived; rewrote it",
+        "None: rewrote the scope boundaries",
+        "none — reframed the mandated stack as suggestions",
+    ],
 )
 def test_real_history_entries_still_count(history):
     files = {f"{RFE_REVIEWS}/RFE-1-review.md": _review("RFE-1", history=history, score=9)}
