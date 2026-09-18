@@ -26,6 +26,24 @@ tracker live in `tmp/pipeline-stall-retries.yaml` and
 `tmp/pipeline-wave-progress.yaml`; `python3 scripts/state.py clean` wipes
 them with the rest of `tmp/`.
 
+## Wave freshness (AISDLC-33)
+
+Every `launch_wave` (and `set-wave`) also stamps `tmp/pipeline-wave-launch.txt`
+with the launch epoch, and the barrier passes it to `check_review_progress.py`
+as `--since` (and to its own in-process slot counts). An assess result, review
+or revise file last modified before the launch is then still *pending*.
+`REASSESS_SAVE` deletes the review and result files before a reassess wave, so
+a file older than the launch can only be a late write by a previous cycle's
+agent; accepting it released the barrier before the wave's own agent had
+finished, and that agent's later write clobbered the review the orchestrator
+had just restored (`auto_revised` and `before_score` lost, observed twice on
+2026-09-17). Dimension files (feasibility, alignment) are reused across cycles
+by design and are never subject to the rule. The companion repair is the COLLECT
+reconcile (`scripts/reconcile_reviews.py`): `REASSESS_RESTORE` now keeps each
+item's `*-review-state.json` (`restore --keep-state`), and COLLECT re-applies it
+idempotently before routing, so a write that lands after the restore is undone
+whatever released the barrier.
+
 ## Reset-on-progress
 
 Progress is the number of (poll phase, id) slots of the wave that are no

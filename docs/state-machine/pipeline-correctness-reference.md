@@ -258,6 +258,8 @@ corrupt one).
 | `REASSESS=` | `auto_revised=true` AND `pass=false` | Re-assess and re-review |
 | `DONE=` | Everything else (passing, terminal, not auto-revised, or review file missing) | No further action |
 
+**COLLECT reconcile (AISDLC-33).** Before `collect_recommendations.py` runs at COLLECT, `pipeline_state.py` runs `scripts/reconcile_reviews.py --type <t> --cycles <reassess_cycle> <active ids>`: it re-applies every `{ID}-review-state.json` that `REASSESS_RESTORE` kept (`restore --keep-state`), undoing a review-agent write that landed after the restore, and sets `needs_attention` (with a reason naming the criteria scored 0) on every review still at `revise`/`pass: false`, since nothing revises it again in this batch. It prints `RESTORED=` / `FLAGGED=` and never exits non-zero for a per-item problem. The wave barrier's freshness rule (`docs/wave-stall-guard.md`, "Wave freshness") is the other half of the same fix.
+
 ### 1.17 Revision Filter: `filter_for_revision.py` Skip Conditions
 
 Applied in order; first match wins. Side effects occur during filtering.
@@ -382,10 +384,13 @@ These scripts exist but are not part of the normal pipeline flow:
 | A4 | any | preserved | preserve_review_state.py save/restore | Reassess cycle boundary (max 2 cycles). State file: `artifacts/rfe-reviews/{ID}-review-state.json` (deleted after restore; persists if review file missing) | Saved to JSON, restored after re-review | preserve_review_state.py:58-127 |
 | A5 | any | (unchanged) | check_revised.py file not found | Original or task file missing (FileNotFoundError) | Prints `FILE_MISSING=<path>`, exits 1. Orchestrator must handle: SKILL.md Step 3.5 runs check_revised only for IDs that went through revision, so missing files indicate an unexpected state. | check_revised.py:38-39 |
 
+| A6 | any | restored | COLLECT reconcile (`scripts/reconcile_reviews.py`, AISDLC-33) | A `{ID}-review-state.json` still exists at COLLECT (REASSESS_RESTORE keeps it with `--keep-state`) | `preserve_review_state.py restore` re-applied idempotently — only raises the flag, fills `before_*`, prepends the saved history once — then the state file is removed. Undoes a review-agent write that landed after REASSESS_RESTORE | pipeline_state.py COLLECT decision |
+
 ### 2.4 needs_attention Flag Transitions
 
 | # | From | To | Trigger | Guard | Action | Code Location |
 |---|---|---|---|---|---|---|
+| N7 | false | true | COLLECT reconcile (`scripts/reconcile_reviews.py`, AISDLC-33) | Review still `recommendation: revise` with `pass: false` when the batch reaches COLLECT (no further revision can happen: reassess cap or revise filtered out) | `update_frontmatter()` sets `needs_attention=true`; fills `needs_attention_reason` only when empty ("Still failing after auto-revision (N reassess cycles): WHY scored 0/2." / "Failing and not auto-revised: …") | pipeline_state.py COLLECT decision |
 | N0 | false | true | Review agent flags issue | Feasibility indeterminate/infeasible, references non-existent components, or concerns rubric doesn't capture | frontmatter.py set needs_attention=true + needs_attention_reason | review-agent.md:45 |
 | N1 | false | true | Revise agent flags issue | Cannot fix autonomously | frontmatter.py set needs_attention=true + needs_attention_reason | revise-agent.md:42 |
 | N2 | false | true | Fetch failure | Task file not created | frontmatter.py set needs_attention=true | rfe.review SKILL.md Step 1 |

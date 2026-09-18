@@ -45,6 +45,10 @@ _TYPES = type_registry.load()
 
 STATE_FILE = "tmp/pipeline-state.yaml"
 WAVE_IDS_FILE = "tmp/pipeline-wave-ids.txt"
+# Epoch of the current wave's launch (AISDLC-33): the barrier hands it to check_review_progress
+# as --since so a review or assess result written before the launch — a previous reassess
+# cycle's late agent — cannot release the wave.
+WAVE_LAUNCH_FILE = "tmp/pipeline-wave-launch.txt"
 DISPATCH_MARKER = "tmp/.dispatch-marker"
 
 MAX_NEXT_ACTION_ITERATIONS = 50
@@ -360,7 +364,9 @@ def _build_phase_config(pipeline_type):
         },
         "REASSESS_RESTORE": {
             "type": "script",
-            "command": "python3 scripts/preserve_review_state.py restore",
+            # --keep-state: the state file survives until the COLLECT reconcile re-applies it
+            # (AISDLC-33: a review agent's late write after this phase clobbered the restore).
+            "command": "python3 scripts/preserve_review_state.py restore --keep-state",
             "ids_file": "tmp/pipeline-reassess-ids.txt",
         },
         "REASSESS_REVISE": {
@@ -628,6 +634,22 @@ def _write_ids(path, ids):
             f.write(f"{id_}\n")
 
 
+def _write_wave_launch():
+    """Record the launch time of the wave just written to WAVE_IDS_FILE."""
+    os.makedirs("tmp", exist_ok=True)
+    with open(WAVE_LAUNCH_FILE, "w") as f:
+        f.write(f"{_now():.3f}\n")
+
+
+def _read_wave_launch():
+    """The current wave's launch epoch, or None when no launch was recorded."""
+    try:
+        with open(WAVE_LAUNCH_FILE) as f:
+            return float(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
 def _copy_ids(src, dst):
     """Copy an ID file."""
     os.makedirs(os.path.dirname(dst) or "tmp", exist_ok=True)
@@ -809,6 +831,19 @@ def advance(state, dry_run=False):
     # --- COLLECT decision ---
     if phase == "COLLECT":
         active_ids = _read_ids("tmp/pipeline-active-ids.txt")
+        # Reconcile before routing (AISDLC-33): re-apply every saved review state a late
+        # agent write may have clobbered since REASSESS_RESTORE, and flag every item still
+        # failing now that no further revision can happen in this batch.
+        reconcile = ""
+        if active_ids and not dry_run:
+            out = _run_script(
+                f"python3 scripts/reconcile_reviews.py {type_flag}"
+                f" --cycles {state.get('reassess_cycle', 0)} {' '.join(active_ids)}"
+            )
+            restored = _parse_line_ids(out, "RESTORED")
+            flagged = _parse_line_ids(out, "FLAGGED")
+            if restored or flagged:
+                reconcile = f"COLLECT reconcile: restored={len(restored)} flagged={len(flagged)}\n"
         out = _run_script(
             f"python3 scripts/collect_recommendations.py {type_flag} {' '.join(active_ids)}"
         )
@@ -822,8 +857,8 @@ def advance(state, dry_run=False):
         if split_ids:
             if not dry_run:
                 _write_ids("tmp/pipeline-split-ids.txt", split_ids)
-            return ("SPLIT", f"COLLECT complete: {stats}\nCOLLECT → SPLIT")
-        return "BATCH_DONE", f"COLLECT complete: {stats}\nCOLLECT → BATCH_DONE"
+            return ("SPLIT", f"{reconcile}COLLECT complete: {stats}\nCOLLECT → SPLIT")
+        return "BATCH_DONE", f"{reconcile}COLLECT complete: {stats}\nCOLLECT → BATCH_DONE"
 
     # --- SPLIT → SPLIT_COLLECT ---
     if phase == "SPLIT":
@@ -1056,6 +1091,7 @@ def cmd_set_wave(args):
         print("Usage: set-wave ID1 ID2 ...", file=sys.stderr)
         sys.exit(1)
     _write_ids(WAVE_IDS_FILE, args)
+    _write_wave_launch()
     _clear_wave_progress()  # a new wave starts a fresh stall window (see cmd_next_action)
     print(f"Wave: {len(args)} IDs")
 
@@ -1193,6 +1229,7 @@ def cmd_next_action(args):
             # cycle — would otherwise inherit its deadline and be declared stalled on its
             # first poll.
             _write_ids(WAVE_IDS_FILE, wave_ids)
+            _write_wave_launch()
             _clear_wave_progress()
 
             # Build agent entries
@@ -1666,6 +1703,13 @@ def cmd_wait_for_wave(args):
         print(f"wait-for-wave: phase {phase} has no poll_phase", file=sys.stderr)
         sys.exit(1)
 
+    # Wave freshness (AISDLC-33): the in-process slot counts and the poll subprocess both
+    # ignore assess/review/revise files older than this wave's launch.
+    since = _read_wave_launch()
+    import check_review_progress as crp
+
+    crp.set_wave_launch(since)
+
     # Stall tracking. A phase missing from the policy table is treated as escalate-only (the
     # policy that never launches a second concurrent agent); the pin test keeps the table full.
     poll_phases = _wave_poll_phases(config)
@@ -1690,6 +1734,8 @@ def cmd_wait_for_wave(args):
             cmd_parts.extend(["--also-phase", p["poll_phase"]])
     if not state.get("headless", True):
         cmd_parts.append("--fast-poll")
+    if since is not None:
+        cmd_parts.extend(["--since", f"{since:.3f}"])
     cmd_parts.extend(["--id-file", WAVE_IDS_FILE])
 
     result = subprocess.run(cmd_parts)
