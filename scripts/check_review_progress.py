@@ -5,14 +5,17 @@ Supports ``--wait`` mode which sleeps internally so the caller does not need
 to parse ``NEXT_POLL`` values.
 
 Wave freshness (AISDLC-33): with ``--since <epoch>`` (or ``set_wave_launch()`` for
-an in-process caller) an assess result, review or revise file last modified
-before the wave was launched is still "pending". REASSESS_SAVE deletes the
-review and result files before a reassess wave, so a file older than the launch
-can only be a late write by a previous cycle's agent; accepting it released the
-barrier before the wave's own agent had finished, and that agent's later write
-then clobbered the restored review (auto_revised and before_score lost).
-Dimension files (feasibility, alignment) are deliberately reused across cycles
-and are never subject to the freshness rule.
+an in-process caller) an assess result or review file last modified before the
+reference time is still "pending". pipeline_state.py passes the agent phase's
+entry time to next-action's wave pre-filter and to the advance guard, and the
+wave's launch time to the wait-for-wave barrier. REASSESS_SAVE deletes the
+review and result files before a reassess phase is entered, so a file older
+than the reference can only be a late write by a previous cycle's agent;
+accepting it skipped the launch (pre-filter) or released the barrier before the
+wave's own agent had finished, and that agent's later write then clobbered the
+restored review (auto_revised and before_score lost). Dimension files
+(feasibility, alignment) are reused across cycles and are never subject to the
+rule; the revise slot keys on ``auto_revised`` and is left alone as well.
 
 ``PHASE_CHECKS`` (poll phase -> expected output path) is a projection of
 ``types/<t>/type.yaml``: ``pipeline.poll_prefix`` + phase base -> ``dirs`` x the
@@ -63,9 +66,12 @@ _PHASE_FACTS = ("dirs.tasks", "dirs.reviews", "pipeline.poll_prefix")
 # Phase bases the engine owns; a pipeline.dimensions entry may not reuse them.
 ENGINE_PHASES = frozenset({"fetch", "create", "assess", "review", "revise", "split"})
 
-# Phase bases whose output a wave (re)writes from scratch: a file older than the wave's
-# launch is a stale write from an earlier cycle, never this wave's result.
-FRESHNESS_BASES = frozenset({"assess", "review", "revise"})
+# Phase bases whose output a wave (re)writes from scratch: a file older than the reference
+# time is a stale write from an earlier cycle, never this wave's result. "revise" is not
+# here: its slot keys on auto_revised in a review the revise agent only edits, and the
+# review REASSESS_RESTORE writes just before REASSESS_REVISE is entered sits inside the clock
+# slack, so a time rule would be nondeterministic there (tracked separately).
+FRESHNESS_BASES = frozenset({"assess", "review"})
 # Clock slack between the launch timestamp (time.time() in pipeline_state) and file mtimes.
 FRESHNESS_SLACK_SECS = 2
 # Epoch of the current wave's launch; None disables the freshness rule (legacy callers).

@@ -177,6 +177,27 @@ def test_missing_or_corrupt_review_does_not_abort_the_batch(workdir, capsys):
     assert "RESTORED=\n" in out and f"FLAGGED={item_id}" in out
 
 
+def test_exactly_one_restored_line_for_pipeline_state(workdir, capsys):
+    # prs.restore prints RESTORED=<id> per item; pipeline_state._parse_line_ids takes the first
+    # RESTORED= line, so only the summary may reach stdout.
+    type_name, _, id_field, _ = RFE
+    for rid in ("RHAIRFE-1", "RHAIRFE-2"):
+        with open(prs.state_path(rid), "w") as f:
+            json.dump({"before_score": 6, "before_scores": RFE_ZERO_WHY, "auto_revised": True}, f)
+        _write(
+            prs.review_path(rid),
+            _review(
+                id_field,
+                rid,
+                {k: 2 for k in RFE_ZERO_WHY},
+                **{"pass": True, "recommendation": "submit", "auto_revised": False},
+            ),
+        )
+    rr.reconcile(["RHAIRFE-1", "RHAIRFE-2"], type_name, cycles=1)
+    out = capsys.readouterr().out
+    assert out.count("RESTORED=") == 1 and "RESTORED=RHAIRFE-1,RHAIRFE-2\n" in out
+
+
 def test_cli(workdir, capsys):
     type_name, item_id, id_field, _ = RFE
     _write(prs.review_path(item_id), _review(id_field, item_id, RFE_ZERO_WHY))

@@ -27,6 +27,8 @@ pipeline_state.py's COLLECT decision, where a failing script aborts the run.
 """
 
 import argparse
+import contextlib
+import io
 import os
 import sys
 
@@ -76,7 +78,10 @@ def reconcile(ids, type_name, cycles=0):
         review = os.path.join(reviews_dir, f"{item_id}-review.md")
         try:
             if os.path.exists(prs.state_path(item_id)) and os.path.exists(review):
-                prs.restore(item_id)  # idempotent; removes the state file
+                # restore() prints its own RESTORED=<id>; only this script's summary line
+                # may reach pipeline_state's line parser.
+                with contextlib.redirect_stdout(io.StringIO()):
+                    prs.restore(item_id)  # idempotent; removes the state file
                 restored.append(item_id)
             data = _read_review(review)
             if data is None or data.get("error"):

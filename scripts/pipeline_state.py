@@ -49,6 +49,12 @@ WAVE_IDS_FILE = "tmp/pipeline-wave-ids.txt"
 # as --since so a review or assess result written before the launch — a previous reassess
 # cycle's late agent — cannot release the wave.
 WAVE_LAUNCH_FILE = "tmp/pipeline-wave-launch.txt"
+# Epoch at which the current agent phase was entered (AISDLC-33). next-action's wave pre-filter
+# and the advance guard decide which ids still need an agent against it: REASSESS_SAVE deletes
+# the review and assess result files before REASSESS_ASSESS / REASSESS_REVIEW are entered, so
+# any such file older than the entry is a previous cycle's late write and must not count as
+# done — otherwise the id is never launched and the phase advances on the stale verdict.
+PHASE_ENTRY_FILE = "tmp/pipeline-phase-entry.txt"
 DISPATCH_MARKER = "tmp/.dispatch-marker"
 
 MAX_NEXT_ACTION_ITERATIONS = 50
@@ -469,7 +475,9 @@ def _build_phase_config(pipeline_type):
         },
         "SPLIT_RESTORE": {
             "type": "script",
-            "command": "python3 scripts/preserve_review_state.py restore",
+            # --keep-state, as REASSESS_RESTORE: the SPLIT_CORRECTION_CHECK reconcile re-applies
+            # and removes the state file (AISDLC-33).
+            "command": "python3 scripts/preserve_review_state.py restore --keep-state",
             "ids_file": "tmp/pipeline-revise-ids.txt",
         },
         "SPLIT_CORRECTION_CHECK": {"type": "noop"},
@@ -650,6 +658,50 @@ def _read_wave_launch():
         return None
 
 
+def _write_phase_entry(phase):
+    """Record that ``phase`` (an agent phase) was entered now."""
+    os.makedirs("tmp", exist_ok=True)
+    with open(PHASE_ENTRY_FILE, "w") as f:
+        f.write(f"{phase}\n{_now():.3f}\n")
+
+
+def _read_phase_entry(phase):
+    """Epoch at which ``phase`` was entered, or None when the record is for another phase
+    (or there is none): a repeat next-action for the same phase never re-stamps it."""
+    try:
+        with open(PHASE_ENTRY_FILE) as f:
+            recorded, ts = f.read().split()[:2]
+        return float(ts) if recorded == phase else None
+    except (OSError, ValueError):
+        return None
+
+
+def _enter_phase(state, next_phase):
+    """Move ``state`` to ``next_phase`` and save; stamp the entry time of an agent phase."""
+    state["phase"] = next_phase
+    _save_state(state)
+    if _get_config(state).get(next_phase, {}).get("type") == "agent":
+        _write_phase_entry(next_phase)
+
+
+def _sweep_review_state(ids):
+    """Remove leftover ``{ID}-review-state.json`` files before a batch starts.
+
+    Only REASSESS_SAVE / SPLIT_SAVE, which run strictly after BATCH_START for the same ids,
+    may write one; a file present here is from an interrupted earlier run or batch and would
+    be re-applied by the COLLECT reconcile onto a review it does not belong to.
+    """
+    from preserve_review_state import state_path
+
+    for rid in ids:
+        try:
+            path = state_path(rid)
+        except Exception:
+            continue
+        if os.path.exists(path):
+            os.remove(path)
+
+
 def _copy_ids(src, dst):
     """Copy an ID file."""
     os.makedirs(os.path.dirname(dst) or "tmp", exist_ok=True)
@@ -755,6 +807,7 @@ def advance(state, dry_run=False):
             state["correction_cycle"] = 0
             batch_file = f"tmp/pipeline-batch-{batch}-ids.txt"
             _copy_ids(batch_file, "tmp/pipeline-active-ids.txt")
+            _sweep_review_state(_read_ids("tmp/pipeline-active-ids.txt"))
         return "FETCH", f"BATCH_START → FETCH: batch={batch}"
 
     # --- Filter before REVISE phases ---
@@ -877,6 +930,12 @@ def advance(state, dry_run=False):
     # --- SPLIT_CORRECTION_CHECK ---
     if phase == "SPLIT_CORRECTION_CHECK":
         child_ids = _read_ids("tmp/pipeline-split-children-ids.txt")
+        if child_ids and not dry_run:
+            # The children's COLLECT equivalent (AISDLC-33): re-apply kept review state, flag
+            # what still fails, before their sizes and recommendations are read.
+            _run_script(
+                f"python3 scripts/reconcile_reviews.py {type_flag} --cycles 1 {' '.join(child_ids)}"
+            )
         if child_ids:
             out = _run_script(
                 f"python3 scripts/check_right_sized.py {type_flag} {' '.join(child_ids)}"
@@ -1015,8 +1074,7 @@ def cmd_set_phase(args):
         print(f"Usage: set-phase <PHASE>\nValid phases: {', '.join(PHASES)}", file=sys.stderr)
         sys.exit(1)
     state = _load_state()
-    state["phase"] = args[0]
-    _save_state(state)
+    _enter_phase(state, args[0])
     print(args[0])
 
 
@@ -1103,6 +1161,7 @@ def cmd_next_action(args):
     returning only when the LLM needs to act: launch_wave, run_script,
     or done.
     """
+    import check_review_progress as crp
     from check_review_progress import check_id
 
     state = _load_state()
@@ -1148,8 +1207,7 @@ def cmd_next_action(args):
         # --- Noop: advance and loop ---
         if phase_type == "noop":
             next_phase, summary = advance(state)
-            state["phase"] = next_phase
-            _save_state(state)
+            _enter_phase(state, next_phase)
             print(summary, file=sys.stderr)
             continue
 
@@ -1162,8 +1220,7 @@ def cmd_next_action(args):
                     # Script already ran — advance past it
                     os.remove(DISPATCH_MARKER)
                     next_phase, summary = advance(state)
-                    state["phase"] = next_phase
-                    _save_state(state)
+                    _enter_phase(state, next_phase)
                     print(summary, file=sys.stderr)
                     continue
                 else:
@@ -1192,7 +1249,9 @@ def cmd_next_action(args):
                 if p.get("poll_phase"):
                     phases_to_check.append(p["poll_phase"])
 
-            # Pre-filter: keep only IDs where ANY phase is still pending
+            # Pre-filter: keep only IDs where ANY phase is still pending. Assess/review files
+            # older than this phase's entry are stale (AISDLC-33) and keep their id in the wave.
+            crp.set_wave_launch(_read_phase_entry(phase))
             remaining = []
             for rfe_id in all_ids:
                 for pphase in phases_to_check:
@@ -1205,8 +1264,7 @@ def cmd_next_action(args):
                 if config.get("post_verify"):
                     _run_script(config["post_verify"])
                 next_phase, summary = advance(state)
-                state["phase"] = next_phase
-                _save_state(state)
+                _enter_phase(state, next_phase)
                 print(summary, file=sys.stderr)
                 continue
 
@@ -1761,8 +1819,9 @@ def cmd_wait_for_wave(args):
     sys.exit(result.returncode)
 
 
-def _check_agent_phase_complete(config):
-    """Return True if all agents for an agent phase are complete."""
+def _check_agent_phase_complete(config, phase=None):
+    """Return True if all agents for an agent phase are complete (files older than the
+    phase's entry do not count, see PHASE_ENTRY_FILE)."""
     ids_file = config.get("ids_file")
     poll_phase = config.get("poll_phase")
     if not ids_file or not poll_phase:
@@ -1770,7 +1829,10 @@ def _check_agent_phase_complete(config):
     ids = _read_ids(ids_file)
     if not ids:
         return True
+    import check_review_progress as crp
     from check_review_progress import check_id
+
+    crp.set_wave_launch(_read_phase_entry(phase) if phase else None)
 
     phases_to_check = [poll_phase]
     for p in config.get("parallel", []):
@@ -1809,7 +1871,7 @@ def cmd_advance(args):
             sys.exit(1)
     # Guard: agent phases must have all agents complete before advancing
     if phase_type == "agent" and not dry_run:
-        if not _check_agent_phase_complete(config):
+        if not _check_agent_phase_complete(config, phase):
             config.get("poll_phase", "")
             config.get("ids_file", "")
             also = ""
@@ -1825,8 +1887,7 @@ def cmd_advance(args):
             sys.exit(1)
     next_phase, summary = advance(state, dry_run=dry_run)
     if not dry_run:
-        state["phase"] = next_phase
-        _save_state(state)
+        _enter_phase(state, next_phase)
     print(summary)
 
 
