@@ -435,12 +435,15 @@ judges:
       # What a template leaves under "## Revision History" when nothing happened.
       EMPTY_HISTORY = {"", "none", "n/a", "no revisions", "no revision"}
       # Agents decorate the placeholder ("None (first pass).", "none — first pass",
-      # "No revisions yet"): the placeholder followed only by a bracketed, dashed or
-      # "yet"-style qualifier is still empty. A sentence that merely starts with
-      # "None ..." ("None of the HOW content survived; rewrote it") is a real entry.
+      # "No revisions yet"): the placeholder followed only by an explicit empty
+      # qualifier is still empty. Anything else after it — "None of the HOW content
+      # survived; rewrote it", "None: rewrote the scope boundaries" — is a real entry.
       EMPTY_HISTORY_PREFIX = re.compile(
           r"^(none|n/a|no revisions?)"
-          r"(\s*[(\[—–:;,-].*|\s+(yet|so far|to date|(on )?(the )?first pass)\b.*)?$"
+          r"(\s*[(\[—–:;,-]?\s*"
+          r"((on |the )?first pass|initial (pass|review)|yet|so far|to date"
+          r"|no revisions?|not (yet )?revised|no changes?)"
+          r"[)\]]?\s*)?$"
       )
 
       files = outputs.get("files", {})
