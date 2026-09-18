@@ -516,6 +516,71 @@ class TestCollect:
         next_phase, _ = ps.advance(state)
         assert next_phase == "BATCH_DONE"
 
+    def test_reconciles_before_routing(self, tmp_dir, monkeypatch):
+        """AISDLC-33: saved review state is re-applied and cap-exhausted items flagged before
+        collect_recommendations reads the reviews; the summary says what changed."""
+        write_ids("tmp/pipeline-active-ids.txt", ["RHAIRFE-1", "RHAIRFE-2"])
+        calls = []
+
+        def mock_run(cmd):
+            calls.append(cmd)
+            if "reconcile_reviews.py" in cmd:
+                return "RESTORED=RHAIRFE-1\nFLAGGED=RHAIRFE-2"
+            return "SUBMIT=RHAIRFE-1\nSPLIT=\nREVISE=RHAIRFE-2\nREJECT=\nERRORS="
+
+        monkeypatch.setattr(ps, "_run_script", mock_run)
+        state = make_state(phase="COLLECT", reassess_cycle=2)
+        next_phase, summary = ps.advance(state)
+        assert next_phase == "BATCH_DONE"
+        assert calls[0] == (
+            "python3 scripts/reconcile_reviews.py --type rfe --cycles 2 RHAIRFE-1 RHAIRFE-2"
+        )
+        assert "collect_recommendations.py" in calls[1]
+        assert summary.startswith("COLLECT reconcile: restored=1 flagged=1 errors=0\n")
+
+    def test_reconcile_errors_leave_normal_routing(self, tmp_dir, monkeypatch):
+        """An id the reconcile could not repair is marked error: reconcile_failed before
+        collect_recommendations reads the reviews."""
+        write_ids("tmp/pipeline-active-ids.txt", ["RHAIRFE-1", "RHAIRFE-2"])
+        marked = []
+        monkeypatch.setattr(
+            ps,
+            "_mark_review_or_stub",
+            lambda rid, updates, ptype, base, error, failures=None: (
+                marked.append((rid, updates["error"], base, error)) or True
+            ),
+        )
+
+        def mock_run(cmd):
+            if "reconcile_reviews.py" in cmd:
+                return "RESTORED=\nFLAGGED=\nRECONCILE_ERRORS=RHAIRFE-2"
+            return "SUBMIT=RHAIRFE-1\nSPLIT=\nREVISE=\nREJECT=\nERRORS=RHAIRFE-2"
+
+        monkeypatch.setattr(ps, "_run_script", mock_run)
+        next_phase, summary = ps.advance(make_state(phase="COLLECT", reassess_cycle=2))
+        assert next_phase == "BATCH_DONE"
+        assert marked == [("RHAIRFE-2", "reconcile_failed", "review", "reconcile_failed")]
+        assert summary.startswith("COLLECT reconcile: restored=0 flagged=0 errors=1\n")
+
+    def test_reconcile_is_quiet_when_nothing_changed_and_skipped_in_dry_run(
+        self, tmp_dir, monkeypatch
+    ):
+        write_ids("tmp/pipeline-active-ids.txt", ["RHAIRFE-1"])
+        calls = []
+
+        def mock_run(cmd):
+            calls.append(cmd)
+            if "reconcile_reviews.py" in cmd:
+                return "RESTORED=\nFLAGGED="
+            return "SUBMIT=RHAIRFE-1\nSPLIT=\nREVISE=\nREJECT=\nERRORS="
+
+        monkeypatch.setattr(ps, "_run_script", mock_run)
+        _, summary = ps.advance(make_state(phase="COLLECT"))
+        assert summary.startswith("COLLECT complete:")
+        calls.clear()
+        ps.advance(make_state(phase="COLLECT"), dry_run=True)
+        assert not any("reconcile_reviews.py" in c for c in calls)
+
 
 # ---------- SPLIT_COLLECT ----------
 
@@ -1000,6 +1065,12 @@ class TestSetWave:
         """set-wave with no IDs exits with error."""
         with pytest.raises(SystemExit):
             ps.cmd_set_wave([])
+
+    def test_set_wave_records_the_launch_time(self, tmp_dir, monkeypatch):
+        """AISDLC-33: the barrier ignores review/assess files older than this timestamp."""
+        monkeypatch.setattr(ps, "_now", lambda: 1_700_000_000.25)
+        ps.cmd_set_wave(["RHAIRFE-1"])
+        assert ps._read_wave_launch() == 1_700_000_000.25
 
 
 # ---------- FIXUP → REASSESS_CHECK ----------
@@ -1894,6 +1965,15 @@ class TestNextActionAgent:
         assert "feasibility" in result["agents"][1]["prompt_file"].lower()
         assert "RHAIRFE-1001" in result["agents"][1]["vars"]
 
+    def test_launch_records_the_wave_launch_time(self, tmp_dir, monkeypatch):
+        """AISDLC-33: every launch_wave stamps tmp/pipeline-wave-launch.txt."""
+        write_ids("tmp/pipeline-active-ids.txt", ["RHAIRFE-1001"])
+        ps._save_state(make_state(phase="REVIEW", batch=1))
+        monkeypatch.setattr(ps, "_now", lambda: 1_700_000_000.0)
+        result = _run_next_action()
+        assert result["action"] == "launch_wave"
+        assert ps._read_wave_launch() == 1_700_000_000.0
+
     def test_multi_phase_prefilter(self, tmp_dir):
         """Pre-filter checks both assess and feasibility phases."""
         write_ids("tmp/pipeline-active-ids.txt", ["RHAIRFE-1001", "RHAIRFE-1002"])
@@ -2118,6 +2198,46 @@ class TestWaitForWave:
         assert "Re-run:" in buf.getvalue()
         assert "wait-for-wave" in buf.getvalue()
 
+    def test_passes_since_when_a_launch_was_recorded(self, tmp_dir, monkeypatch):
+        """AISDLC-33: the poll subprocess and the in-process slot counts share the launch."""
+        import check_review_progress as crp
+
+        ps._save_state(make_state(phase="REVIEW"))
+        write_ids(ps.WAVE_IDS_FILE, ["RHAIRFE-1001"])
+        monkeypatch.setattr(ps, "_now", lambda: 1_700_000_000.5)
+        ps._write_wave_launch()
+        captured_cmd = {}
+
+        def mock_subprocess_run(cmd_parts, **kw):
+            captured_cmd["parts"] = cmd_parts
+            captured_cmd["module_since"] = crp.WAVE_LAUNCHED_AT
+            return type("R", (), {"returncode": 0})()
+
+        monkeypatch.setattr(subprocess, "run", mock_subprocess_run)
+        try:
+            ps.cmd_wait_for_wave([])
+        finally:
+            crp.set_wave_launch(None)
+        parts = captured_cmd["parts"]
+        assert parts[parts.index("--since") + 1] == "1700000000.500"
+        assert captured_cmd["module_since"] == 1_700_000_000.5
+
+    def test_no_since_without_a_recorded_launch(self, tmp_dir, monkeypatch):
+        import check_review_progress as crp
+
+        ps._save_state(make_state(phase="REVIEW"))
+        write_ids(ps.WAVE_IDS_FILE, ["RHAIRFE-1001"])
+        captured_cmd = {}
+
+        def mock_subprocess_run(cmd_parts, **kw):
+            captured_cmd["parts"] = cmd_parts
+            return type("R", (), {"returncode": 0})()
+
+        monkeypatch.setattr(subprocess, "run", mock_subprocess_run)
+        ps.cmd_wait_for_wave([])
+        assert "--since" not in captured_cmd["parts"]
+        assert crp.WAVE_LAUNCHED_AT is None
+
     def test_no_poll_phase_errors(self, tmp_dir):
         """wait-for-wave on a phase with no poll_phase exits with error."""
         ps._save_state(make_state(phase="BATCH_START"))
@@ -2336,6 +2456,8 @@ class TestReassessFixupIds:
         cfg = ps._build_phase_config(ptype)
         assert cfg["REASSESS_FIXUP"]["ids_file"] == "tmp/pipeline-reassess-ids.txt"
         assert cfg["REASSESS_RESTORE"]["ids_file"] == "tmp/pipeline-reassess-ids.txt"
+        # AISDLC-33: the state file outlives this phase for the COLLECT reconcile.
+        assert cfg["REASSESS_RESTORE"]["command"].endswith("restore --keep-state")
         assert cfg["REASSESS_REVISE"]["ids_file"] == "tmp/pipeline-revise-ids.txt"
         # The first-pass FIXUP still checks exactly what REVISE revised: nothing
         # has recreated those review files yet.
@@ -3923,3 +4045,137 @@ class TestWaveStall:
         label, failures = ps._mark_split_not_attempted(["RHAIRFE-1003"], "rfe", "test")
         assert label == "split_not_attempted" and failures == {"RHAIRFE-1003": None}
         assert not os.path.exists("artifacts/rfe-reviews/RHAIRFE-1003-split-status.yaml")
+
+
+# ---------- AISDLC-33: phase-entry freshness, keep-state, sweep ----------
+
+
+def _scored_review(rid, mtime, **over):
+    fm = {"rfe_id": rid, "score": 4, "pass": False, "recommendation": "revise"}
+    fm.update(over)
+    body = "---\n" + "".join(
+        f"{k}: {str(v).lower() if isinstance(v, bool) else v}\n" for k, v in fm.items()
+    )
+    path = f"artifacts/rfe-reviews/{rid}-review.md"
+    with open(path, "w") as f:
+        f.write(body + "---\nBody\n\n## Revision History\nnone\n")
+    os.utime(path, (mtime, mtime))
+    return path
+
+
+class TestPhaseEntryFreshness:
+    """A review or assess result older than the agent phase's entry is a previous cycle's late
+    write: it keeps its id in the wave (next-action) and blocks advance, instead of skipping
+    the agent and advancing on the stale verdict (the AISDLC-33 sequence)."""
+
+    T = 1_700_000_000.0
+
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        import check_review_progress as crp
+
+        yield
+        crp.set_wave_launch(None)
+
+    def test_enter_phase_stamps_agent_phases_only_and_once(self, tmp_dir, monkeypatch):
+        state = make_state(phase="REASSESS_CHECK")
+        monkeypatch.setattr(ps, "_now", lambda: self.T)
+        ps._enter_phase(state, "COLLECT")  # noop phase: no stamp
+        assert ps._read_phase_entry("COLLECT") is None
+        ps._enter_phase(state, "REVIEW")
+        assert ps._read_phase_entry("REVIEW") == self.T
+        assert ps._read_phase_entry("ASSESS") is None  # the record names one phase
+        monkeypatch.setattr(ps, "_now", lambda: self.T + 100)
+        ps._enter_phase(state, "REASSESS_RESTORE")  # script phase: stamp untouched
+        assert ps._read_phase_entry("REVIEW") == self.T
+        assert state["phase"] == "REASSESS_RESTORE"
+
+    def test_set_phase_stamps_an_agent_phase(self, tmp_dir, monkeypatch):
+        ps._save_state(make_state(phase="BATCH_START"))
+        monkeypatch.setattr(ps, "_now", lambda: self.T)
+        ps.cmd_set_phase(["REASSESS_REVIEW"])
+        assert ps._read_phase_entry("REASSESS_REVIEW") == self.T
+
+    def _reassess_review(self, monkeypatch, review_mtime):
+        ps._save_state(make_state(phase="REASSESS_REVIEW", batch=1, reassess_cycle=1))
+        write_ids("tmp/pipeline-reassess-ids.txt", ["RHAIRFE-1"])
+        write_ids("tmp/pipeline-active-ids.txt", ["RHAIRFE-1"])
+        monkeypatch.setattr(ps, "_now", lambda: self.T)
+        ps._write_phase_entry("REASSESS_REVIEW")
+        monkeypatch.setattr(ps, "_run_script", lambda cmd: "")  # post_verify, filter, restore
+        _scored_review("RHAIRFE-1", review_mtime)
+
+    def test_stale_review_at_entry_still_launches_the_agent(self, tmp_dir, monkeypatch):
+        # The reviewer's reproduction: REASSESS_SAVE deleted the review, a previous cycle's
+        # agent rewrote it during REASSESS_ASSESS, next-action now plans REASSESS_REVIEW.
+        self._reassess_review(monkeypatch, self.T - 300)
+        result = _run_next_action()
+        assert result["action"] == "launch_wave" and result["phase"] == "REASSESS_REVIEW"
+        assert "RHAIRFE-1" in result["agents"][0]["vars"]
+        assert ps._read_wave_launch() == self.T  # the barrier's reference
+        assert ps._read_phase_entry("REASSESS_REVIEW") == self.T  # not re-stamped
+
+    def test_fresh_review_advances(self, tmp_dir, monkeypatch, capsys):
+        self._reassess_review(monkeypatch, self.T + 30)
+        result = _run_next_action()
+        assert result["action"] == "run_script" and result["phase"] == "REASSESS_RESTORE"
+        assert "REASSESS_REVIEW → REASSESS_RESTORE" in capsys.readouterr().err
+
+    def test_advance_guard_holds_on_a_stale_review(self, tmp_dir, monkeypatch, capsys):
+        self._reassess_review(monkeypatch, self.T - 300)
+        with pytest.raises(SystemExit) as exc:
+            ps.cmd_advance([])
+        assert exc.value.code == 1
+        assert "pending agents" in capsys.readouterr().err
+        os.utime("artifacts/rfe-reviews/RHAIRFE-1-review.md", (self.T + 30, self.T + 30))
+        ps.cmd_advance([])
+        assert ps._load_state()["phase"] == "REASSESS_RESTORE"
+
+    def test_no_entry_record_keeps_the_legacy_rule(self, tmp_dir, monkeypatch):
+        self._reassess_review(monkeypatch, self.T - 300)
+        os.remove(ps.PHASE_ENTRY_FILE)
+        assert _run_next_action()["action"] == "run_script"  # stale file accepted as before
+
+    def test_revise_slot_is_not_time_gated(self, tmp_dir, monkeypatch):
+        """REASSESS_RESTORE re-raises auto_revised just before REASSESS_REVISE is entered, so
+        the revise slot keeps its auto_revised rule (tracked separately, not changed here)."""
+        import check_review_progress as crp
+
+        _scored_review("RHAIRFE-1", self.T - 300, auto_revised=True)
+        crp.set_wave_launch(self.T)
+        assert crp.check_id("revise", "RHAIRFE-1") == "completed"
+        assert crp.check_id("review", "RHAIRFE-1") == "pending"
+
+
+class TestReviewStateLifetime:
+    def test_split_restore_keeps_state_and_correction_check_reconciles(self, tmp_dir, monkeypatch):
+        cfg = ps._build_phase_config("rfe")
+        assert cfg["SPLIT_RESTORE"]["command"].endswith("restore --keep-state")
+        write_ids("tmp/pipeline-split-children-ids.txt", ["RFE-002", "RFE-003"])
+        calls = []
+
+        def mock_run(cmd):
+            calls.append(cmd)
+            return "RESPLIT=" if "check_right_sized" in cmd else "RESTORED=\nFLAGGED="
+
+        monkeypatch.setattr(ps, "_run_script", mock_run)
+        next_phase, _ = ps.advance(make_state(phase="SPLIT_CORRECTION_CHECK"))
+        assert next_phase == "BATCH_DONE"
+        assert (
+            calls[0] == "python3 scripts/reconcile_reviews.py --type rfe --cycles 1 RFE-002 RFE-003"
+        )
+        assert "check_right_sized" in calls[1]
+        calls.clear()
+        ps.advance(make_state(phase="SPLIT_CORRECTION_CHECK"), dry_run=True)
+        assert not any("reconcile_reviews" in c for c in calls)
+
+    def test_batch_start_sweeps_leftover_state_files(self, tmp_dir):
+        write_ids("tmp/pipeline-batch-1-ids.txt", ["RHAIRFE-1", "RHAIRFE-2"])
+        stale = "artifacts/rfe-reviews/RHAIRFE-1-review-state.json"
+        with open(stale, "w") as f:
+            f.write('{"before_score": 3, "auto_revised": true}')
+        state = make_state(phase="BATCH_START", batch=0, total_batches=1)
+        assert ps.advance(state, dry_run=True)[0] == "FETCH"
+        assert os.path.exists(stale)  # a preview touches nothing
+        assert ps.advance(state)[0] == "FETCH"
+        assert not os.path.exists(stale)

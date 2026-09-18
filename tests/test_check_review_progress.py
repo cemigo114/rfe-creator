@@ -1271,3 +1271,113 @@ def test_distinct_dimension_names_build_rows():
     rows = crp._phase_rows(desc)
     assert rows["feasibility"]("ID-1") == "artifacts/x-reviews/ID-1-feasibility.md"
     assert set(rows) >= {"fetch", "assess", "feasibility", "alignment", "review", "revise", "split"}
+
+
+# ── wave freshness (AISDLC-33) ──
+
+
+class TestWaveFreshness:
+    """An assess/review/revise file older than the wave launch is a previous cycle's late
+    write, not this wave's result; dimension files are reused across cycles and exempt."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_launch(self):
+        import check_review_progress as crp
+
+        yield
+        crp.set_wave_launch(None)
+
+    def _review(self, tmp_path, mtime):
+        f = tmp_path / "RHAIRFE-1-review.md"
+        f.write_text("---\nscore: 7\n---\nBody\n")
+        os.utime(f, (mtime, mtime))
+        return f
+
+    def test_review_older_than_the_launch_is_pending(self, tmp_path):
+        since = 1_700_000_000.0
+        self._review(tmp_path, since - 60)
+        with patch.dict(
+            "check_review_progress.PHASE_CHECKS",
+            {"review": lambda id: str(tmp_path / f"{id}-review.md")},
+        ):
+            assert check_id("review", "RHAIRFE-1", since=since) == "pending"
+            assert check_id("review", "RHAIRFE-1") == "completed"  # no launch: legacy rule
+
+    def test_review_written_after_the_launch_is_completed(self, tmp_path):
+        since = 1_700_000_000.0
+        self._review(tmp_path, since + 5)
+        with patch.dict(
+            "check_review_progress.PHASE_CHECKS",
+            {"review": lambda id: str(tmp_path / f"{id}-review.md")},
+        ):
+            assert check_id("review", "RHAIRFE-1", since=since) == "completed"
+
+    def test_clock_slack(self, tmp_path):
+        import check_review_progress as crp
+
+        since = 1_700_000_000.0
+        self._review(tmp_path, since - crp.FRESHNESS_SLACK_SECS + 0.5)
+        with patch.dict(
+            "check_review_progress.PHASE_CHECKS",
+            {"review": lambda id: str(tmp_path / f"{id}-review.md")},
+        ):
+            assert check_id("review", "RHAIRFE-1", since=since) == "completed"
+
+    def test_module_launch_applies_when_since_is_not_passed(self, tmp_path):
+        import check_review_progress as crp
+
+        since = 1_700_000_000.0
+        self._review(tmp_path, since - 60)
+        with patch.dict(
+            "check_review_progress.PHASE_CHECKS",
+            {"review": lambda id: str(tmp_path / f"{id}-review.md")},
+        ):
+            crp.set_wave_launch(since)
+            assert check_id("review", "RHAIRFE-1") == "pending"
+            crp.set_wave_launch(None)
+            assert check_id("review", "RHAIRFE-1") == "completed"
+
+    def test_stale_assess_result_is_pending(self, tmp_path):
+        since = 1_700_000_000.0
+        f = tmp_path / "RHAIRFE-1.result.md"
+        f.write_text("result")
+        os.utime(f, (since - 60, since - 60))
+        with patch.dict(
+            "check_review_progress.PHASE_CHECKS",
+            {"assess": lambda id: str(tmp_path / f"{id}.result.md")},
+        ):
+            assert check_id("assess", "RHAIRFE-1", since=since) == "pending"
+            assert check_id("assess", "RHAIRFE-1") == "completed"
+
+    def test_dimension_files_are_exempt(self, tmp_path):
+        # feasibility is reused across reassess cycles (reassess_save.py keeps it).
+        since = 1_700_000_000.0
+        f = tmp_path / "RHAIRFE-1-feasibility.md"
+        f.write_text("feasible")
+        os.utime(f, (since - 3600, since - 3600))
+        with patch.dict(
+            "check_review_progress.PHASE_CHECKS",
+            {"feasibility": lambda id: str(tmp_path / f"{id}-feasibility.md")},
+        ):
+            assert check_id("feasibility", "RHAIRFE-1", since=since) == "completed"
+
+    def test_cli_since_flag(self, tmp_path, monkeypatch):
+        """End to end through the real script: the same file is pending with --since in the
+        future and completed without it."""
+        import subprocess
+        import sys as _sys
+
+        monkeypatch.chdir(tmp_path)
+        os.makedirs("artifacts/rfe-reviews")
+        with open("artifacts/rfe-reviews/RHAIRFE-1-review.md", "w") as f:
+            f.write("---\nscore: 7\n---\nBody\n")
+        script = os.path.join(
+            os.path.dirname(__file__), "..", "scripts", "check_review_progress.py"
+        )
+        base = [_sys.executable, script, "--phase", "review", "RHAIRFE-1"]
+        fresh = subprocess.run(base, capture_output=True, text=True)
+        stale = subprocess.run(
+            base + ["--since", str(1_800_000_000.0)], capture_output=True, text=True
+        )
+        assert fresh.returncode == 0 and "COMPLETED=1/1" in fresh.stdout
+        assert stale.returncode == 0 and "PENDING=1" in stale.stdout

@@ -8,7 +8,15 @@ item; submit.py derives the auto-revised Jira label from it.
 
 Usage:
     python3 scripts/preserve_review_state.py save <ID> [<ID> ...]
-    python3 scripts/preserve_review_state.py restore <ID> [<ID> ...]
+    python3 scripts/preserve_review_state.py restore [--keep-state] <ID> [<ID> ...]
+    python3 scripts/preserve_review_state.py cleanup <ID> [<ID> ...]
+
+``restore`` is idempotent: it only raises ``auto_revised``, fills ``before_*``
+and prepends the saved history when it is not already there, so it can run
+again after a late review-agent write (AISDLC-33). With ``--keep-state`` the
+state file survives the restore for that later re-application; the pipeline's
+COLLECT reconcile (``scripts/reconcile_reviews.py``) does the final restore and
+removes it. ``cleanup`` removes state files without touching the review.
 """
 
 import json
@@ -41,12 +49,26 @@ def _schema(item_id):
     return f"{_descriptor(item_id).name}-review"
 
 
+def validate_item_id(item_id):
+    """Refuse an id that is not a plain file-name stem (absolute, empty, or with a path
+    component): the pipeline validates ids before calling, this guards direct CLI use."""
+    if (
+        not isinstance(item_id, str)
+        or not item_id
+        or item_id in (".", "..")
+        or os.path.isabs(item_id)
+        or os.path.basename(item_id) != item_id
+    ):
+        raise ValueError(f"invalid item id: {item_id!r}")
+    return item_id
+
+
 def state_path(item_id):
-    return os.path.join(_reviews_dir(item_id), f"{item_id}-review-state.json")
+    return os.path.join(_reviews_dir(validate_item_id(item_id)), f"{item_id}-review-state.json")
 
 
 def review_path(item_id):
-    return os.path.join(_reviews_dir(item_id), f"{item_id}-review.md")
+    return os.path.join(_reviews_dir(validate_item_id(item_id)), f"{item_id}-review.md")
 
 
 def extract_revision_history(filepath):
@@ -98,8 +120,12 @@ def save(rfe_id):
     print(f"SAVED={rfe_id}")
 
 
-def restore(rfe_id):
-    """Restore before_scores and revision history from the state file."""
+def restore(rfe_id, keep_state=False):
+    """Restore before_scores, the flag and the revision history from the state file.
+
+    Idempotent. ``keep_state`` leaves the state file in place so the restore can be
+    re-applied later (the pipeline's REASSESS_RESTORE); the default removes it.
+    """
     spath = state_path(rfe_id)
     if not os.path.exists(spath):
         print(f"SKIP={rfe_id} (no state file)")
@@ -133,10 +159,16 @@ def restore(rfe_id):
         with open(rpath) as f:
             content = f.read()
 
-        # Find ## Revision History and prepend saved history
+        # Find ## Revision History and prepend saved history — once: a second restore
+        # over a review that already carries it must not duplicate the entries. A review
+        # written without the heading gets it appended: the saved history is the only copy.
         marker = "## Revision History"
         idx = content.find(marker)
-        if idx != -1:
+        if idx == -1:
+            content = content.rstrip("\n") + f"\n\n{marker}\n{saved_history}\n"
+            with open(rpath, "w") as f:
+                f.write(content)
+        elif saved_history not in extract_revision_history(rpath):
             after_marker = idx + len(marker)
             # Get current revision history (new pass content)
             current_after = content[after_marker:]
@@ -147,8 +179,19 @@ def restore(rfe_id):
             with open(rpath, "w") as f:
                 f.write(content)
 
-    os.remove(spath)
+    if not keep_state:
+        os.remove(spath)
     print(f"RESTORED={rfe_id}")
+
+
+def cleanup(rfe_id):
+    """Remove the state file, if any, without touching the review."""
+    spath = state_path(rfe_id)
+    if os.path.exists(spath):
+        os.remove(spath)
+        print(f"CLEANED={rfe_id}")
+    else:
+        print(f"SKIP={rfe_id} (no state file)")
 
 
 def main():
@@ -158,13 +201,18 @@ def main():
 
     action = sys.argv[1]
     ids = sys.argv[2:]
+    keep_state = "--keep-state" in ids
+    ids = [i for i in ids if i != "--keep-state"]
 
     if action == "save":
         for rfe_id in ids:
             save(rfe_id)
     elif action == "restore":
         for rfe_id in ids:
-            restore(rfe_id)
+            restore(rfe_id, keep_state=keep_state)
+    elif action == "cleanup":
+        for rfe_id in ids:
+            cleanup(rfe_id)
     else:
         print(f"Unknown action: {action}", file=sys.stderr)
         sys.exit(2)

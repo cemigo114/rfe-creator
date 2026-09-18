@@ -87,6 +87,7 @@ exclusion, and split parent detection. The `rfe_id` pattern constraint causes
 | `"<phase base>_stalled"` (`fetch_stalled`, `assess_stalled`, `feasibility_stalled`, `alignment_stalled`, `review_stalled`: the stuck poll phase with the type's `pipeline.poll_prefix` stripped, so `assess_stalled` for `assess` and `initiative-assess` alike) | Wave stall guard escalation of a fetch / assess / review-class wave (`docs/wave-stall-guard.md`), on the registry error stub | `pipeline_state.py` `_escalate_stuck` via `verify_phase.write_error_stubs(outcome="stalled")` |
 | `"revise_stalled"` | Wave stall guard escalation of a REVISE-class wave: set on the real review (score, recommendation and `auto_revised` kept), or on the registry stub when that review cannot be updated | `pipeline_state.py` `_mark_revise_stalled` via `_mark_review_or_stub` (`artifact_utils.update_frontmatter`, falling back to `verify_phase.write_error_stubs(error="revise_stalled")`) |
 | `"split_not_attempted: wave stalled ..."` | Wave stall guard escalation of a SPLIT wave (non-retryable, like the submit.py form below) | `pipeline_state.py` `_mark_split_not_attempted` via `_mark_review_or_stub` |
+| `"reconcile_failed"` | COLLECT reconcile (`scripts/reconcile_reviews.py` reported `RECONCILE_ERRORS=` for the id: restore or frontmatter update raised) — set through `_mark_review_or_stub`, retryable, `needs_attention=true` | `pipeline_state.py` COLLECT decision |
 | `"split_refused: too many leaf children"` | Submit Phase 1 | `submit.py:199` |
 | `"split_refused: jira conflict"` | Submit Phase 1 | `submit.py:233` |
 | `"submit_failed: {msg}"` | Submit Phase 2 (also sets needs_attention=true) | `submit.py:597-605` |
@@ -258,6 +259,8 @@ corrupt one).
 | `REASSESS=` | `auto_revised=true` AND `pass=false` | Re-assess and re-review |
 | `DONE=` | Everything else (passing, terminal, not auto-revised, or review file missing) | No further action |
 
+**COLLECT reconcile (AISDLC-33).** Before `collect_recommendations.py` runs at COLLECT, `pipeline_state.py` runs `scripts/reconcile_reviews.py --type <t> --cycles <reassess_cycle> <active ids>`: it re-applies every `{ID}-review-state.json` that `REASSESS_RESTORE` kept (`restore --keep-state`), undoing a review-agent write that landed after the restore, and sets `needs_attention` (with a reason naming the criteria scored 0) on every review still at `revise`/`pass: false`, since nothing revises it again in this batch. `SPLIT_CORRECTION_CHECK` does the same for split children (`--cycles 1`, before `check_right_sized.py`), and `BATCH_START` removes any leftover state file for the batch's ids so nothing from an interrupted earlier run is re-applied. The script prints one `RESTORED=`, one `FLAGGED=` and one `RECONCILE_ERRORS=` line and never exits non-zero for a per-item problem; the ids on the last line are marked `error: reconcile_failed` (retryable) so they route to ERRORS rather than being submitted on a review the reconcile could not repair. The phase-entry freshness rule (`docs/wave-stall-guard.md`, "Wave freshness") is the other half of the same fix.
+
 ### 1.17 Revision Filter: `filter_for_revision.py` Skip Conditions
 
 Applied in order; first match wins. Side effects occur during filtering.
@@ -379,13 +382,15 @@ These scripts exist but are not part of the normal pipeline flow:
 | A1 | false | true | Revise agent modifies content | Agent edits task file | frontmatter.py set auto_revised=true | revise-agent.md Step 3 |
 | A2 | true | false | check_revised.py detects no actual change | Original and task file identical after strip | frontmatter.py set auto_revised=false | rfe.review SKILL.md Step 3.5, check_revised.py:43-44 |
 | A3 | false | true | check_revised.py detects actual change | Files differ but flag was false | frontmatter.py set auto_revised=true | rfe.review SKILL.md Step 3.5, check_revised.py:42 |
-| A4 | any | preserved | preserve_review_state.py save/restore | Reassess cycle boundary (max 2 cycles). State file: `artifacts/rfe-reviews/{ID}-review-state.json` (deleted after restore; persists if review file missing) | Saved to JSON, restored after re-review | preserve_review_state.py:58-127 |
+| A4 | any | preserved | preserve_review_state.py save/restore | Reassess cycle boundary (max 2 cycles). State file: `artifacts/rfe-reviews/{ID}-review-state.json` (headless pipeline: `REASSESS_RESTORE` / `SPLIT_RESTORE` run `restore --keep-state`, so it survives until the reconcile of A6 removes it; the interactive skills' plain `restore` deletes it; `BATCH_START` sweeps any leftover for the batch's ids) | Saved to JSON, restored after re-review | preserve_review_state.py |
 | A5 | any | (unchanged) | check_revised.py file not found | Original or task file missing (FileNotFoundError) | Prints `FILE_MISSING=<path>`, exits 1. Orchestrator must handle: SKILL.md Step 3.5 runs check_revised only for IDs that went through revision, so missing files indicate an unexpected state. | check_revised.py:38-39 |
+| A6 | any | restored | COLLECT reconcile (`scripts/reconcile_reviews.py`, AISDLC-33) | A `{ID}-review-state.json` still exists at COLLECT, or at SPLIT_CORRECTION_CHECK for split children (the RESTORE phases keep it with `--keep-state`) | `preserve_review_state.py restore` re-applied idempotently — only raises the flag, fills `before_*`, prepends the saved history once — then the state file is removed. Undoes a review-agent write that landed after REASSESS_RESTORE | pipeline_state.py COLLECT decision |
 
 ### 2.4 needs_attention Flag Transitions
 
 | # | From | To | Trigger | Guard | Action | Code Location |
 |---|---|---|---|---|---|---|
+| N7 | false | true | COLLECT reconcile (`scripts/reconcile_reviews.py`, AISDLC-33) | Review still `recommendation: revise` with `pass: false` when the batch reaches COLLECT (no further revision can happen: reassess cap or revise filtered out) | `update_frontmatter()` sets `needs_attention=true`; fills `needs_attention_reason` only when empty ("Still failing after auto-revision (N reassess cycles): WHY scored 0/2." / "Failing and not auto-revised: …") | pipeline_state.py COLLECT decision |
 | N0 | false | true | Review agent flags issue | Feasibility indeterminate/infeasible, references non-existent components, or concerns rubric doesn't capture | frontmatter.py set needs_attention=true + needs_attention_reason | review-agent.md:45 |
 | N1 | false | true | Revise agent flags issue | Cannot fix autonomously | frontmatter.py set needs_attention=true + needs_attention_reason | revise-agent.md:42 |
 | N2 | false | true | Fetch failure | Task file not created | frontmatter.py set needs_attention=true | rfe.review SKILL.md Step 1 |
@@ -608,7 +613,7 @@ stateDiagram-v2
             RAS_Save --> RAS_Delete : preserve_review_state.py save
             RAS_Delete --> RAS_Assess : rm review + assess files\n(enables progress detection)
             RAS_Assess --> RAS_Review : re-assess + re-review\n(FIRST_PASS=false)
-            RAS_Review --> RAS_Restore : preserve_review_state.py restore
+            RAS_Review --> RAS_Restore : preserve_review_state.py restore --keep-state
             RAS_Restore --> RAS_Filter : filter_for_revision.py
             RAS_Filter --> RAS_Revise : IDs need revision
             RAS_Filter --> RAS_CheckCycle : no revision needed
@@ -793,7 +798,7 @@ failures that may not surface until production runs.
 ### 4.2 Review Pipeline Invariants
 
 - **`check_revised.py` must run after every revise pass** to correct false `auto_revised` flags (prevents spurious `rfe-creator-auto-revised` labels in Jira).
-- **`preserve_review_state.py` save/restore must bracket every reassess cycle.** Exact field set preserved: `before_score`, `before_scores`, `auto_revised`, `revision_history`. State file (`-review-state.json`) is deleted after restore. **Not preserved**: `needs_attention`, `needs_attention_reason`, `error` — these are implicitly cleared when the reassess cycle deletes and recreates the review file. This contradicts the "sticky" characterization of `needs_attention` in Section 5.1; in practice, `needs_attention=true` set during a first-pass review or revise is lost after reassess unless the new review agent independently re-sets it.
+- **`preserve_review_state.py` save/restore must bracket every reassess cycle.** Exact field set preserved: `before_score`, `before_scores`, `auto_revised`, `revision_history`. State file (`-review-state.json`) survives the pipeline's `restore --keep-state` until the COLLECT / SPLIT_CORRECTION_CHECK reconcile (`scripts/reconcile_reviews.py`) re-applies and deletes it; the interactive skills' plain `restore` deletes it at once. **Not preserved**: `needs_attention`, `needs_attention_reason`, `error` — these are implicitly cleared when the reassess cycle deletes and recreates the review file. This contradicts the "sticky" characterization of `needs_attention` in Section 5.1; in practice, `needs_attention=true` set during a first-pass review or revise is lost after reassess unless the new review agent independently re-sets it.
 - **`set-default` (not `set`) for cycle counters** — prevents counter reset on context compression re-entry.
 - **`before_score`/`before_scores` set once on first pass** (`FIRST_PASS=true`), preserved across all reassess cycles. Never overwritten.
 - **`filter_for_revision.py` intentionally includes split-recommended IDs** — revise fixes non-right-sizing rubric failures; revise agent cannot change scope (`revise-agent.md: "Do NOT split scope"`).

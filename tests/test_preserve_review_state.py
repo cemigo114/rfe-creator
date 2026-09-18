@@ -139,3 +139,91 @@ def test_restore_tolerates_a_state_file_without_the_flag(workdir):
     assert data["auto_revised"] is False
     assert data["before_score"] == 5
     assert not os.path.exists(prs.state_path(item_id))
+
+
+# ── AISDLC-33: keep-state restore is idempotent; the COLLECT reconcile does the final one ──
+
+
+def test_keep_state_restore_survives_a_late_rewrite(workdir):
+    item_id = "RHAIRFE-4"
+    _write(prs.review_path(item_id), _revised_review("rfe_id", item_id, RFE_SCORES, True))
+    prs.save(item_id)
+    _write(prs.review_path(item_id), _fresh_review("rfe_id", item_id, RFE_SCORES))
+
+    prs.restore(item_id, keep_state=True)  # REASSESS_RESTORE
+    assert os.path.exists(prs.state_path(item_id))
+    data, body = read_frontmatter(prs.review_path(item_id))
+    assert data["auto_revised"] is True and data["before_score"] == 6
+    assert body.count("reframed the objective") == 1
+
+    # A late review-agent write replaces the file with a fresh one again.
+    _write(prs.review_path(item_id), _fresh_review("rfe_id", item_id, RFE_SCORES))
+    prs.restore(item_id, keep_state=True)
+    prs.restore(item_id)  # the COLLECT reconcile: final restore, state file removed
+    data, body = read_frontmatter(prs.review_path(item_id))
+    assert data["auto_revised"] is True and data["before_score"] == 6
+    assert data["score"] == 9
+    assert body.count("reframed the objective") == 1  # history prepended once, not thrice
+    assert not os.path.exists(prs.state_path(item_id))
+
+
+def test_restore_twice_over_an_already_restored_review_changes_nothing(workdir):
+    item_id = "RHAIRFE-5"
+    _write(prs.review_path(item_id), _revised_review("rfe_id", item_id, RFE_SCORES, True))
+    prs.save(item_id)
+    _write(prs.review_path(item_id), _fresh_review("rfe_id", item_id, RFE_SCORES))
+    prs.restore(item_id, keep_state=True)
+    first = open(prs.review_path(item_id)).read()
+    prs.restore(item_id, keep_state=True)
+    assert open(prs.review_path(item_id)).read() == first
+
+
+def test_cleanup_removes_the_state_file_only(workdir, capsys):
+    item_id = "RHAIRFE-6"
+    _write(prs.review_path(item_id), _revised_review("rfe_id", item_id, RFE_SCORES, True))
+    prs.save(item_id)
+    prs.cleanup(item_id)
+    assert not os.path.exists(prs.state_path(item_id))
+    assert os.path.exists(prs.review_path(item_id))
+    prs.cleanup(item_id)
+    assert "SKIP=RHAIRFE-6" in capsys.readouterr().out
+
+
+def test_restore_appends_the_history_heading_when_the_review_lacks_it(workdir):
+    item_id = "RHAIRFE-8"
+    _write(prs.review_path(item_id), _revised_review("rfe_id", item_id, RFE_SCORES, True))
+    prs.save(item_id)
+    fresh = _fresh_review("rfe_id", item_id, RFE_SCORES).split("## Revision History")[0]
+    _write(prs.review_path(item_id), fresh)  # a late review without the section
+    prs.restore(item_id)
+    body = open(prs.review_path(item_id)).read()
+    assert body.count("## Revision History") == 1
+    assert "reframed the objective" in body.split("## Revision History")[1]
+    prs.save(item_id)
+    prs.restore(item_id)  # idempotent over the appended section too
+    assert open(prs.review_path(item_id)).read().count("reframed the objective") == 1
+
+
+@pytest.mark.parametrize("bad", ["../RHAIRFE-1", "/tmp/RHAIRFE-1", "RHAIRFE-1/x", "", ".."])
+def test_paths_refuse_ids_that_are_not_plain_stems(workdir, bad):
+    with pytest.raises(ValueError, match="invalid item id"):
+        prs.state_path(bad)
+    with pytest.raises(ValueError, match="invalid item id"):
+        prs.review_path(bad)
+
+
+def test_cli_keep_state_flag(workdir, monkeypatch):
+    item_id = "RHAIRFE-7"
+    _write(prs.review_path(item_id), _revised_review("rfe_id", item_id, RFE_SCORES, True))
+    prs.save(item_id)
+    _write(prs.review_path(item_id), _fresh_review("rfe_id", item_id, RFE_SCORES))
+    monkeypatch.setattr(
+        sys, "argv", ["preserve_review_state.py", "restore", "--keep-state", item_id]
+    )
+    prs.main()
+    assert os.path.exists(prs.state_path(item_id))
+    data, _ = read_frontmatter(prs.review_path(item_id))
+    assert data["auto_revised"] is True
+    monkeypatch.setattr(sys, "argv", ["preserve_review_state.py", "restore", item_id])
+    prs.main()
+    assert not os.path.exists(prs.state_path(item_id))

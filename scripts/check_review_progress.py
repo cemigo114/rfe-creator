@@ -4,6 +4,19 @@ Reports completion status for a list of RFE IDs based on the current phase.
 Supports ``--wait`` mode which sleeps internally so the caller does not need
 to parse ``NEXT_POLL`` values.
 
+Wave freshness (AISDLC-33): with ``--since <epoch>`` (or ``set_wave_launch()`` for
+an in-process caller) an assess result or review file last modified before the
+reference time is still "pending". pipeline_state.py passes the agent phase's
+entry time to next-action's wave pre-filter and to the advance guard, and the
+wave's launch time to the wait-for-wave barrier. REASSESS_SAVE deletes the
+review and result files before a reassess phase is entered, so a file older
+than the reference can only be a late write by a previous cycle's agent;
+accepting it skipped the launch (pre-filter) or released the barrier before the
+wave's own agent had finished, and that agent's later write then clobbered the
+restored review (auto_revised and before_score lost). Dimension files
+(feasibility, alignment) are reused across cycles and are never subject to the
+rule; the revise slot keys on ``auto_revised`` and is left alone as well.
+
 ``PHASE_CHECKS`` (poll phase -> expected output path) is a projection of
 ``types/<t>/type.yaml``: ``pipeline.poll_prefix`` + phase base -> ``dirs`` x the
 phase's file convention, with one row per ``pipeline.dimensions[]`` entry
@@ -52,6 +65,23 @@ _PHASE_FACTS = ("dirs.tasks", "dirs.reviews", "pipeline.poll_prefix")
 
 # Phase bases the engine owns; a pipeline.dimensions entry may not reuse them.
 ENGINE_PHASES = frozenset({"fetch", "create", "assess", "review", "revise", "split"})
+
+# Phase bases whose output a wave (re)writes from scratch: a file older than the reference
+# time is a stale write from an earlier cycle, never this wave's result. "revise" is not
+# here: its slot keys on auto_revised in a review the revise agent only edits, and the
+# review REASSESS_RESTORE writes just before REASSESS_REVISE is entered sits inside the clock
+# slack, so a time rule would be nondeterministic there (tracked separately).
+FRESHNESS_BASES = frozenset({"assess", "review"})
+# Clock slack between the launch timestamp (time.time() in pipeline_state) and file mtimes.
+FRESHNESS_SLACK_SECS = 2
+# Epoch of the current wave's launch; None disables the freshness rule (legacy callers).
+WAVE_LAUNCHED_AT = None
+
+
+def set_wave_launch(since):
+    """Set the wave launch epoch check_id() compares file mtimes against (None disables)."""
+    global WAVE_LAUNCHED_AT
+    WAVE_LAUNCHED_AT = float(since) if since is not None else None
 
 
 def _polls(desc):
@@ -109,8 +139,12 @@ def _build_phase_table():
 PHASE_CHECKS, _PHASE_OWNER = _build_phase_table()
 
 
-def check_id(phase, rfe_id):
-    """Check one ID. Returns 'completed', 'pending', or 'error'."""
+def check_id(phase, rfe_id, since=None):
+    """Check one ID. Returns 'completed', 'pending', or 'error'.
+
+    ``since`` (epoch seconds; defaults to WAVE_LAUNCHED_AT) makes an assess, review or
+    revise file older than the wave launch "pending": see the module docstring.
+    """
     path = PHASE_CHECKS[phase](rfe_id)
     if not os.path.exists(path):
         return "pending"
@@ -118,6 +152,15 @@ def check_id(phase, rfe_id):
     # review -> score_present, revise -> revised_or_split, anything else -> exists. A phase
     # patched into PHASE_CHECKS without an owner (tests) keeps the exists mode.
     type_name, base = _PHASE_OWNER.get(phase, (None, None))
+    if since is None:
+        since = WAVE_LAUNCHED_AT
+    if since is not None and base in FRESHNESS_BASES:
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return "pending"
+        if mtime < float(since) - FRESHNESS_SLACK_SECS:
+            return "pending"  # written before this wave launched: a previous cycle's file
     if base == "create":
         # Every not-yet-good state is "pending", never "error". The --wait loop
         # exits on pending == 0 and never consults the error count, so an
@@ -279,8 +322,14 @@ def main():
         help="Max seconds to wait in --wait mode before timing out (exit 3). "
         "Default 90 (fits within 2-min bash timeout).",
     )
+    parser.add_argument(
+        "--since",
+        type=float,
+        help="Wave launch epoch: assess/review/revise files older than it stay pending",
+    )
     parser.add_argument("ids", nargs="*", metavar="ID", help="RFE IDs to check")
     args = parser.parse_args()
+    set_wave_launch(args.since)
 
     ids = args.ids
     if args.id_file:

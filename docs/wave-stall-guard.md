@@ -26,6 +26,41 @@ tracker live in `tmp/pipeline-stall-retries.yaml` and
 `tmp/pipeline-wave-progress.yaml`; `python3 scripts/state.py clean` wipes
 them with the rest of `tmp/`.
 
+## Wave freshness (AISDLC-33)
+
+Two timestamps under `tmp/` decide whether an assess result or review file
+counts as this phase's output:
+
+- `tmp/pipeline-phase-entry.txt` — written when the pipeline *enters* an agent
+  phase (`next-action`, `advance`, `set-phase`; never re-written by a repeat
+  `next-action` for the same phase). `next-action`'s wave pre-filter and the
+  `advance` guard treat an assess result or review last modified before it as
+  *pending*, so the id stays in the wave and its agent is launched.
+- `tmp/pipeline-wave-launch.txt` — written by every `launch_wave` / `set-wave`;
+  `wait-for-wave` passes it to `check_review_progress.py` as `--since` (and to
+  its own slot counts), so a file older than the wave's launch cannot release
+  the barrier.
+
+`REASSESS_SAVE` deletes the review and result files before a reassess phase is
+entered, so a file older than either reference can only be a late write by a
+previous cycle's agent. Before the rule, such a file made the pre-filter skip
+the launch altogether and the phase advanced on the stale verdict, or released
+the barrier before the wave's own agent had finished, whose later write then
+clobbered the review the orchestrator had just restored (`auto_revised` and
+`before_score` lost, observed twice on 2026-09-17). Dimension files
+(feasibility, alignment) are reused across cycles by design and are exempt;
+the revise slot keys on `auto_revised` and is exempt too. Without a recorded
+entry or launch the legacy rule applies (interactive skills call
+`check_review_progress.py` directly).
+
+The companion repair is the reconcile (`scripts/reconcile_reviews.py`):
+`REASSESS_RESTORE` and `SPLIT_RESTORE` keep each item's `*-review-state.json`
+(`restore --keep-state`), COLLECT (and `SPLIT_CORRECTION_CHECK` for split
+children) re-applies it idempotently before routing and removes it, so a write
+that lands after the restore is undone whatever released the barrier; the same
+step flags every review still failing once no revision can follow. `BATCH_START`
+sweeps leftover state files for the batch's ids.
+
 ## Reset-on-progress
 
 Progress is the number of (poll phase, id) slots of the wave that are no
