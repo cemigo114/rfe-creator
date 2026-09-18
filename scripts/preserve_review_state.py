@@ -49,12 +49,26 @@ def _schema(item_id):
     return f"{_descriptor(item_id).name}-review"
 
 
+def validate_item_id(item_id):
+    """Refuse an id that is not a plain file-name stem (absolute, empty, or with a path
+    component): the pipeline validates ids before calling, this guards direct CLI use."""
+    if (
+        not isinstance(item_id, str)
+        or not item_id
+        or item_id in (".", "..")
+        or os.path.isabs(item_id)
+        or os.path.basename(item_id) != item_id
+    ):
+        raise ValueError(f"invalid item id: {item_id!r}")
+    return item_id
+
+
 def state_path(item_id):
-    return os.path.join(_reviews_dir(item_id), f"{item_id}-review-state.json")
+    return os.path.join(_reviews_dir(validate_item_id(item_id)), f"{item_id}-review-state.json")
 
 
 def review_path(item_id):
-    return os.path.join(_reviews_dir(item_id), f"{item_id}-review.md")
+    return os.path.join(_reviews_dir(validate_item_id(item_id)), f"{item_id}-review.md")
 
 
 def extract_revision_history(filepath):
@@ -146,10 +160,15 @@ def restore(rfe_id, keep_state=False):
             content = f.read()
 
         # Find ## Revision History and prepend saved history — once: a second restore
-        # over a review that already carries it must not duplicate the entries.
+        # over a review that already carries it must not duplicate the entries. A review
+        # written without the heading gets it appended: the saved history is the only copy.
         marker = "## Revision History"
         idx = content.find(marker)
-        if idx != -1 and saved_history not in extract_revision_history(rpath):
+        if idx == -1:
+            content = content.rstrip("\n") + f"\n\n{marker}\n{saved_history}\n"
+            with open(rpath, "w") as f:
+                f.write(content)
+        elif saved_history not in extract_revision_history(rpath):
             after_marker = idx + len(marker)
             # Get current revision history (new pass content)
             current_after = content[after_marker:]

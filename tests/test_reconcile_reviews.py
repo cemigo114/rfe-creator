@@ -198,6 +198,26 @@ def test_exactly_one_restored_line_for_pipeline_state(workdir, capsys):
     assert out.count("RESTORED=") == 1 and "RESTORED=RHAIRFE-1,RHAIRFE-2\n" in out
 
 
+def test_per_item_failures_are_reported_on_one_errors_line(workdir, capsys, monkeypatch):
+    type_name, item_id, id_field, _ = RFE
+    _write(prs.review_path(item_id), _review(id_field, item_id, RFE_ZERO_WHY))
+    _write(prs.review_path("RHAIRFE-2"), _review(id_field, "RHAIRFE-2", RFE_ZERO_WHY))
+    real = rr.update_frontmatter
+
+    def failing(path, updates, schema):
+        if "RHAIRFE-2" in path:
+            raise OSError("disk says no")
+        return real(path, updates, schema)
+
+    monkeypatch.setattr(rr, "update_frontmatter", failing)
+    restored, flagged = rr.reconcile([item_id, "RHAIRFE-2", "../evil"], type_name, cycles=2)
+    assert flagged == [item_id]
+    out = capsys.readouterr().out
+    assert "RECONCILE_ERROR RHAIRFE-2: disk says no" in out
+    assert "RECONCILE_ERROR ../evil: invalid item id" in out
+    assert out.count("RECONCILE_ERRORS=") == 1 and "RECONCILE_ERRORS=RHAIRFE-2,../evil\n" in out
+
+
 def test_cli(workdir, capsys):
     type_name, item_id, id_field, _ = RFE
     _write(prs.review_path(item_id), _review(id_field, item_id, RFE_ZERO_WHY))

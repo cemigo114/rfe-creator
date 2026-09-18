@@ -895,8 +895,28 @@ def advance(state, dry_run=False):
             )
             restored = _parse_line_ids(out, "RESTORED")
             flagged = _parse_line_ids(out, "FLAGGED")
-            if restored or flagged:
-                reconcile = f"COLLECT reconcile: restored={len(restored)} flagged={len(flagged)}\n"
+            errored = _parse_line_ids(out, "RECONCILE_ERRORS")
+            # An item the reconcile could not repair may still hold a readable but stale
+            # review: mark it through the error contract so collect_recommendations routes
+            # it to ERRORS (retryable) instead of submitting it on that review.
+            for rid in errored:
+                _mark_review_or_stub(
+                    rid,
+                    {
+                        "error": "reconcile_failed",
+                        "needs_attention": True,
+                        "needs_attention_reason": "COLLECT reconcile could not repair this"
+                        " review (see the RECONCILE_ERROR line in the run log)",
+                    },
+                    pipeline_type,
+                    "review",
+                    error="reconcile_failed",
+                )
+            if restored or flagged or errored:
+                reconcile = (
+                    f"COLLECT reconcile: restored={len(restored)} flagged={len(flagged)}"
+                    f" errors={len(errored)}\n"
+                )
         out = _run_script(
             f"python3 scripts/collect_recommendations.py {type_flag} {' '.join(active_ids)}"
         )

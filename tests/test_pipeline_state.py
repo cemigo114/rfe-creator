@@ -536,7 +536,31 @@ class TestCollect:
             "python3 scripts/reconcile_reviews.py --type rfe --cycles 2 RHAIRFE-1 RHAIRFE-2"
         )
         assert "collect_recommendations.py" in calls[1]
-        assert summary.startswith("COLLECT reconcile: restored=1 flagged=1\n")
+        assert summary.startswith("COLLECT reconcile: restored=1 flagged=1 errors=0\n")
+
+    def test_reconcile_errors_leave_normal_routing(self, tmp_dir, monkeypatch):
+        """An id the reconcile could not repair is marked error: reconcile_failed before
+        collect_recommendations reads the reviews."""
+        write_ids("tmp/pipeline-active-ids.txt", ["RHAIRFE-1", "RHAIRFE-2"])
+        marked = []
+        monkeypatch.setattr(
+            ps,
+            "_mark_review_or_stub",
+            lambda rid, updates, ptype, base, error, failures=None: (
+                marked.append((rid, updates["error"], base, error)) or True
+            ),
+        )
+
+        def mock_run(cmd):
+            if "reconcile_reviews.py" in cmd:
+                return "RESTORED=\nFLAGGED=\nRECONCILE_ERRORS=RHAIRFE-2"
+            return "SUBMIT=RHAIRFE-1\nSPLIT=\nREVISE=\nREJECT=\nERRORS=RHAIRFE-2"
+
+        monkeypatch.setattr(ps, "_run_script", mock_run)
+        next_phase, summary = ps.advance(make_state(phase="COLLECT", reassess_cycle=2))
+        assert next_phase == "BATCH_DONE"
+        assert marked == [("RHAIRFE-2", "reconcile_failed", "review", "reconcile_failed")]
+        assert summary.startswith("COLLECT reconcile: restored=0 flagged=0 errors=1\n")
 
     def test_reconcile_is_quiet_when_nothing_changed_and_skipped_in_dry_run(
         self, tmp_dir, monkeypatch

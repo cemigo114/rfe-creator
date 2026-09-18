@@ -189,6 +189,29 @@ def test_cleanup_removes_the_state_file_only(workdir, capsys):
     assert "SKIP=RHAIRFE-6" in capsys.readouterr().out
 
 
+def test_restore_appends_the_history_heading_when_the_review_lacks_it(workdir):
+    item_id = "RHAIRFE-8"
+    _write(prs.review_path(item_id), _revised_review("rfe_id", item_id, RFE_SCORES, True))
+    prs.save(item_id)
+    fresh = _fresh_review("rfe_id", item_id, RFE_SCORES).split("## Revision History")[0]
+    _write(prs.review_path(item_id), fresh)  # a late review without the section
+    prs.restore(item_id)
+    body = open(prs.review_path(item_id)).read()
+    assert body.count("## Revision History") == 1
+    assert "reframed the objective" in body.split("## Revision History")[1]
+    prs.save(item_id)
+    prs.restore(item_id)  # idempotent over the appended section too
+    assert open(prs.review_path(item_id)).read().count("reframed the objective") == 1
+
+
+@pytest.mark.parametrize("bad", ["../RHAIRFE-1", "/tmp/RHAIRFE-1", "RHAIRFE-1/x", "", ".."])
+def test_paths_refuse_ids_that_are_not_plain_stems(workdir, bad):
+    with pytest.raises(ValueError, match="invalid item id"):
+        prs.state_path(bad)
+    with pytest.raises(ValueError, match="invalid item id"):
+        prs.review_path(bad)
+
+
 def test_cli_keep_state_flag(workdir, monkeypatch):
     item_id = "RHAIRFE-7"
     _write(prs.review_path(item_id), _revised_review("rfe_id", item_id, RFE_SCORES, True))
