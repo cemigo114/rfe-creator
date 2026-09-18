@@ -16,6 +16,7 @@ import os
 import textwrap
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO_ROOT = os.path.join(os.path.dirname(__file__), "..")
@@ -86,6 +87,47 @@ def _run(files, annotations=None):
 # only the per-case/tag logic is under test.
 def _other_revised():
     return {REPORT: _report(_entry("RFE-9", before=6, after=8, cycles=1, auto_revised=True))}
+
+
+# --- Revision History placeholder variants ------------------------------------
+
+
+@pytest.mark.parametrize(
+    "history",
+    [
+        "none",
+        "None (first pass).",
+        "none — first pass",
+        "No revisions yet.",
+        "- N/A",
+        "_none_",
+        "None (initial review)",
+        "none: not yet revised",
+    ],
+)
+def test_decorated_placeholder_is_empty_history(history):
+    # PR-4b: review agents decorate the template's "none" ("None (first pass)."), which
+    # the judge used to count as revision evidence (INIT-010/013 on #190's first run).
+    files = {f"{RFE_REVIEWS}/RFE-1-review.md": _review("RFE-1", history=history, score=9)}
+    files.update(_other_revised())
+    passed, msg = _run(files, UNTAGGED)
+    assert passed is True and msg.startswith("not revised (untagged)"), msg
+
+
+@pytest.mark.parametrize(
+    "history",
+    [
+        "- Cycle 1: strengthened WHY with metrics",
+        "None of the HOW content survived; rewrote it",
+        "None: rewrote the scope boundaries",
+        "none — reframed the mandated stack as suggestions",
+    ],
+)
+def test_real_history_entries_still_count(history):
+    files = {f"{RFE_REVIEWS}/RFE-1-review.md": _review("RFE-1", history=history, score=9)}
+    files.update(_other_revised())
+    passed, msg = _run(files, UNTAGGED)
+    assert passed is True and "non-empty Revision History" in msg, msg
 
 
 # --- Drift guard: the two configs must carry the identical judge body ---------

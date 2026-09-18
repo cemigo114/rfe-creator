@@ -2592,12 +2592,14 @@ class TestEvalConfigs:
         assert f'"rm {ctx.dirs["tasks"]}/" in stdout' in check
         assert f'"{ctx.sk}create"' in check
         assert '"AUTOFIX" in stdout or "Batch " in stdout' in check
+        assert "if len(phases_found) < 3:" in check  # PR-4b: all three phases
 
     def test_architecture_context_judge(self, ctx):
         # rows: 207 — one shared judge; the not_relevant carve-out is switched per type by the
         # fragment's architecture_context.not_relevant_pattern (null for rfe)
         check = judges(ctx)["architecture_context_used"]["check"]
         assert "declared_irrelevant = bool(not_relevant_pattern and" in check
+        assert "elif transcripts:" in check  # PR-4b: prose fallback only without capture
         assert ("not_relevant_pattern = None" in check) is (ctx.t == "rfe")
         assert ("not_relevant_pattern = re.compile(" in check) is (ctx.t == "initiative")
         assert ctx.ev["thresholds"]["architecture_context_used"]["min_pass_rate"] == (
